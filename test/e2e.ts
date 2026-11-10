@@ -265,6 +265,17 @@ try {
     assert.ok(history.matches.some((m: any) => m.queue === 'Normal') || mine.every((id) => matches.get(id).info.queue_id === 1100))
     ok('summoner card and match history')
 
+    const setAccount = (body: unknown) => call('/api/me/account', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    assert.equal((await setAccount({ riotId: 'NoTag', platform: 'na1' })).status, 400)
+    assert.equal((await setAccount({ riotId: 'Tester#NA1', platform: 'mars' })).status, 400)
+    const missing = (await setAccount({ riotId: "Nobody#XX1", platform: "na1" })).body
+    assert.equal(missing.ok, false); assert.match(missing.error, /No Riot account called Nobody#XX1/)
+    assert.equal((await get('/api/me')).riotId, 'Nobody#XX1')
+    assert.equal((await setAccount({ riotId: "Tester # NA1", platform: "na1" })).body.ok, true)
+    const back = await get('/api/me')
+    assert.equal(back.riotId, 'Tester#NA1'); assert.equal(back.name, 'Tester'); assert.equal(back.tier, 'CHALLENGER')
+    ok('Riot ID and server can be set from the app, with clear errors for typos')
+
     assert.equal((await call('/api/icon/unit/Nope')).status, 404)
   } finally { api.kill() }
 

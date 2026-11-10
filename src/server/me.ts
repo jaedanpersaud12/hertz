@@ -1,6 +1,7 @@
 /**
  * Your own account: rank, recent placements and match history.
- * This is the only part of the app that calls Riot while you browse. It needs RIOT_ID and MY_PLATFORM in .env.
+ * This is the only part of the app that calls Riot while you browse.
+ * The account comes from the app (saved in the database) or, failing that, RIOT_ID and MY_PLATFORM in .env.
  */
 import type { Hono } from 'hono'
 import { rarityCost } from '../cluster'
@@ -16,6 +17,10 @@ type Me = {
   fetchedAt: number
 }
 
+/** What the user typed into the app. Takes priority over .env. */
+type Account = { riotId: string; platform: string }
+const ACCOUNT_KEY = 'account'
+
 const QUEUES: Record<number, string> = { 1100: 'Ranked', 1090: 'Normal', 1130: 'Hyper Roll', 1160: 'Double Up' }
 const STALE_MS = 5 * 60_000
 
@@ -23,28 +28,33 @@ export function registerMe(app: Hono, db: DB, describe: Describe) {
   let refreshing: Promise<void> | null = null
   loadCalendar(db)
   let lastError: string | null = null
-  const configured = () => config.riotId.includes('#')
+  const account = (): Account => {
+    const saved = kvGet<Account>(db, ACCOUNT_KEY)
+    if (saved?.riotId) return saved
+    return { riotId: config.riotId, platform: config.myPlatform || config.platforms[0] }
+  }
+  const configured = () => account().riotId.includes('#')
 
   async function refresh() {
-    const [name, tag] = config.riotId.split('#')
-    const platform = config.myPlatform || config.platforms[0]
+    const { riotId, platform } = account()
+    const [name, tag] = riotId.split('#')
     const route = PLATFORM_ROUTE[platform]
-    if (!route) throw new Error(`MY_PLATFORM "${platform}" is not a known server.`)
+    if (!route) throw new Error(`"${platform}" is not a known server. Pick your server again.`)
 
     // Account lookups have no "sea" host; any of the three others returns the same account.
-    const account = await getAccount(route === 'sea' ? 'asia' : route, name.trim(), tag.trim())
-    if (!account) throw new Error(`No Riot account found for ${config.riotId}. Check RIOT_ID in .env.`)
+    const found = await getAccount(route === 'sea' ? 'asia' : route, name.trim(), tag.trim())
+    if (!found) throw new Error(`No Riot account called ${riotId}. Check the spelling and the tag after #.`)
 
-    const ranked = (await getRank(platform, account.puuid)).find((e) => e.queueType === 'RANKED_TFT')
+    const ranked = (await getRank(platform, found.puuid)).find((e) => e.queueType === 'RANKED_TFT')
     const have = db.prepare('SELECT 1 FROM my_matches WHERE match_id = ?')
     const save = db.prepare('INSERT OR REPLACE INTO my_matches (match_id, game_datetime, json) VALUES (?,?,?)')
-    for (const id of await getMatchIds(route, account.puuid, null, 20)) {
+    for (const id of await getMatchIds(route, found.puuid, null, 20)) {
       if (have.get(id)) continue
       const match = await getMatch(route, id)
       if (match) save.run(id, match.info.game_datetime, JSON.stringify(match))
     }
     kvSet(db, 'me', {
-      riotId: config.riotId, puuid: account.puuid, name: account.gameName, tag: account.tagLine, platform,
+      riotId, puuid: found.puuid, name: found.gameName, tag: found.tagLine, platform,
       tier: ranked?.tier ?? null, division: ranked?.rank ?? null, lp: ranked?.leaguePoints ?? null,
       wins: ranked?.wins ?? null, losses: ranked?.losses ?? null, fetchedAt: Date.now(),
     } satisfies Me)
@@ -65,21 +75,35 @@ export function registerMe(app: Hono, db: DB, describe: Describe) {
       .filter((m) => m.info.participants.some((p) => p.puuid === me.puuid))
 
   app.get('/api/me', async (c) => {
-    if (!configured()) return c.json({ configured: false })
+    const { riotId, platform } = account()
+    if (!configured()) return c.json({ configured: false, riotId, platform })
     let me = kvGet<Me>(db, 'me')
-    if (me && me.riotId !== config.riotId) me = null
+    if (me && me.riotId !== riotId) me = null
     if (!me) await startRefresh()
     else if (Date.now() - me.fetchedAt > STALE_MS) void startRefresh()
     me = kvGet<Me>(db, 'me')
-    if (!me || me.riotId !== config.riotId) return c.json({ configured: true, error: lastError ?? 'Could not load your account.' })
+    if (!me || me.riotId !== riotId) return c.json({ configured: true, riotId, platform, error: lastError ?? 'Could not load your account.' })
 
     const recent = myMatches(me, 10).map((m) => m.info.participants.find((p) => p.puuid === me!.puuid)!.placement)
     return c.json({
-      configured: true, error: lastError, refreshing: !!refreshing,
+      configured: true, riotId, error: lastError, refreshing: !!refreshing,
       name: me.name, tag: me.tag, platform: me.platform, tier: me.tier, division: me.division, lp: me.lp,
       wins: me.wins, losses: me.losses, fetchedAt: me.fetchedAt,
       recent, avgPlace: recent.length ? recent.reduce((a, b) => a + b, 0) / recent.length : null,
     })
+  })
+
+  /** Set from the app: { riotId: "Name#TAG", platform: "na1" }. Checks the account with Riot straight away. */
+  app.post('/api/me/account', async (c) => {
+    const body = await c.req.json().catch(() => ({})) as Partial<Account>
+    const riotId = String(body.riotId ?? '').trim().replace(/\s*#\s*/, '#')
+    const platform = String(body.platform ?? '').trim().toLowerCase()
+    if (!/^[^#]{3,16}#[^#]{2,5}$/.test(riotId)) return c.json({ ok: false, error: 'Write it as Name#TAG, the way the client shows it.' }, 400)
+    if (!PLATFORM_ROUTE[platform]) return c.json({ ok: false, error: 'Pick the server you play on.' }, 400)
+    kvSet(db, ACCOUNT_KEY, { riotId, platform } satisfies Account)
+    if (kvGet<Me>(db, 'me')?.riotId !== riotId) db.prepare('DELETE FROM my_matches').run() // games of the previous account
+    await startRefresh()
+    return c.json({ ok: !lastError, error: lastError })
   })
 
   app.post('/api/me/refresh', async (c) => {

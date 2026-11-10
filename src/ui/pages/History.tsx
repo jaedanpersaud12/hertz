@@ -5,6 +5,7 @@ import { ago, count, useApi, type BoardUnit, type TraitChipData } from '../api'
 import { useAccordion, useAutoHeight, type AccordionHeaderProps, type AccordionPanelProps } from '../interior/accordion'
 import { LoadingButton } from '../interior/loading-button'
 import { LoadMore } from '../interior/load-more'
+import { AccountForm } from '../Account'
 import { PlaceMedal } from '../art'
 import { Status, TraitChip, UnitChip } from '../parts'
 
@@ -17,13 +18,12 @@ type Match = { id: string; date: number; length: number; queue: string; patch: s
 export const placeClass = (p: number) => (p === 1 ? 'first' : p <= 4 ? 'top' : 'bottom')
 const PAGE = 8
 
-export function SetupHint() {
+export function SetupHint({ onSaved }: { onSaved: () => void }) {
   return (
     <div className="empty">
       <h2>Add your Riot ID</h2>
-      <p>Put these two lines in <code>.env</code>, then restart the app:</p>
-      <pre>RIOT_ID=YourName#TAG{'\n'}MY_PLATFORM=na1</pre>
-      <p>Your rank, recent placements and match history then load from Riot using your API key.</p>
+      <p>Your rank, recent placements and match history load from Riot using your API key.</p>
+      <div className="account-inline"><AccountForm onSaved={onSaved} /></div>
     </div>
   )
 }
@@ -80,7 +80,7 @@ export function History() {
   const acc = useAccordion({ items: entries, type: 'single', open, onOpenChange: setOpen })
 
   if (error || !data) return <Status error={error} loading={loading} />
-  if (!data.configured) return <SetupHint />
+  if (!data.configured) return <SetupHint onSaved={reload} />
 
   const refresh = async () => {
     const r = await fetch('/api/me/refresh', { method: 'POST' }).then((x) => x.json())

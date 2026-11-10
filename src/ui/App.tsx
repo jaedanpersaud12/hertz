@@ -1,6 +1,7 @@
-import { ArrowsClockwise, CaretRight, MagnifyingGlass, SidebarSimple, X } from '@phosphor-icons/react'
+import { ArrowsClockwise, CaretRight, MagnifyingGlass, PencilSimple, SidebarSimple, X } from '@phosphor-icons/react'
 import { useEffect, useMemo, useState } from 'react'
 import { ago, FiltersCtx, MarksCtx, num, useApi, useMarks, useMarksState, type Comp, type Filters, type Meta, type Scope } from './api'
+import { AccountForm } from './Account'
 import { IdentitySheet, LogoMark, PlaceMedal } from './art'
 import { DevData } from './DevData'
 import { CommandPalette, type CommandItem } from './interior/command-palette'
@@ -68,7 +69,7 @@ const loadFilters = (): Filters => {
 
 // ---- Your panel: account, pinned comp, what this view covers ----------------------
 type Me = {
-  configured: boolean; error?: string | null; name?: string; tag?: string; tier?: string | null; division?: string | null
+  configured: boolean; riotId?: string; platform?: string; error?: string | null; name?: string; tag?: string; tier?: string | null; division?: string | null
   lp?: number | null; recent?: number[]; avgPlace?: number | null; fetchedAt?: number
 }
 const title = (s: string) => s.charAt(0) + s.slice(1).toLowerCase()
@@ -76,23 +77,33 @@ const title = (s: string) => s.charAt(0) + s.slice(1).toLowerCase()
 function Summoner() {
   const { data, reload } = useApi<Me>('/api/me')
   const [busy, setBusy] = useState(false)
+  const [editing, setEditing] = useState(false)
   const refresh = async () => { setBusy(true); await fetch('/api/me/refresh', { method: 'POST' }).catch(() => {}); setBusy(false); reload() }
+  const saved = () => { setEditing(false); reload() }
   const apex = ['MASTER', 'GRANDMASTER', 'CHALLENGER'].includes(data?.tier ?? '')
   return (
     <section className="side-card">
       <SkeletonSwap ready={!!data} reserve={data && !data.name ? 62 : data?.error ? 190 : 112} lines={4} label="Your account" className="grid-cols-[minmax(0,1fr)]">
-        {!data ? null : !data.configured ? (
+        {!data ? null : !data.configured || editing ? (
           <>
             <h3>Your account</h3>
-            <p className="muted small mt-1">Add <code>RIOT_ID</code> and <code>MY_PLATFORM</code> to <code>.env</code> to see your rank and recent games. <a href="#/history">How</a></p>
+            {!data.configured ? <p className="muted small mt-1">Add your Riot ID to see your rank and recent games.</p> : null}
+            <AccountForm riotId={data.riotId} platform={data.platform} onSaved={saved} onCancel={data.configured ? () => setEditing(false) : undefined} />
           </>
         ) : !data.name ? (
-          <><h3>Your account</h3><p className="error small">{data.error}</p></>
+          <>
+            <h3>Your account</h3>
+            <p className="error small">{data.error}</p>
+            <AccountForm riotId={data.riotId} platform={data.platform} onSaved={saved} />
+          </>
         ) : (
           <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
             <div className="side-head">
               <h3 title={`${data.name}#${data.tag}`}><span className="riot-name">{data.name}</span><span className="muted font-normal">#{data.tag}</span></h3>
-              <IconButton label={busy ? 'Checking Riot' : `Updated ${ago(data.fetchedAt)}. Check again`} onClick={refresh} side="bottom"><ArrowsClockwise size={15} /></IconButton>
+              <div className="flex items-center gap-1">
+                <IconButton label="Change account" onClick={() => setEditing(true)} side="bottom"><PencilSimple size={14} /></IconButton>
+                <IconButton label={busy ? 'Checking Riot' : `Updated ${ago(data.fetchedAt)}. Check again`} onClick={refresh} side="bottom"><ArrowsClockwise size={15} /></IconButton>
+              </div>
             </div>
             <p className="rank">{data.tier ? <>{title(data.tier)}{apex ? '' : ` ${data.division}`} <span className="muted font-normal">{data.lp} LP</span></> : <span className="muted">Unranked</span>}</p>
             {data.recent?.length ? (
