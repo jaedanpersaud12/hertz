@@ -9,7 +9,7 @@
     "stats": "tsx src/stats/build.ts",
     "recluster": "tsx src/stats/recluster.ts",
     "demo": "tsx scripts/demo.ts",
-    "dev": "concurrently -n api,ui -c blue,green \"tsx watch src/server/index.ts --dev\" \"vite\"",
+    "dev": "concurrently -k -n api,ui -c blue,green \"node --import tsx --watch-path=src --watch-preserve-output src/server/index.ts --dev\" \"vite\"",
     "build": "vite build",
     "start": "tsx src/server/index.ts",
     "test": "tsx test/e2e.ts",
