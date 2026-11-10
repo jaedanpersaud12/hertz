@@ -19,7 +19,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-    conn.busy_timeout(Duration::from_millis(10_000))?;
+    conn.busy_timeout(Duration::from_millis(60_000))?; // the stats step can hold the write lock for a while
     conn.pragma_update(None, "journal_mode", "WAL")?; // lets the app read while the crawler writes
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch(schema::SCHEMA)?;

@@ -187,7 +187,7 @@ export function buildStats(db: DB, patchCount = 2, log: (s: string) => void = co
             INSERT INTO stat_comp_levels
             SELECT ?, ?, p.comp_key, COALESCE(p.level, 0), COUNT(*), SUM(p.placement)
             FROM p JOIN topc USING (comp_key) GROUP BY p.comp_key, COALESCE(p.level, 0)`).run(...k)
-        })()
+        }).immediate() // take the write lock up front, so a crawler writing at the same time makes this wait instead of fail
 
         const meta = db.prepare('SELECT matches, comps FROM stat_meta WHERE patch = ? AND bucket = ?').get(...k) as { matches: number; comps: number }
         log(`patch ${patch}  ${scope.padEnd(13)} ${String(meta.matches).padStart(8)} matches ${String(meta.comps).padStart(9)} comps  ${((Date.now() - t0) / 1000).toFixed(1)} s`)

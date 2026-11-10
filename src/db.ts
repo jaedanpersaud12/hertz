@@ -146,7 +146,7 @@ function migrate(db: DB) {
 export function openDb(path = config.dbPath, opts: { readonly?: boolean } = {}): DB {
   if (!opts.readonly) mkdirSync(dirname(path), { recursive: true })
   const db = new Database(path, { readonly: opts.readonly ?? false, fileMustExist: opts.readonly ?? false })
-  db.pragma('busy_timeout = 10000')
+  db.pragma('busy_timeout = 60000') // stats and the crawler take turns writing; a stats step on a big database can hold the lock for a while
   if (!opts.readonly) {
     db.pragma('journal_mode = WAL') // lets the app read while the crawler writes
     db.pragma('synchronous = NORMAL')
