@@ -1,11 +1,17 @@
 //! Sliding-window rate limiter for one Riot host. Same rule as the TypeScript `Limiter`.
 //!
+//! Riot counts limits per host, and the crawler fetches matches only from the four routing-group hosts
+//! (americas, europe, asia, sea), so the limiter for a group's host is that group's limiter.
+//! Server hosts (na1, euw1, ...) have their own separate limits on Riot's side and their own limiters here.
+//!
 //! Riot counts a request when it arrives, some time between when we send it and when the answer comes
 //! back. So a request holds its slot from the moment it is sent until one full window after its answer
 //! arrives. That way no window on Riot's side can ever hold more requests than we allow.
 //!
 //! Think of a car park with a strict hourly cap: a car counts from the moment it drives in, and its space
 //! only frees up a full hour after it leaves.
+//!
+//! All times are tokio `Instant`s, which are monotonic: changing the wall clock never moves a window.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,13 +19,17 @@ use tokio::time::{Instant, sleep, sleep_until};
 
 #[derive(Debug, Clone, Copy)]
 struct Window {
+    /// What we allow: Riot's count times the safety margin.
     limit: usize,
+    /// What Riot allows, as the header says.
+    riot: usize,
     len: Duration,
 }
 
 #[derive(Debug)]
 struct Slot {
     id: u64,
+    sent: Instant,
     /// When the answer arrived. `None` while the request is in flight.
     done: Option<Instant>,
 }
@@ -30,6 +40,9 @@ struct State {
     slots: Vec<Slot>,
     next_id: u64,
     blocked_until: Option<Instant>,
+    /// For [`Limiter::slot_use`]: when the first request went out, and how many have gone out since.
+    first_sent: Option<Instant>,
+    total_sent: u64,
 }
 
 #[derive(Debug)]
@@ -48,6 +61,7 @@ fn to_windows(limits: &[(u32, u32)], margin: f64) -> Vec<Window> {
         .iter()
         .map(|&(count, secs)| Window {
             limit: ((count as f64 * margin).floor() as usize).max(1),
+            riot: count as usize,
             len: Duration::from_secs(secs as u64),
         })
         .collect()
@@ -61,6 +75,8 @@ impl Limiter {
                 slots: Vec::new(),
                 next_id: 0,
                 blocked_until: None,
+                first_sent: None,
+                total_sent: 0,
             }),
             turn: tokio::sync::Mutex::new(()),
             margin,
@@ -122,7 +138,9 @@ impl Limiter {
                         if wait.is_zero() {
                             let id = st.next_id;
                             st.next_id += 1;
-                            st.slots.push(Slot { id, done: None });
+                            st.slots.push(Slot { id, sent: now, done: None });
+                            st.first_sent.get_or_insert(now);
+                            st.total_sent += 1;
                             return Permit { limiter: Arc::clone(self), id, open: true };
                         }
                         Ok(wait)
@@ -136,12 +154,42 @@ impl Limiter {
         }
     }
 
+    /// How many of Riot's long-window slots this host uses (e.g. 95 of 100 per 2 minutes).
+    pub fn slot_use(&self) -> SlotUse {
+        let now = Instant::now();
+        let st = self.state.lock().unwrap();
+        let Some(w) = st.windows.iter().max_by_key(|w| w.len) else {
+            return SlotUse::default();
+        };
+        // Windows elapsed since the first request, at least one so a fresh start does not read as huge.
+        let windows = st.first_sent.map_or(1.0, |f| (now - f).as_secs_f64() / w.len.as_secs_f64()).max(1.0);
+        SlotUse {
+            last_window: st.slots.iter().filter(|s| s.sent + w.len > now).count(),
+            average: st.total_sent as f64 / windows,
+            riot_limit: w.riot,
+            window: w.len,
+        }
+    }
+
     fn mark_done(&self, id: u64) {
         let mut st = self.state.lock().unwrap();
         if let Some(s) = st.slots.iter_mut().find(|s| s.id == id) {
             s.done = Some(Instant::now());
         }
     }
+}
+
+/// How full one host's long window is.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SlotUse {
+    /// Requests sent in the last long window.
+    pub last_window: usize,
+    /// Requests sent per long window, averaged since this host's first request. A single window swings
+    /// with where it starts (requests go out in bursts of 20), so this is the number to judge a long run by.
+    pub average: f64,
+    /// Riot's limit for the long window, before the safety margin.
+    pub riot_limit: usize,
+    pub window: Duration,
 }
 
 /// One request's place in the window. Marked answered when dropped, so an early return never leaks a slot.
@@ -223,5 +271,116 @@ mod tests {
         assert!(Instant::now() - t1 >= Duration::from_secs(5));
         limiter.update_from_header(Some("garbage"));
         assert_eq!(limiter.state.lock().unwrap().windows[0].limit, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slot_frees_one_window_after_the_answer_not_after_sending() {
+        let limiter = Limiter::new(&[(1, 1)], 1.0);
+        let t0 = Instant::now();
+        let permit = limiter.acquire().await;
+        sleep(Duration::from_secs(3)).await; // a slow answer
+        permit.answered();
+        drop(limiter.acquire().await);
+        let waited = Instant::now() - t0;
+        assert!(waited >= Duration::from_secs(4), "second request went out {waited:?} after the first");
+        assert!(waited < Duration::from_millis(4100), "second request waited too long: {waited:?}");
+    }
+
+    /// Callers that always have work, with 50 to 400 ms answers, for two simulated hours.
+    async fn sustained_load(margin: f64) -> (Vec<Instant>, SlotUse) {
+        let limiter = Limiter::new(&DEFAULT_LIMITS, margin);
+        let sent = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let end = Instant::now() + Duration::from_secs(2 * 3600);
+        let mut tasks = Vec::new();
+        for i in 0..30u64 {
+            let (l, sent) = (Arc::clone(&limiter), Arc::clone(&sent));
+            tasks.push(tokio::spawn(async move {
+                while Instant::now() < end {
+                    let permit = l.acquire().await;
+                    sent.lock().unwrap().push(Instant::now());
+                    sleep(Duration::from_millis(50 + (i * 53) % 350)).await;
+                    permit.answered();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let use_at_end = limiter.slot_use();
+        let mut sent = Arc::try_unwrap(sent).unwrap().into_inner().unwrap();
+        sent.sort();
+        (sent, use_at_end)
+    }
+
+    /// Most requests in any window of `len` (every window that starts at a send).
+    fn most_in_any(sent: &[Instant], len: Duration) -> usize {
+        (0..sent.len()).map(|i| sent[i..].iter().take_while(|u| **u < sent[i] + len).count()).max().unwrap()
+    }
+
+    /// Requests per 2 minutes over the sixty whole 2-minute windows from the first send.
+    fn per_two_minutes(sent: &[Instant]) -> f64 {
+        let end = sent[0] + Duration::from_secs(60 * 120);
+        sent.iter().filter(|t| **t < end).count() as f64 / 60.0
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_load_uses_at_least_95_of_100_slots_per_two_minutes() {
+        let (sent, at_end) = sustained_load(1.0).await;
+        let most = most_in_any(&sent, Duration::from_secs(120));
+        assert!(most <= 100, "{most} requests in one 2-minute window, Riot allows 100");
+        let most = most_in_any(&sent, Duration::from_secs(1));
+        assert!(most <= 20, "{most} requests in one second, Riot allows 20");
+        let used = per_two_minutes(&sent);
+        assert!(used >= 95.0, "only {used} of 100 slots used per 2 minutes");
+        assert_eq!(at_end.riot_limit, 100);
+        assert!((at_end.average - used).abs() < 2.0, "slot use reports {}, actual {used}", at_end.average);
+    }
+
+    /// The default margin (RATE_MARGIN=0.95) allows 95 of 100, and the crawler should use all 95.
+    #[tokio::test(start_paused = true)]
+    async fn sustained_load_at_the_default_margin_stays_at_95() {
+        let (sent, at_end) = sustained_load(0.95).await;
+        let most = most_in_any(&sent, Duration::from_secs(120));
+        assert!(most <= 95, "{most} requests in one 2-minute window, margin allows 95");
+        let most = most_in_any(&sent, Duration::from_secs(1));
+        assert!(most <= 19, "{most} requests in one second, margin allows 19");
+        let used = per_two_minutes(&sent);
+        assert!(used >= 95.0, "only {used} of 100 slots used per 2 minutes");
+        assert!((at_end.average - used).abs() < 2.0, "slot use reports {}, actual {used}", at_end.average);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slot_use_counts_requests_per_two_minutes() {
+        let limiter = Limiter::new(&DEFAULT_LIMITS, 1.0);
+        let empty = SlotUse { last_window: 0, average: 0.0, riot_limit: 100, window: Duration::from_secs(120) };
+        assert_eq!(limiter.slot_use(), empty);
+        let t0 = Instant::now();
+        for _ in 0..30 {
+            limiter.acquire().await.answered();
+        }
+        let u = limiter.slot_use();
+        assert_eq!((u.last_window, u.average), (30, 30.0));
+        // Four minutes after the first request: 30 requests over two windows.
+        tokio::time::advance(Duration::from_secs(240) - (Instant::now() - t0)).await;
+        let u = limiter.slot_use();
+        assert_eq!((u.last_window, u.average), (0, 15.0));
+        limiter.update_from_header(Some("500:10,30000:600"));
+        assert_eq!(limiter.slot_use().riot_limit, 30000);
+    }
+
+    /// Windows run on monotonic time. When the clock jumps forward (a laptop waking from sleep on Windows,
+    /// where monotonic time includes sleep), every window has passed and requests go out at once.
+    #[tokio::test(start_paused = true)]
+    async fn windows_are_free_again_after_a_long_sleep() {
+        let limiter = Limiter::new(&DEFAULT_LIMITS, 1.0);
+        for _ in 0..100 {
+            limiter.acquire().await.answered();
+        }
+        tokio::time::advance(Duration::from_secs(10 * 60)).await;
+        let t0 = Instant::now();
+        for _ in 0..20 {
+            limiter.acquire().await.answered();
+        }
+        assert_eq!(Instant::now(), t0, "requests after a sleep must not wait");
     }
 }

@@ -1,6 +1,9 @@
 //! Riot API client. One limiter per host, retries on 429 and server errors, clear errors for key problems.
+//!
+//! Riot limits each host separately. Matches come from the four routing-group hosts (americas, europe, asia,
+//! sea), so each group's host limiter is that group's limiter; server hosts (na1, euw1, ...) count apart.
 
-use crate::limiter::{DEFAULT_LIMITS, Limiter};
+use crate::limiter::{DEFAULT_LIMITS, Limiter, SlotUse};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +40,22 @@ pub struct RiotClient {
     pub counts: Counts,
 }
 
+/// Tries per request on server errors and network failures. A 429 does not use one up.
+const MAX_TRIES: u32 = 6;
+/// After the last try fails, the whole group waits this long.
+const GROUP_PAUSE: Duration = Duration::from_secs(60);
+
+/// Counts one failed try and waits before the next: 1, 2, 4, 8, then 16 seconds.
+/// Returns false when the tries are used up.
+async fn try_again(failures: &mut u32) -> bool {
+    *failures += 1;
+    if *failures >= MAX_TRIES {
+        return false;
+    }
+    tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(*failures - 1))).await;
+    true
+}
+
 /// Installs the TLS backend once per process. Safe to call more than once.
 pub fn init_tls() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -64,6 +83,17 @@ impl RiotClient {
         }
     }
 
+    /// How much of a host's long rate-limit window is in use. `None` before the first request to it.
+    pub fn slot_use(&self, host: &str) -> Option<SlotUse> {
+        self.limiters.lock().unwrap().get(host).map(|l| l.slot_use())
+    }
+
+    #[cfg(test)]
+    fn with_http(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
+
     fn limiter(&self, host: &str) -> Arc<Limiter> {
         Arc::clone(
             self.limiters
@@ -74,7 +104,8 @@ impl RiotClient {
         )
     }
 
-    /// GETs a Riot endpoint. `Ok(None)` on 404. Retries on 429 and server errors.
+    /// GETs a Riot endpoint. `Ok(None)` on 404. Retries on 429 (as often as Riot asks) and on server errors
+    /// or network failures (up to [`MAX_TRIES`], then the host pauses for [`GROUP_PAUSE`]).
     pub async fn get<T: DeserializeOwned>(&self, host: &str, path: &str) -> Result<Option<T>, RiotError> {
         if self.key.is_empty() {
             return Err(RiotError::Key(
@@ -83,9 +114,9 @@ impl RiotClient {
         }
         let url = format!("{}{}", self.base.replace("{host}", host), path);
         let limiter = self.limiter(host);
-        let backoff = |attempt: u32| tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt)));
+        let mut failures = 0;
 
-        for attempt in 0..6 {
+        loop {
             let permit = limiter.acquire().await;
             let sent = self.http.get(&url).header("X-Riot-Token", &self.key).send().await;
             permit.answered();
@@ -93,8 +124,10 @@ impl RiotClient {
                 Ok(r) => r,
                 Err(_) => {
                     self.counts.retried.fetch_add(1, Ordering::Relaxed);
-                    backoff(attempt).await;
-                    continue;
+                    if try_again(&mut failures).await {
+                        continue;
+                    }
+                    break;
                 }
             };
             limiter.update_from_header(res.headers().get("x-app-rate-limit").and_then(|v| v.to_str().ok()));
@@ -125,10 +158,13 @@ impl RiotClient {
                 }
                 _ => {
                     self.counts.retried.fetch_add(1, Ordering::Relaxed);
-                    backoff(attempt).await;
+                    if !try_again(&mut failures).await {
+                        break;
+                    }
                 }
             }
         }
+        limiter.block(GROUP_PAUSE);
         Err(RiotError::Unavailable(format!(
             "Riot did not answer on {host} after several tries. Check your connection, or try again in a few minutes."
         )))
@@ -196,8 +232,146 @@ fn encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
+
     #[test]
     fn encodes_like_encode_uri_component() {
         assert_eq!(super::encode("Jaé Dan#1"), "Ja%C3%A9%20Dan%231");
+    }
+
+    /// What the test server does with the next request.
+    enum Reply {
+        /// Status, extra header lines (each ending in CRLF), body.
+        Http(u16, &'static str, &'static str),
+        /// Reads the request, then closes the connection without answering.
+        HangUp,
+    }
+
+    type Hits = Arc<Mutex<Vec<(Instant, String)>>>;
+
+    /// A one-connection-at-a-time HTTP server that plays `script` in order, then answers 200 `[]`.
+    /// Returns the client's base URL and the (time, path) of every request it saw.
+    async fn serve(script: Vec<Reply>) -> (String, Hits) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits: Hits = Arc::default();
+        let seen = Arc::clone(&hits);
+        tokio::spawn(async move {
+            let mut script = script.into_iter();
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let path = String::from_utf8_lossy(&req).split(' ').nth(1).unwrap_or_default().to_string();
+                seen.lock().unwrap().push((Instant::now(), path));
+                match script.next().unwrap_or(Reply::Http(200, "", "[]")) {
+                    Reply::HangUp => drop(sock),
+                    Reply::Http(status, headers, body) => {
+                        let answer = format!(
+                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                             connection: close\r\n{headers}\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(answer.as_bytes()).await;
+                        let _ = sock.shutdown().await;
+                    }
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}/{{host}}"), hits)
+    }
+
+    /// No request timeout and no idle pool, so the only timers in a paused-time test are the client's own.
+    fn client(base: &str) -> RiotClient {
+        init_tls();
+        let http = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
+        RiotClient::new("test-key", base, 1.0).with_http(http)
+    }
+
+    fn gaps(hits: &Hits) -> Vec<Duration> {
+        hits.lock().unwrap().windows(2).map(|w| w[1].0 - w[0].0).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_429_honours_retry_after_and_does_not_use_up_a_try() {
+        let mut script: Vec<Reply> = (0..7).map(|_| Reply::Http(429, "retry-after: 3\r\n", "")).collect();
+        script.push(Reply::Http(200, "", "[\"NA1_1\"]"));
+        let (base, hits) = serve(script).await;
+        let riot = client(&base);
+
+        let got = riot.get::<Vec<String>>("americas", "/ids").await.unwrap();
+        assert_eq!(got, Some(vec!["NA1_1".to_string()]), "seven 429s in a row must not give up the request");
+        assert_eq!(hits.lock().unwrap().len(), 8);
+        assert!(hits.lock().unwrap().iter().all(|(_, p)| p == "/americas/ids"), "the same request is retried");
+        for gap in gaps(&hits) {
+            assert!(gap >= Duration::from_secs(3), "retried after {gap:?}, Retry-After said 3 s");
+        }
+        assert_eq!(riot.counts.limited.load(Ordering::Relaxed), 7);
+        assert_eq!(riot.counts.retried.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn server_errors_get_six_tries_then_the_group_pauses_for_a_minute() {
+        let script = (0..6).map(|_| Reply::Http(500, "", "")).collect();
+        let (base, hits) = serve(script).await;
+        let riot = client(&base);
+
+        let err = riot.get::<Vec<String>>("americas", "/ids").await.unwrap_err();
+        assert!(matches!(err, RiotError::Unavailable(_)), "got {err:?}");
+        assert_eq!(hits.lock().unwrap().len(), 6, "six tries");
+        let expected = [1, 2, 4, 8, 16].map(Duration::from_secs);
+        for (gap, want) in gaps(&hits).into_iter().zip(expected) {
+            assert!(gap >= want, "backed off {gap:?}, expected at least {want:?}");
+        }
+
+        // Other groups carry on.
+        let gave_up = Instant::now();
+        assert_eq!(riot.get::<Vec<String>>("europe", "/ids").await.unwrap(), Some(vec![]));
+        assert!(Instant::now() - gave_up < Duration::from_secs(1), "europe must not wait for americas");
+
+        // The failed group waits a minute before its next request.
+        assert_eq!(riot.get::<Vec<String>>("americas", "/ids").await.unwrap(), Some(vec![]));
+        let (at, path) = hits.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, "/americas/ids");
+        assert!(at - gave_up >= GROUP_PAUSE, "americas resumed after {:?}", at - gave_up);
+        assert_eq!(riot.counts.retried.load(Ordering::Relaxed), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn network_failures_are_retried_on_the_same_request() {
+        let (base, hits) = serve(vec![Reply::HangUp, Reply::HangUp, Reply::Http(200, "", "[\"NA1_2\"]")]).await;
+        let riot = client(&base);
+
+        let got = riot.get::<Vec<String>>("americas", "/match").await.unwrap();
+        assert_eq!(got, Some(vec!["NA1_2".to_string()]));
+        assert_eq!(hits.lock().unwrap().len(), 3);
+        assert!(hits.lock().unwrap().iter().all(|(_, p)| p == "/americas/match"));
+        assert_eq!(riot.counts.retried.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adopts_the_rate_limit_header_and_reports_slot_use() {
+        let limited = || Reply::Http(200, "x-app-rate-limit: 1:1,50:120\r\n", "[]");
+        let (base, hits) = serve(vec![limited(), limited(), limited()]).await;
+        let riot = client(&base);
+        assert_eq!(riot.slot_use("americas"), None);
+
+        for _ in 0..3 {
+            riot.get::<Vec<String>>("americas", "/ids").await.unwrap();
+        }
+        for gap in &gaps(&hits) {
+            assert!(*gap >= Duration::from_secs(1), "header said 1 per second, gap was {gap:?}");
+        }
+        let used = riot.slot_use("americas").unwrap();
+        assert_eq!((used.last_window, used.riot_limit), (3, 50));
     }
 }

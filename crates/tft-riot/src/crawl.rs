@@ -165,8 +165,17 @@ impl Crawler {
         );
         if let Ok((m, p, q)) = totals {
             let c = &self.riot.counts;
+            // Each routing group's share of its long rate-limit window, averaged since its first request.
+            let mut groups: Vec<&str> = self.config.platforms.iter().filter_map(|p| platform_route(p)).collect();
+            groups.sort();
+            groups.dedup();
+            let slots: Vec<String> = groups
+                .iter()
+                .filter_map(|g| self.riot.slot_use(g).map(|u| format!("{g} {:.1}/{}", u.average, u.riot_limit)))
+                .collect();
+            let slots = if slots.is_empty() { "none yet".to_string() } else { slots.join(", ") };
             println!(
-                "stored {stored} this run ({per_hour}/hour) | database: {m} matches, {p} players, {q} queued | requests ok {}, rate-limited {}, retried {}",
+                "stored {stored} this run ({per_hour}/hour) | database: {m} matches, {p} players, {q} queued | requests ok {}, 429s {}, retried {} | slots used per 2 min: {slots}",
                 c.ok.load(Ordering::Relaxed),
                 c.limited.load(Ordering::Relaxed),
                 c.retried.load(Ordering::Relaxed),
