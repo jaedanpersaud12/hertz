@@ -8,7 +8,7 @@ Replaces the TypeScript engine (`src/crawler`, `src/stats`, `src/server`) piece 
 | `tft-core` | Settings, Riot response shapes, comp labels, patch dating, dictionary string order | Done, matches TS |
 | `tft-store` | SQLite schema (identical to `src/db.ts`), migrations, storing matches | Done, matches TS |
 | `tft-riot` | Riot client, per-region rate limiter, Community Dragon, the crawler | Done, matches TS |
-| `tft-stats` | Aggregation, comp merging, Explorer index | Week 2 |
+| `tft-stats` | Aggregation, comp merging (`tft stats`); Explorer index and incremental builds come in E5 | Full rebuild done, matches TS |
 | `tft-api` | The `/api` routes the React app calls | Week 2 |
 | `tft-cli` | The `tft` command | `crawl`, `ingest`, `patches`, `init` |
 

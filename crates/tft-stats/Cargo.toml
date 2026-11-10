@@ -1,8 +1,14 @@
 [package]
 name = "tft-stats"
-description = "Aggregation, comp merging and the Explorer index. Ported in week 2 (PRD 1 E1, E5)."
+description = "Aggregation and comp merging: the stat tables the app reads (PRD 1 E1). Incremental builds are E5."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+rusqlite.workspace = true
+tft-core.workspace = true
+
+[dev-dependencies]
+tft-store.workspace = true

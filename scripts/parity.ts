@@ -5,13 +5,16 @@
  *
  * 1. Ingest: the same match files go through both engines into two fresh databases. Schema and every raw
  *    table are compared row by row, in insertion order. Includes awkward cases on top of the fake world.
- * 2. Crawl: both crawlers run against the same fake Riot API (rate limits, a forced 429, server errors).
+ * 2. Stats: copies of the ingested database get their stat tables built by each engine. Every stat table is
+ *    compared row by row in primary key order. Averages (REAL columns) may differ by at most 0.0001;
+ *    stat_meta.built_at is a timestamp and is left out.
+ * 3. Crawl: both crawlers run against the same fake Riot API (rate limits, a forced 429, server errors).
  *    The databases are compared by content, since the two crawlers fetch in a different order.
  *
- * Exits non-zero on any difference. Stat tables and API routes join this check as they are ported.
+ * Exits non-zero on any difference. API routes join this check as they are ported.
  */
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
@@ -94,6 +97,30 @@ function compareContent(a: Database.Database, b: Database.Database, label: strin
   fail(label, `    TypeScript ${ra.length}, Rust ${rb.length}. Only in TS: ${onlyA.slice(0, 2).join(' ')} Only in Rust: ${onlyB.slice(0, 2).join(' ')}`)
 }
 
+/** Averages may differ by this much; every other value must be identical. */
+const TOLERANCE = 0.0001
+
+/** Row-by-row comparison of a stat table in primary key order. REAL columns get TOLERANCE, built_at is skipped. */
+function compareStats(a: Database.Database, b: Database.Database, table: string) {
+  const info = a.prepare(`PRAGMA table_info(${table})`).all() as { name: string; type: string; pk: number }[]
+  const keys = info.filter((c) => c.pk > 0).sort((x, y) => x.pk - y.pk).map((c) => c.name)
+  const cols = info.map((c) => c.name).filter((c) => !(table === 'stat_meta' && c === 'built_at'))
+  const real = new Set(info.filter((c) => c.type === 'REAL').map((c) => c.name))
+  const sql = `SELECT ${cols.join(', ')} FROM ${table} ORDER BY ${keys.join(', ')}`
+  const [ra, rb] = [a.prepare(sql).all() as Record<string, unknown>[], b.prepare(sql).all() as Record<string, unknown>[]]
+  const same = (x: Record<string, unknown>, y: Record<string, unknown> | undefined) =>
+    !!y && cols.every((c) =>
+      real.has(c) && typeof x[c] === 'number' && typeof y[c] === 'number'
+        ? Math.abs((x[c] as number) - (y[c] as number)) <= TOLERANCE
+        : x[c] === y[c])
+  const first = ra.findIndex((r, i) => !same(r, rb[i]))
+  if (!ra.length) return fail(table, '    the TypeScript engine wrote no rows, so this check proves nothing')
+  if (ra.length === rb.length && first < 0) return ok(`${table}: ${ra.length} rows identical`)
+  const at = first < 0 ? ra.length : first
+  fail(table, `    TypeScript ${ra.length} rows, Rust ${rb.length} rows. First difference at row ${at}:\n` +
+    `    TS:   ${JSON.stringify(ra[at])}\n    Rust: ${JSON.stringify(rb[at])}`)
+}
+
 const run = (cmd: string, args: string[], env: Record<string, string>) =>
   new Promise<string>((resolve, reject) => {
     const child = spawn(cmd, args, { cwd: root, env: { ...process.env, NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost', ...env } })
@@ -144,7 +171,30 @@ try {
   ts.close()
   rust.close()
 
-  // ---- 2. Crawl --------------------------------------------------------------------------
+  // ---- 2. Stats --------------------------------------------------------------------------
+  console.log('\nStats: the same database through both engines\' stats rebuild')
+  const PATCHES = 4 // the fixture has three patches; one more checks that a short list is handled
+  const tsStats = join(dir, 'ts-stats.db')
+  const rsStats = join(dir, 'rust-stats.db')
+  copyFileSync(tsPath, tsStats)
+  copyFileSync(tsPath, rsStats)
+  const { buildStats } = await import('../src/stats/build')
+  const { STAT_TABLES } = await import('../src/db')
+  const tsS = openDb(tsStats)
+  buildStats(tsS, PATCHES, () => {})
+  tsS.close()
+  try {
+    await run(bin, ['--db', rsStats, 'stats', '--patches', String(PATCHES)], {})
+  } catch (e) {
+    fail('tft stats', `    ${(e as Error).message.split('\n').slice(0, 3).join('\n    ')}`)
+  }
+  const sa = new Database(tsStats, { readonly: true })
+  const sb = new Database(rsStats, { readonly: true })
+  for (const t of STAT_TABLES) compareStats(sa, sb, t)
+  sa.close()
+  sb.close()
+
+  // ---- 3. Crawl --------------------------------------------------------------------------
   console.log('\nCrawl: both crawlers against the same fake Riot API')
   const crawl = async (label: string, dbPath: string, cmd: string, args: string[]) => {
     const fake = await startFakeRiot()

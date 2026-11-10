@@ -4,6 +4,7 @@
 //!   tft crawl --once           stop when every known player is up to date
 //!   tft ingest FILE...         store saved match JSON files (one match, or an array of matches, per file)
 //!   tft patches                download the patch calendar and date matches stored without one
+//!   tft stats [--patches N]    rebuild the stat tables for the N most recent patches (same as `npm run stats`)
 //!   tft init                   create or upgrade the database and print where it is
 //!
 //! Settings come from `.env` in the current folder, the same file the TypeScript engine reads.
@@ -57,6 +58,12 @@ enum Command {
     },
     /// Download the patch calendar and date matches stored before it was known.
     Patches,
+    /// Rebuild the stat tables the app reads.
+    Stats {
+        /// How many of the most recent patches to rebuild.
+        #[arg(long, default_value_t = 2)]
+        patches: i64,
+    },
     /// Create or upgrade the database.
     Init,
 }
@@ -131,6 +138,29 @@ async fn run(command: Command, config: Config) -> Result<()> {
             println!("Stored {added} matches ({repeats} were already stored).");
         }
 
+        Command::Stats { patches } => {
+            let mut conn = tft_store::open(&config.db_path)?;
+            // Matches stored without a patch (Riot stopped sending one) get dated from the patch calendar first.
+            let unknown: i64 =
+                conn.query_row("SELECT COUNT(*) n FROM matches WHERE patch = 'unknown'", [], |r| r.get(0))?;
+            if unknown > 0 {
+                let cal = match tft_riot::cdragon::fetch_calendar(&tft_riot::http_client()).await {
+                    Ok(cal) if !cal.is_empty() => {
+                        save_calendar(&conn, &cal)?;
+                        cal
+                    }
+                    _ => load_calendar(&conn)?,
+                };
+                let fixed = relabel_unknown(&mut conn, &cal)?;
+                if fixed > 0 {
+                    println!("Dated {} matches to their patch.", thousands(fixed));
+                } else {
+                    println!("Could not reach Community Dragon for the patch calendar. Check your connection and run this again.");
+                }
+            }
+            tft_stats::build_stats(&mut conn, patches)?;
+        }
+
         Command::Patches => {
             let mut conn = tft_store::open(&config.db_path)?;
             let cal = match tft_riot::cdragon::fetch_calendar(&tft_riot::http_client()).await {
@@ -152,4 +182,17 @@ async fn run(command: Command, config: Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 1234567 as "1,234,567", as `toLocaleString('en-US')` prints it.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }

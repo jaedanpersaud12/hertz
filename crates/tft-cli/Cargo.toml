@@ -1,6 +1,6 @@
 [package]
 name = "tft-cli"
-description = "The `tft` command: crawl, ingest saved matches, refresh the patch calendar."
+description = "The `tft` command: crawl, ingest saved matches, refresh the patch calendar, rebuild stats."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,5 +16,6 @@ dotenvy.workspace = true
 serde_json.workspace = true
 tft-core.workspace = true
 tft-riot.workspace = true
+tft-stats.workspace = true
 tft-store.workspace = true
 tokio.workspace = true
