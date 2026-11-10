@@ -374,6 +374,45 @@ mod tests {
     }
 
     #[test]
+    fn buckets_and_window_narrow_the_matches() {
+        let units: &[&str] = &["U1", "U2"];
+        let boards: Vec<(&str, i64, &[&str])> = (0..40).map(|i| ("X|A", 1 + i % 8, units)).collect();
+        let (dir, mut conn) = world("scopes", &boards);
+        // Five matches: ranks exactly at each bucket minimum (0, 4, 6, 7) plus one below Platinum.
+        // M0 and M1 are old (one just outside 3 days); M2 is just inside.
+        let now = now_ms();
+        for (m, rank, age_ms) in [
+            ("M0", 7, 10 * 86_400_000),
+            ("M1", 6, 3 * 86_400_000 + 60_000),
+            ("M2", 4, 3 * 86_400_000 - 60_000),
+            ("M3", 0, 3_600_000),
+            ("M4", 3, 3_600_000),
+        ] {
+            conn.execute("UPDATE matches SET rank = ?, game_datetime = ? WHERE match_id = ?", params![rank, now - age_ms, m])
+                .unwrap();
+        }
+        build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
+        let meta = |scope: &str| -> (i64, i64) {
+            conn.query_row("SELECT matches, comps FROM stat_meta WHERE bucket = ?", [scope], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        assert_eq!(meta("ALL"), (5, 40));
+        assert_eq!(meta("PLATINUM+"), (3, 24));
+        assert_eq!(meta("DIAMOND+"), (2, 16));
+        assert_eq!(meta("MASTER+"), (1, 8));
+        assert_eq!(meta("ALL@3d"), (3, 24));
+        assert_eq!(meta("PLATINUM+@3d"), (1, 8));
+        assert_eq!(meta("DIAMOND+@3d"), (0, 0));
+        assert_eq!(meta("MASTER+@3d"), (0, 0));
+        // An empty scope writes its meta row and nothing else.
+        let units_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM stat_units WHERE bucket = 'MASTER+@3d'", [], |r| r.get(0)).unwrap();
+        assert_eq!(units_rows, 0);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn says_so_when_nothing_is_stored() {
         let (dir, mut conn) = world("empty", &[]);
         let mut lines = Vec::new();

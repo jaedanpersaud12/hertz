@@ -5,9 +5,10 @@
  *
  * 1. Ingest: the same match files go through both engines into two fresh databases. Schema and every raw
  *    table are compared row by row, in insertion order. Includes awkward cases on top of the fake world.
- * 2. Stats: copies of the ingested database get their stat tables built by each engine. Every stat table is
- *    compared row by row in primary key order. Averages (REAL columns) may differ by at most 0.0001;
- *    stat_meta.built_at is a timestamp and is left out.
+ * 2. Stats: copies of the ingested database get the same spread of ranks and dates, then their stat tables
+ *    are built by each engine. Every stat table is compared row by row in primary key order, every value
+ *    exactly; stat_meta.built_at is a timestamp and is left out. A check that the buckets and the 3-day
+ *    window really narrow the input keeps the comparison from passing vacuously.
  * 3. Crawl: both crawlers run against the same fake Riot API (rate limits, a forced 429, server errors).
  *    The databases are compared by content, since the two crawlers fetch in a different order.
  *
@@ -97,28 +98,20 @@ function compareContent(a: Database.Database, b: Database.Database, label: strin
   fail(label, `    TypeScript ${ra.length}, Rust ${rb.length}. Only in TS: ${onlyA.slice(0, 2).join(' ')} Only in Rust: ${onlyB.slice(0, 2).join(' ')}`)
 }
 
-/** Averages may differ by this much; every other value must be identical. */
-const TOLERANCE = 0.0001
-
-/** Row-by-row comparison of a stat table in primary key order. REAL columns get TOLERANCE, built_at is skipped. */
+/** Row-by-row comparison of a stat table in primary key order, every value exact. stat_meta.built_at is skipped. */
 function compareStats(a: Database.Database, b: Database.Database, table: string) {
-  const info = a.prepare(`PRAGMA table_info(${table})`).all() as { name: string; type: string; pk: number }[]
+  const info = a.prepare(`PRAGMA table_info(${table})`).all() as { name: string; pk: number }[]
   const keys = info.filter((c) => c.pk > 0).sort((x, y) => x.pk - y.pk).map((c) => c.name)
   const cols = info.map((c) => c.name).filter((c) => !(table === 'stat_meta' && c === 'built_at'))
-  const real = new Set(info.filter((c) => c.type === 'REAL').map((c) => c.name))
   const sql = `SELECT ${cols.join(', ')} FROM ${table} ORDER BY ${keys.join(', ')}`
-  const [ra, rb] = [a.prepare(sql).all() as Record<string, unknown>[], b.prepare(sql).all() as Record<string, unknown>[]]
-  const same = (x: Record<string, unknown>, y: Record<string, unknown> | undefined) =>
-    !!y && cols.every((c) =>
-      real.has(c) && typeof x[c] === 'number' && typeof y[c] === 'number'
-        ? Math.abs((x[c] as number) - (y[c] as number)) <= TOLERANCE
-        : x[c] === y[c])
-  const first = ra.findIndex((r, i) => !same(r, rb[i]))
+  const rows = (db: Database.Database) => (db.prepare(sql).all() as unknown[]).map((r) => JSON.stringify(r))
+  const [ra, rb] = [rows(a), rows(b)]
   if (!ra.length) return fail(table, '    the TypeScript engine wrote no rows, so this check proves nothing')
+  const first = ra.findIndex((r, i) => r !== rb[i])
   if (ra.length === rb.length && first < 0) return ok(`${table}: ${ra.length} rows identical`)
   const at = first < 0 ? ra.length : first
   fail(table, `    TypeScript ${ra.length} rows, Rust ${rb.length} rows. First difference at row ${at}:\n` +
-    `    TS:   ${JSON.stringify(ra[at])}\n    Rust: ${JSON.stringify(rb[at])}`)
+    `    TS:   ${ra[at]}\n    Rust: ${rb[at]}`)
 }
 
 const run = (cmd: string, args: string[], env: Record<string, string>) =>
@@ -178,6 +171,15 @@ try {
   const rsStats = join(dir, 'rust-stats.db')
   copyFileSync(tsPath, tsStats)
   copyFileSync(tsPath, rsStats)
+  // Every fixture match is rank 8 and an hour old, which would give all buckets and both windows the same
+  // input. Spread ranks over 0..9 and move a third of the matches 4 to 10 days back, the same in both copies.
+  const DAY = 86_400_000
+  for (const path of [tsStats, rsStats]) {
+    const db = new Database(path)
+    db.prepare(`UPDATE matches SET rank = rowid % 10,
+      game_datetime = CASE WHEN rowid % 3 = 0 THEN game_datetime - (4 + rowid % 7) * ? ELSE game_datetime END`).run(DAY)
+    db.close()
+  }
   const { buildStats } = await import('../src/stats/build')
   const { STAT_TABLES } = await import('../src/db')
   const tsS = openDb(tsStats)
@@ -191,6 +193,15 @@ try {
   const sa = new Database(tsStats, { readonly: true })
   const sb = new Database(rsStats, { readonly: true })
   for (const t of STAT_TABLES) compareStats(sa, sb, t)
+  // The comparison only means something if the buckets and the window really narrow the input.
+  const counts = (scope: string) =>
+    (sa.prepare("SELECT matches FROM stat_meta WHERE patch = '99.3' AND bucket = ?").get(scope) as { matches: number } | undefined)?.matches ?? 0
+  const whole = ['ALL', 'PLATINUM+', 'DIAMOND+', 'MASTER+'].map(counts)
+  const recent = ['ALL@3d', 'PLATINUM+@3d', 'DIAMOND+@3d', 'MASTER+@3d'].map(counts)
+  const label = `patch 99.3 matches per bucket ${whole.join(' > ')}, last 3 days ${recent.join(' > ')}`
+  const decreasing = (xs: number[]) => xs.every((x, i) => i === 0 || x < xs[i - 1]) && xs[xs.length - 1] > 0
+  if (decreasing(whole) && decreasing(recent) && whole.every((w, i) => recent[i] < w)) ok(label)
+  else fail('buckets and window', `    ${label}: each bucket must have fewer matches than the one before, and each 3-day count fewer than its whole patch`)
   sa.close()
   sb.close()
 
