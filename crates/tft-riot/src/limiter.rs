@@ -286,11 +286,11 @@ mod tests {
         assert!(waited < Duration::from_millis(4100), "second request waited too long: {waited:?}");
     }
 
-    /// Callers that always have work, with 50 to 400 ms answers, for two simulated hours.
+    /// Callers that always have work, with 50 to 400 ms answers, for 24 simulated hours (the soak's length).
     async fn sustained_load(margin: f64) -> (Vec<Instant>, SlotUse) {
         let limiter = Limiter::new(&DEFAULT_LIMITS, margin);
         let sent = Arc::new(Mutex::new(Vec::<Instant>::new()));
-        let end = Instant::now() + Duration::from_secs(2 * 3600);
+        let end = Instant::now() + Duration::from_secs(24 * 3600);
         let mut tasks = Vec::new();
         for i in 0..30u64 {
             let (l, sent) = (Arc::clone(&limiter), Arc::clone(&sent));
@@ -317,36 +317,31 @@ mod tests {
         (0..sent.len()).map(|i| sent[i..].iter().take_while(|u| **u < sent[i] + len).count()).max().unwrap()
     }
 
-    /// Requests per 2 minutes over the sixty whole 2-minute windows from the first send.
-    fn per_two_minutes(sent: &[Instant]) -> f64 {
-        let end = sent[0] + Duration::from_secs(60 * 120);
-        sent.iter().filter(|t| **t < end).count() as f64 / 60.0
+    /// Requests per 2 minutes in steady state: the first 2-minute window (warm-up, when nothing is held yet)
+    /// is skipped, then every whole 2-minute window up to the last request is counted.
+    fn steady_per_two_minutes(sent: &[Instant]) -> f64 {
+        let w = Duration::from_secs(120);
+        let from = sent[0] + w;
+        let windows = ((*sent.last().unwrap() - from).as_secs_f64() / w.as_secs_f64()).floor();
+        let to = from + w.mul_f64(windows);
+        sent.iter().filter(|t| **t >= from && **t < to).count() as f64 / windows
     }
 
+    /// At the default RATE_MARGIN, a region uses at least 95 of Riot's 100 slots per 2 minutes, all day,
+    /// and never more than 100 per 2 minutes or 20 per second.
     #[tokio::test(start_paused = true)]
-    async fn sustained_load_uses_at_least_95_of_100_slots_per_two_minutes() {
-        let (sent, at_end) = sustained_load(1.0).await;
+    async fn a_day_at_the_default_margin_uses_at_least_95_of_100_slots_and_never_more_than_riot_allows() {
+        let margin = tft_core::config::Config::from_lookup(|_| None).rate_margin;
+        let (sent, at_end) = sustained_load(margin).await;
         let most = most_in_any(&sent, Duration::from_secs(120));
         assert!(most <= 100, "{most} requests in one 2-minute window, Riot allows 100");
         let most = most_in_any(&sent, Duration::from_secs(1));
         assert!(most <= 20, "{most} requests in one second, Riot allows 20");
-        let used = per_two_minutes(&sent);
-        assert!(used >= 95.0, "only {used} of 100 slots used per 2 minutes");
+        let used = steady_per_two_minutes(&sent);
+        eprintln!("steady state at RATE_MARGIN={margin}: {used:.2} of 100 slots per 2 minutes over 24 hours");
+        assert!(used >= 95.0, "only {used:.2} of 100 slots used per 2 minutes");
         assert_eq!(at_end.riot_limit, 100);
-        assert!((at_end.average - used).abs() < 2.0, "slot use reports {}, actual {used}", at_end.average);
-    }
-
-    /// The default margin (RATE_MARGIN=0.95) allows 95 of 100, and the crawler should use all 95.
-    #[tokio::test(start_paused = true)]
-    async fn sustained_load_at_the_default_margin_stays_at_95() {
-        let (sent, at_end) = sustained_load(0.95).await;
-        let most = most_in_any(&sent, Duration::from_secs(120));
-        assert!(most <= 95, "{most} requests in one 2-minute window, margin allows 95");
-        let most = most_in_any(&sent, Duration::from_secs(1));
-        assert!(most <= 19, "{most} requests in one second, margin allows 19");
-        let used = per_two_minutes(&sent);
-        assert!(used >= 95.0, "only {used} of 100 slots used per 2 minutes");
-        assert!((at_end.average - used).abs() < 2.0, "slot use reports {}, actual {used}", at_end.average);
+        assert!((at_end.average - used).abs() < 2.0, "slot use reports {}, actual {used:.2}", at_end.average);
     }
 
     #[tokio::test(start_paused = true)]

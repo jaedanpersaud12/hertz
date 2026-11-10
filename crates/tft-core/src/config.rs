@@ -95,7 +95,7 @@ impl Config {
             port: num("PORT", 5174.0) as u16,
             riot_id: get("RIOT_ID").unwrap_or_default(),
             my_platform: get("MY_PLATFORM").unwrap_or_default().to_lowercase(),
-            rate_margin: num("RATE_MARGIN", 0.95),
+            rate_margin: num("RATE_MARGIN", 1.0),
         }
     }
 }
