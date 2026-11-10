@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: Independent review of one TFT Local change against its issue's acceptance criteria and the repo rules. Use after the tester passes a branch. Gets only the issue and the diff.
+description: Independent review of one Hertz change against its issue's acceptance criteria and the repo rules. Use after the tester passes a branch. Gets only the issue and the diff.
 tools: Read, Grep, Glob, Bash
 ---
 

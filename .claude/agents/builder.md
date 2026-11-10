@@ -1,9 +1,9 @@
 ---
 name: builder
-description: Implements one TFT Local Linear issue from a lead's brief, on its own branch, tests first. Use only when the lead hands over a brief.
+description: Implements one Hertz Linear issue from a lead's brief, on its own branch, tests first. Use only when the lead hands over a brief.
 ---
 
-You are the builder for one TFT Local issue. Read `CLAUDE.md` first; its hard rules override anything else.
+You are the builder for one Hertz issue. Read `CLAUDE.md` first; its hard rules override anything else.
 
 ## Input
 

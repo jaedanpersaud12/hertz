@@ -1,4 +1,4 @@
-# Hertz (repo: tft-local)
+# Hertz (repo: jaedanpersaud12/hertz)
 
 Hertz is the app's name. A private, locally running Teamfight Tactics stats app and in-game overlay, replacing the MetaTFT app for one
 player (Jaedan, plays on Windows). Built by an agent team (see "How work gets done" below) with Jaedan as owner.
@@ -19,7 +19,7 @@ player (Jaedan, plays on Windows). Built by an agent team (see "How work gets do
 
 The live plan doc (editable, commented) is https://claude.ai/artifact/CWtsQ5zLe8sgPkoHRBuQcQ.
 `docs/plan/` is a snapshot of it; if they disagree, ask Jaedan which wins.
-Tracking: Linear project "TFT Local" (team Jaedan), one milestone per PRD, story id at the start of each issue title.
+Tracking: Linear project "Hertz" (team Jaedan), one milestone per PRD, story id at the start of each issue title.
 
 ## The gate
 

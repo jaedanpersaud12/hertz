@@ -10,7 +10,7 @@ feature code. Read `CLAUDE.md` first.
 
 ## 2. Every Done has proof
 
-List issues in the Linear project "TFT Local" that moved to Done in the last 7 days. For each:
+List issues in the Linear project "Hertz" that moved to Done in the last 7 days. For each:
 
 1. It has a proof comment (commit hash, reviewer APPROVE lines, gate tail). No proof: reopen (step 4).
 2. The commit is on `main`: `git branch --contains <hash>` includes main. Missing: reopen.
@@ -38,7 +38,7 @@ Commit an updated `docs/plan/log.md` (create it if missing) with one row per wee
 
 ## 6. Report
 
-Post one comment on the Linear project "TFT Local":
+Post one comment on the Linear project "Hertz":
 
 ```
 Audit <date>, plan week <n>: <done>/<planned> stories. Main <green|red>, gate <duration>.

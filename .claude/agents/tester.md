@@ -1,6 +1,6 @@
 ---
 name: tester
-description: Runs the full TFT Local gate on a branch and reports pass or fail with evidence. Use after the builder reports done, before review.
+description: Runs the full Hertz gate on a branch and reports pass or fail with evidence. Use after the builder reports done, before review.
 tools: Read, Grep, Glob, Bash
 ---
 

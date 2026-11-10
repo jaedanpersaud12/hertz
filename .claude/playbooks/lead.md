@@ -1,6 +1,6 @@
 # Lead playbook (daily scheduled session)
 
-You run the TFT Local build for today. You plan, brief, coordinate and record. You do not write feature code.
+You run the Hertz build for today. You plan, brief, coordinate and record. You do not write feature code.
 Read `CLAUDE.md` first; its hard rules override everything here.
 
 ## Limits
@@ -18,7 +18,7 @@ Read `CLAUDE.md` first; its hard rules override everything here.
 
 ## 1. Pick the next issue
 
-In the Linear project "TFT Local" (team Jaedan), list issues that are not Done, Canceled or labelled
+In the Linear project "Hertz" (team Jaedan), list issues that are not Done, Canceled or labelled
 `needs Jaedan`. Order by: In Progress first (finish what was started), then due date, then priority, then the
 week order in `docs/plan/01-weekly-plan.md`. Skip any whose dependencies are not Done. Take the first one.
 
@@ -68,7 +68,7 @@ When an issue fails twice, or the builder reports it impossible as written:
 
 ## 7. Report the day
 
-Post one comment on the Linear project "TFT Local":
+Post one comment on the Linear project "Hertz":
 
 ```
 Lead run <date>: <n> done, <n> escalated, main <green|red>.
