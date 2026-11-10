@@ -1,0 +1,12 @@
+[package]
+name = "tft-core"
+description = "Shared types and rules: configuration, Riot match shapes, comp labels, patch dating."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+httpdate.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

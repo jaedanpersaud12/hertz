@@ -1,0 +1,8 @@
+[package]
+name = "tft-api"
+description = "The /api routes the React app calls. Ported in week 2 (PRD 1 E1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]

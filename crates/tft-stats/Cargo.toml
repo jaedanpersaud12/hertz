@@ -1,0 +1,8 @@
+[package]
+name = "tft-stats"
+description = "Aggregation, comp merging and the Explorer index. Ported in week 2 (PRD 1 E1, E5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]

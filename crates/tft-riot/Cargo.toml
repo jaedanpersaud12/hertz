@@ -1,0 +1,21 @@
+[package]
+name = "tft-riot"
+description = "Riot API client with per-region rate limiting, Community Dragon downloads, and the crawler."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tft-core.workspace = true
+tft-store.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

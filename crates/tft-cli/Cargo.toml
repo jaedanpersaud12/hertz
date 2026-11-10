@@ -1,0 +1,20 @@
+[package]
+name = "tft-cli"
+description = "The `tft` command: crawl, ingest saved matches, refresh the patch calendar."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tft"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+serde_json.workspace = true
+tft-core.workspace = true
+tft-riot.workspace = true
+tft-store.workspace = true
+tokio.workspace = true

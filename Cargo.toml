@@ -1,0 +1,33 @@
+# The Rust engine. Replaces the TypeScript engine in src/crawler, src/stats and src/server piece by piece;
+# the React app in src/ui stays as it is. See crates/README.md.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tft-core = { path = "crates/tft-core" }
+tft-store = { path = "crates/tft-store" }
+tft-riot = { path = "crates/tft-riot" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+futures = "0.3"
+httpdate = "1"
+regex = "1"
+# TLS through rustls with the ring backend: builds on Windows, macOS and Linux without CMake, NASM or OpenSSL.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+lto = "thin"
