@@ -13,6 +13,7 @@ rust-version = "1.85"
 tft-core = { path = "crates/tft-core" }
 tft-store = { path = "crates/tft-store" }
 tft-riot = { path = "crates/tft-riot" }
+tft-stats = { path = "crates/tft-stats" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

@@ -1270,6 +1270,7 @@ dependencies = [
  "serde_json",
  "tft-core",
  "tft-riot",
+ "tft-stats",
  "tft-store",
  "tokio",
 ]
@@ -1303,6 +1304,12 @@ dependencies = [
 [[package]]
 name = "tft-stats"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "tft-core",
+ "tft-store",
+]
 
 [[package]]
 name = "tft-store"
