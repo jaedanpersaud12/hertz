@@ -6,7 +6,7 @@ use crate::cdragon::fetch_calendar;
 use crate::client::{RiotClient, RiotError, http_client};
 use anyhow::{Result, bail};
 use futures::future::join_all;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +20,9 @@ const RECRAWL_MS: i64 = 6 * 3600 * 1000;
 
 /// Settings key: servers whose ladders were not read to the end (the crawler was stopped or killed).
 const SEED_PENDING: &str = "seed_pending";
+
+/// A match whose answer is cut off this many times in one run is left queued for the next run.
+const CUT_OFF_LIMIT: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct CrawlOptions {
@@ -39,6 +42,8 @@ pub struct Crawler {
     calendar: RwLock<Calendar>,
     stored: AtomicU64,
     stop: Arc<AtomicBool>,
+    /// How often each match's answer was cut off in this run.
+    cut_off: Mutex<HashMap<String, u32>>,
 }
 
 fn now_ms() -> i64 {
@@ -60,6 +65,7 @@ impl Crawler {
             calendar: RwLock::new(calendar),
             stored: AtomicU64::new(0),
             stop,
+            cut_off: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -273,12 +279,21 @@ impl Crawler {
         Ok(())
     }
 
+    /// Queued matches this run still has to fetch (the ones held back after repeated cut-offs are left out).
     fn pending(&self, route: &str) -> Result<i64> {
         Ok(self.db.lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM match_queue WHERE route = ?1 AND status = 0",
-            [route],
+            "SELECT COUNT(*) FROM match_queue WHERE route = ?1 AND status = 0
+             AND match_id NOT IN (SELECT value FROM json_each(?2))",
+            params![route, self.held_back()?],
             |r| r.get(0),
         )?)
+    }
+
+    /// Matches whose answer was cut off too often in this run, as a JSON list. They stay queued for the next run.
+    fn held_back(&self) -> Result<String> {
+        let cut_off = self.cut_off.lock().unwrap();
+        let ids: Vec<&String> = cut_off.iter().filter(|(_, n)| **n >= CUT_OFF_LIMIT).map(|(id, _)| id).collect();
+        Ok(serde_json::to_string(&ids)?)
     }
 
     /// One round: top up the queue, then fetch a batch of matches. Returns true when `--once` is satisfied.
@@ -343,9 +358,10 @@ impl Crawler {
         let batch: Vec<(String, String, i64)> = {
             let db = self.db.lock().unwrap();
             let mut q = db.prepare_cached(
-                "SELECT match_id, platform, seed_rank FROM match_queue WHERE route = ?1 AND status = 0 LIMIT ?2",
+                "SELECT match_id, platform, seed_rank FROM match_queue WHERE route = ?1 AND status = 0
+                 AND match_id NOT IN (SELECT value FROM json_each(?2)) LIMIT ?3",
             )?;
-            q.query_map(params![route, 20], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            q.query_map(params![route, self.held_back()?, 20], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite_result::Result<_>>()?
         };
 
@@ -367,7 +383,19 @@ impl Crawler {
                 None => continue,
                 Some(Ok(m)) => m,
                 // The answer was cut off (laptop asleep, connection dropped): leave it queued to fetch again.
-                Some(Err(RiotError::BadBody { source, .. })) if !riot_sent_garbage(&source) => continue,
+                Some(Err(RiotError::BadBody { source, .. })) if !riot_sent_garbage(&source) => {
+                    let mut cut_off = self.cut_off.lock().unwrap();
+                    let n = cut_off.entry(id.clone()).or_default();
+                    *n += 1;
+                    if *n < CUT_OFF_LIMIT {
+                        println!("[{route}] the answer for {id} was cut off. It will be fetched again.");
+                    } else {
+                        println!(
+                            "[{route}] the answer for {id} was cut off {n} times. Leaving it queued for the next run."
+                        );
+                    }
+                    continue;
+                }
                 Some(Err(RiotError::BadBody { url, source })) => {
                     println!("[{route}] skipped {id}: Riot sent an unreadable answer ({source}) for {url}");
                     set_status(id, 2)?;
