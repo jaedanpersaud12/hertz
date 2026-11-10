@@ -8,11 +8,19 @@
  * request a run is meant to die on arrives, SIGKILLs the crawler before answering it. So every kill lands on a
  * known request, and the script checks where each one landed.
  *
+ * Kills on requests can never land between two database writes (all of a batch's downloads finish before any of
+ * it is stored), so other runs set `TFT_DIE_AT=<point>:<n>`, a test-only hook in crates/tft-riot/src/crawl.rs that
+ * aborts the crawler exactly between two writes: after a ladder page is saved, after a server's ladders are all
+ * saved, after a match list is queued, after a match is downloaded but before it is stored, and after its store
+ * commits but before it is marked done.
+ *
  * 1. Reference: one `tft crawl --once` into a fresh database.
  * 2. Chaos, into another fresh database:
- *    - killed while the ladders are being read, then while the other server's ladders are read,
- *    - killed on a match-list request,
+ *    - killed while the ladders are being read, then aborted after a ladder page is saved and after na1's ladders
+ *      are all saved, then killed while the other server's ladders are read,
+ *    - killed on a match-list request, then aborted right after a match list is queued,
  *    - killed on match downloads chosen from a fixed seed, each while that match is still queued,
+ *    - aborted just before a match is stored, and just after its store commits (before it is marked done),
  *    - one run where the answer for one match is always cut off (it must be left queued, and the run must end),
  *    - a last run where that answer is cut off once (it must be fetched again and stored).
  * 3. The two databases are compared row by row, and the chaos database is checked for duplicates and orphans.
@@ -69,11 +77,15 @@ interface Plan {
   /** SIGKILL the crawler when the `nth` request of this kind (counted in this run, from 1) arrives. */
   kill?: { kind: Kind; nth: number }
   /** Cut off the answer for this match: always, or only the first time it is asked for. */
-  cutOff?: { matchId?: string; firstMatch?: boolean; times: 'always' | 'once' }
+  cutOff?: { matchId?: string; firstMatch?: boolean; times: 'always' | 'once'; among?: Set<string> }
+  /** Abort the crawler at an exact point between database writes: `TFT_DIE_AT=<point>:<n>` (test-only hook). */
+  dieAt?: string
 }
 
 interface RunResult {
-  outcome: 'killed' | 'finished'
+  outcome: 'killed' | 'died' | 'finished'
+  /** Where `TFT_DIE_AT` aborted it: the point and what it was working on (a match id, a puuid, a server). */
+  died?: { point: string; what: string }
   /** The request the crawler was killed on. */
   killedOn?: { kind: Kind; path: string }
   /** Match ids whose answers were cut off in this run. */
@@ -121,7 +133,7 @@ async function startProxy(fakePort: number) {
       return
     }
     const id = matchIdOf(path)
-    if (kind === 'match' && id && plan.cutOff && !cutTarget && plan.cutOff.firstMatch) cutTarget = id
+    if (kind === 'match' && id && plan.cutOff && !cutTarget && plan.cutOff.firstMatch && (plan.cutOff.among?.has(id) ?? true)) cutTarget = id
     const cutThis = kind === 'match' && id !== undefined && plan.cutOff !== undefined && id === (plan.cutOff.matchId ?? cutTarget) &&
       (plan.cutOff.times === 'always' || !cut.includes(id))
     forward(req, (status, headers, body) => {
@@ -150,7 +162,8 @@ async function startProxy(fakePort: number) {
       cut = []
       cutTarget = undefined
       return new Promise<RunResult>((resolve, reject) => {
-        const c = spawn(bin, ['crawl', '--once'], { cwd: root, env: envFor(port, dbPath) })
+        const env = { ...envFor(port, dbPath), ...(p.dieAt ? { TFT_DIE_AT: p.dieAt } : {}) }
+        const c = spawn(bin, ['crawl', '--once'], { cwd: root, env })
         child = c
         let out = ''
         c.stdout.on('data', (d) => (out += d))
@@ -158,7 +171,9 @@ async function startProxy(fakePort: number) {
         c.on('exit', (code, signal) => {
           child = undefined
           const result = { killedOn, cut: [...cut], out, counts: { ...counts } }
+          const died = out.match(/^TFT_DIE_AT (\S+):\d+ (\S+)$/m)
           if (killedOn && signal === 'SIGKILL') resolve({ outcome: 'killed', ...result })
+          else if (p.dieAt && died && signal === 'SIGABRT') resolve({ outcome: 'died', died: { point: died[1], what: died[2] }, ...result })
           else if (code === 0) resolve({ outcome: 'finished', ...result })
           else reject(new Error(`tft crawl exited ${code ?? signal}\n${out}`))
         })
@@ -205,6 +220,17 @@ const seedPending = (dbPath: string): string[] => {
   }
 }
 
+function lastCrawled(dbPath: string, puuid: string) {
+  const db = new Database(dbPath, { readonly: true })
+  try {
+    const crawled = (db.prepare('SELECT last_crawled AS n FROM players WHERE puuid = ?').get(puuid) as { n: number } | undefined)?.n ?? 0
+    const queuedFor = count(db, 'SELECT COUNT(*) AS n FROM match_queue')
+    return { crawled, queuedFor }
+  } finally {
+    db.close()
+  }
+}
+
 function queued(dbPath: string, matchId: string) {
   const db = new Database(dbPath, { readonly: true })
   try {
@@ -233,6 +259,10 @@ try {
     await fake.close()
   }
   const c = ref.counts
+  // Matches the uninterrupted crawl stored. The cut-off runs pick one of these that is not stored yet.
+  const refDb = new Database(refPath, { readonly: true })
+  const refStored = new Set((refDb.prepare('SELECT match_id FROM matches').raw().all() as string[][]).map((r) => r[0]))
+  refDb.close()
   console.log(`\nUninterrupted crawl: ${proxy.total.requests} requests (${c.ladder} ladder, ${c.ids} match lists, ${c.match} matches)`)
 
   // ---- 2. Killed and restarted -----------------------------------------------------------
@@ -247,6 +277,18 @@ try {
     check(q.players > 0, 'kill 1: some players were saved before it', `${q.players} players`)
     check(seedPending(chaosPath).includes('na1'), 'kill 1: na1 is marked as not read to the end', `seed_pending = ${JSON.stringify(seedPending(chaosPath))}`)
 
+    // Aborted right after the 2nd ladder page of the re-read is saved: na1 must still be marked as not read to the end.
+    r = await proxy.run(chaosPath, { dieAt: 'after_ladder:2' })
+    check(r.outcome === 'died' && r.died?.point === 'after_ladder' && r.died.what.startsWith('na1/'),
+      'abort after a ladder page is saved lands in the na1 ladders', `${r.outcome} at ${r.died?.point} ${r.died?.what}`)
+    check(seedPending(chaosPath).includes('na1'), 'after_ladder: na1 is still marked as not read to the end', `seed_pending = ${JSON.stringify(seedPending(chaosPath))}`)
+
+    // Aborted after all of na1's ladders are saved but before na1 leaves seed_pending: it must be read again.
+    r = await proxy.run(chaosPath, { dieAt: 'after_seed:1' })
+    check(r.outcome === 'died' && r.died?.point === 'after_seed' && r.died.what === 'na1',
+      'abort after na1\'s ladders are all saved lands before na1 is marked done', `${r.outcome} at ${r.died?.point} ${r.died?.what}`)
+    check(seedPending(chaosPath).includes('na1'), 'after_seed: na1 is still marked, so its ladders are read again', `seed_pending = ${JSON.stringify(seedPending(chaosPath))}`)
+
     // Restarted: na1 is read again (8 requests), then euw1. Request 15 is in the middle of euw1.
     r = await proxy.run(chaosPath, { kill: { kind: 'ladder', nth: 15 } })
     check(r.outcome === 'killed' && /^\/euw1\//.test(r.killedOn?.path ?? ''), 'kill 2 lands while the euw1 ladders are read', `${r.outcome} on ${r.killedOn?.path}`)
@@ -257,6 +299,13 @@ try {
     r = await proxy.run(chaosPath, { kill: { kind: 'ids', nth: 3 } })
     check(r.outcome === 'killed' && r.killedOn?.kind === 'ids', 'kill 3 lands on a match-list request', `${r.outcome} on ${r.killedOn?.path}`)
     check(seedPending(chaosPath).length === 0, 'kill 3: both ladders were read to the end', `seed_pending = ${JSON.stringify(seedPending(chaosPath))}`)
+
+    // Aborted right after one player's match list is committed: that player is marked as looked at and its matches are
+    // queued.
+    r = await proxy.run(chaosPath, { dieAt: 'after_enqueue:2' })
+    const lc = lastCrawled(chaosPath, r.died?.what ?? '')
+    check(r.outcome === 'died' && r.died?.point === 'after_enqueue' && lc.crawled > 0 && lc.queuedFor > 0,
+      `abort after a match list is queued lands with ${r.died?.what} marked as looked at`, `${r.outcome} at ${r.died?.point} ${r.died?.what}, last_crawled ${lc.crawled}, queue ${lc.queuedFor}`)
 
     // Match downloads, each at a seeded point inside the first two batches of the run.
     const next = random(SEED)
@@ -273,8 +322,24 @@ try {
     }
     check(midMatch > 0, `${midMatch} kills landed mid-match`)
 
-    // A match whose answer is always cut off: left queued, and the run still ends.
-    r = await proxy.run(chaosPath, { cutOff: { firstMatch: true, times: 'always' } })
+    // Aborted between the database writes for one match: just before its store, and just after its store commits but
+    // before it is marked done. The first must leave it queued and unstored; the second stored but still queued, so
+    // the next run stores it again, which must add nothing (the duplicate and row-by-row checks below).
+    for (const [point, n] of [['before_store', 1], ['after_store', 1], ['after_store', 13], ['before_store', 13], ['after_store', 27], ['before_store', 27]] as const) {
+      r = await proxy.run(chaosPath, { dieAt: `${point}:${n}` })
+      const id = r.died?.what ?? ''
+      q = queued(chaosPath, id)
+      const want = point === 'before_store' ? q.status === 0 && q.stored === 0 : q.status === 0 && q.stored === 1
+      check(r.outcome === 'died' && r.died?.point === point && want,
+        `abort ${point}:${n} lands on ${id} ${point === 'before_store' ? 'still queued and not stored' : 'stored but still queued'}`,
+        `${r.outcome} at ${r.died?.point} ${id}, queue status ${q.status}, stored ${q.stored}`)
+    }
+
+    // A ranked match not stored yet whose answer is always cut off: left queued, and the run still ends.
+    const chaosDb = new Database(chaosPath, { readonly: true })
+    const notYet = new Set([...refStored].filter((id) => count(chaosDb, 'SELECT COUNT(*) AS n FROM matches WHERE match_id = ?', id) === 0))
+    chaosDb.close()
+    r = await proxy.run(chaosPath, { cutOff: { firstMatch: true, times: 'always', among: notYet } })
     const stuck = r.cut[0]
     q = queued(chaosPath, stuck ?? '')
     check(r.outcome === 'finished', 'a run where one answer is always cut off still finishes', r.outcome)

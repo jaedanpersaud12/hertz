@@ -1,6 +1,16 @@
-//! Collects ranked TFT matches into the local database. Same behaviour as `src/crawler/crawl.ts`.
+//! Collects ranked TFT matches into the local database. Stores what `src/crawler/crawl.ts` stores, with two
+//! deliberate differences, both about stopping and starting again:
+//!
+//! - A server whose ladders were not read to the end (killed mid-seed) has its ladders read again on the next run
+//!   (`seed_pending`). The TypeScript crawler reads ladders only when it knows no players for that server
+//!   or is given `--reseed`.
+//! - A match answer that was cut off on the way is fetched again, up to 3 times per run, then left queued for the
+//!   next run. The TypeScript crawler stops on it.
 //!
 //! It is safe to stop and restart at any time: the queue and progress live in the database.
+//!
+//! Test only: `TFT_DIE_AT=<point>:<n>` aborts the process at an exact point between database writes, for
+//! `scripts/resume.ts`. See [`die_at`]. It does nothing unless that variable is set.
 
 use crate::cdragon::fetch_calendar;
 use crate::client::{RiotClient, RiotError, http_client};
@@ -8,7 +18,7 @@ use anyhow::{Result, bail};
 use futures::future::join_all;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tft_core::config::{Config, TIERS, platform_route, tier_name, tier_rank};
 use tft_core::patches::Calendar;
@@ -44,6 +54,29 @@ pub struct Crawler {
     stop: Arc<AtomicBool>,
     /// How often each match's answer was cut off in this run.
     cut_off: Mutex<HashMap<String, u32>>,
+}
+
+/// Test only, for `scripts/resume.ts`. With `TFT_DIE_AT=<point>:<n>` set, the nth time this run reaches `point`
+/// it prints `TFT_DIE_AT <point>:<n> <what>` to stderr and aborts, so a kill lands exactly between two database
+/// writes. Points: `after_ladder` (a ladder page is saved), `after_seed` (a server's ladders are all saved, before
+/// it leaves `seed_pending`), `after_enqueue` (one player's match list is queued), `before_store` (a match is
+/// downloaded, before its store), `after_store` (its store is committed, before its queue status is set).
+/// Does nothing when the variable is not set.
+fn die_at(point: &str, what: &str) {
+    static PLAN: OnceLock<Option<(String, u64)>> = OnceLock::new();
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    let plan = PLAN.get_or_init(|| {
+        let v = std::env::var("TFT_DIE_AT").ok()?;
+        let (p, n) = v.rsplit_once(':')?;
+        Some((p.to_string(), n.parse().ok()?))
+    });
+    if let Some((p, n)) = plan
+        && p == point
+        && HITS.fetch_add(1, Ordering::SeqCst) + 1 == *n
+    {
+        eprintln!("TFT_DIE_AT {point}:{n} {what}");
+        std::process::abort();
+    }
 }
 
 fn now_ms() -> i64 {
@@ -127,6 +160,7 @@ impl Crawler {
                 println!("[{platform}] reading ladders...");
                 self.seed(platform).await?;
                 if !self.stopping() {
+                    die_at("after_seed", platform);
                     self.set_seed_pending(platform, false)?;
                 }
             }
@@ -224,6 +258,7 @@ impl Crawler {
                 }
             }
             tx.commit()?;
+            die_at("after_ladder", &format!("{platform}/{tier}"));
             Ok(n)
         };
 
@@ -343,6 +378,7 @@ impl Crawler {
                                 tx.execute("UPDATE players SET last_crawled = ?1 WHERE puuid = ?2", params![now_ms(), puuid])?;
                             }
                             tx.commit()?;
+                            die_at("after_enqueue", puuid);
                         }
                         Err(e) => {
                             first_err.get_or_insert(e);
@@ -419,8 +455,10 @@ impl Crawler {
             let ingest = Ingest { platform, rank: *seed_rank, tier: tier_name(*seed_rank), snowball: self.config.snowball };
             let added = {
                 let cal = self.calendar.read().unwrap();
+                die_at("before_store", id);
                 ingest.store(&mut self.db.lock().unwrap(), &m, &cal)?
             };
+            die_at("after_store", id);
             if added {
                 self.stored.fetch_add(1, Ordering::Relaxed);
             }
