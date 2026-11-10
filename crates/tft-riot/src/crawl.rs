@@ -13,10 +13,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tft_core::config::{Config, TIERS, platform_route, tier_name, tier_rank};
 use tft_core::patches::Calendar;
 use tft_core::riot::LeagueEntry;
-use tft_store::{Connection, Ingest, load_calendar, params, save_calendar};
+use tft_store::{Connection, Ingest, kv_get, kv_set, load_calendar, params, save_calendar};
 
 /// Look at the same player again after this long.
 const RECRAWL_MS: i64 = 6 * 3600 * 1000;
+
+/// Settings key: servers whose ladders were not read to the end (the crawler was stopped or killed).
+const SEED_PENDING: &str = "seed_pending";
 
 #[derive(Debug, Clone, Default)]
 pub struct CrawlOptions {
@@ -111,9 +114,15 @@ impl Crawler {
                 [platform],
                 |r| r.get(0),
             )?;
-            if have == 0 || self.opts.reseed {
+            // A kill while reading the ladders leaves the platform in SEED_PENDING, so the next run reads them again.
+            let pending: Vec<String> = kv_get(&self.db.lock().unwrap(), SEED_PENDING)?.unwrap_or_default();
+            if have == 0 || self.opts.reseed || pending.contains(platform) {
+                self.set_seed_pending(platform, true)?;
                 println!("[{platform}] reading ladders...");
                 self.seed(platform).await?;
+                if !self.stopping() {
+                    self.set_seed_pending(platform, false)?;
+                }
             }
         }
 
@@ -172,6 +181,22 @@ impl Crawler {
                 c.retried.load(Ordering::Relaxed),
             );
         }
+    }
+
+    /// Adds or removes a platform from the list of servers whose ladders were not read to the end.
+    fn set_seed_pending(&self, platform: &str, unfinished: bool) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        let mut pending: Vec<String> = kv_get(&db, SEED_PENDING)?.unwrap_or_default();
+        pending.retain(|p| p != platform);
+        if unfinished {
+            pending.push(platform.to_string());
+        }
+        if pending.is_empty() {
+            db.execute("DELETE FROM kv WHERE key = ?1", [SEED_PENDING])?;
+        } else {
+            kv_set(&db, SEED_PENDING, &pending)?;
+        }
+        Ok(())
     }
 
     /// Fills the player list for one server from its ranked ladders.
@@ -341,6 +366,8 @@ impl Crawler {
             let m = match got {
                 None => continue,
                 Some(Ok(m)) => m,
+                // The answer was cut off (laptop asleep, connection dropped): leave it queued to fetch again.
+                Some(Err(RiotError::BadBody { source, .. })) if !riot_sent_garbage(&source) => continue,
                 Some(Err(RiotError::BadBody { url, source })) => {
                     println!("[{route}] skipped {id}: Riot sent an unreadable answer ({source}) for {url}");
                     set_status(id, 2)?;
@@ -378,6 +405,45 @@ impl Crawler {
     }
 }
 
+/// True when Riot's whole answer arrived but was not readable JSON, so fetching it again gives the same.
+/// False when the answer was cut off on the way, which is worth another try.
+fn riot_sent_garbage(e: &reqwest::Error) -> bool {
+    std::error::Error::source(e).is_some_and(|s| s.is::<serde_json::Error>())
+}
+
 mod rusqlite_result {
     pub type Result<T> = std::result::Result<T, tft_store::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::riot_sent_garbage;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves one answer whose body is `body`, announced as `length` bytes long, then hangs up.
+    async fn answer_once(body: &'static str, length: usize) -> reqwest::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {length}\r\n\r\n");
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body.as_bytes()).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+        let res = crate::client::http_client().get(format!("http://127.0.0.1:{port}/")).send().await.unwrap();
+        res.json::<serde_json::Value>().await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_answer_is_fetched_again() {
+        assert!(!riot_sent_garbage(&answer_once("{\"metadata\":", 500).await));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_answer_is_skipped() {
+        assert!(riot_sent_garbage(&answer_once("not json", 8).await));
+    }
 }
