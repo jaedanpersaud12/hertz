@@ -331,6 +331,47 @@ mod tests {
         assert_eq!(riot.counts.retried.load(Ordering::Relaxed), 0);
     }
 
+    /// The crawler sends up to 20 fetches at once, so a 429 must pause the whole group, not only the request
+    /// that got it (PRD rule 4: block that group). Other regions keep going.
+    #[tokio::test(start_paused = true)]
+    async fn a_429_blocks_the_whole_group_and_leaves_other_regions_free() {
+        let (base, hits) = serve(vec![Reply::Http(429, "retry-after: 3\r\n", "")]).await;
+        let riot = client(&base);
+
+        let a = riot.get::<Vec<String>>("americas", "/a");
+        let others = async {
+            while riot.counts.limited.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let limited_at = Instant::now();
+            let (b, eu) = tokio::join!(
+                riot.get::<Vec<String>>("americas", "/b"),
+                riot.get::<Vec<String>>("europe", "/eu")
+            );
+            (limited_at, b.unwrap(), eu.unwrap())
+        };
+        let (a, (limited_at, b, eu)) = tokio::join!(a, others);
+        assert_eq!((a.unwrap(), b, eu), (Some(vec![]), Some(vec![]), Some(vec![])));
+
+        let hits = hits.lock().unwrap().clone();
+        let sent = |path: &str| hits.iter().filter(|(_, p)| p == path).map(|(at, _)| *at).collect::<Vec<_>>();
+        assert_eq!(sent("/americas/a").len(), 2, "A gets its 429, then is sent again");
+        let b_at = sent("/americas/b");
+        assert_eq!(b_at.len(), 1);
+        assert!(
+            b_at[0] - limited_at >= Duration::from_secs(3),
+            "americas B was sent {:?} after the 429; Retry-After said 3 s for the whole group",
+            b_at[0] - limited_at
+        );
+        let eu_at = sent("/europe/eu");
+        assert_eq!(eu_at.len(), 1);
+        assert!(
+            eu_at[0] - limited_at < Duration::from_secs(1),
+            "europe waited {:?}; an americas 429 must not block it",
+            eu_at[0] - limited_at
+        );
+    }
+
     /// The client gives up after six tries and leaves the host free: the crawler's own 60 s pause on
     /// `Unavailable` is the only pause, so a batch is not held up twice.
     #[tokio::test(start_paused = true)]
