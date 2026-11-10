@@ -87,7 +87,7 @@ impl RiotClient {
     }
 
     #[cfg(test)]
-    fn with_http(mut self, http: reqwest::Client) -> Self {
+    pub(crate) fn with_http(mut self, http: reqwest::Client) -> Self {
         self.http = http;
         self
     }
@@ -107,12 +107,14 @@ impl RiotClient {
     /// the host after the last try: the crawler pauses that group for 60 s on `Unavailable`, as the
     /// TypeScript crawler does, and the queued match stays queued.
     ///
-    /// Two intended differences from the TypeScript client:
+    /// Three intended differences from the TypeScript client:
     /// - 429 retries are uncapped. A 429 waits Retry-After and sends the same request again, and never uses
     ///   up one of the six tries (PRD rule 4). The TypeScript client counts 429s against its tries.
     /// - The request does not check the crawler's stop flag between 429 waits. A stop takes effect once the
     ///   request in hand finishes, which can be several Retry-After waits later; the TypeScript client
     ///   gives up within six attempts.
+    /// - The client gives up straight after the sixth failed try. The TypeScript client waits one more
+    ///   backoff (32 s) after its last try before it throws.
     pub async fn get<T: DeserializeOwned>(&self, host: &str, path: &str) -> Result<Option<T>, RiotError> {
         if self.key.is_empty() {
             return Err(RiotError::Key(
