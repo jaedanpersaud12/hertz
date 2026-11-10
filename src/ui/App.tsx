@@ -223,7 +223,7 @@ export function App() {
             <div className="topbar-row">
               <a className="brand" href="#/comps">
                 <LogoMark size={24} />
-                TFT Local
+                Hertz
               </a>
               {hasStats ? (
                 <div className="scope">

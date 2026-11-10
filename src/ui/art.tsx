@@ -124,7 +124,7 @@ export function IdentitySheet() {
       <div className="page-head"><div><h1>Identity</h1><p className="page-sub">Every badge is a cut hexagonal stone, lit from the top. Colours live in PALETTE in src/ui/art.tsx.</p></div></div>
       <h3>Mark</h3>
       <div style={row}><LogoMark size={96} /><LogoMark size={48} /><LogoMark size={24} /><LogoMark size={16} />
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, fontSize: 28, fontWeight: 600, letterSpacing: '-0.02em' }}><LogoMark size={36} /> TFT Local</span></div>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, fontSize: 28, fontWeight: 600, letterSpacing: '-0.02em' }}><LogoMark size={36} /> Hertz</span></div>
       <h3>Tier badges</h3>
       <div style={row}>{grades.map((g) => <TierBadge key={g} grade={g} size={72} />)}</div>
       <div style={row}>{grades.map((g) => <TierBadge key={g} grade={g} />)}{grades.map((g) => <TierBadge key={g + 's'} grade={g} size={20} />)}</div>

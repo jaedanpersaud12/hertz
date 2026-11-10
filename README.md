@@ -1,4 +1,6 @@
-# TFT Local
+# Hertz
+
+A local TFT stats app and overlay (repository name: tft-local).
 
 A local TFT stats app. A crawler collects ranked matches from the Riot API into a SQLite file on your disk,
 and the app reads from that file, so every page loads instantly and nothing depends on someone else's server.

@@ -437,4 +437,4 @@ if (!dev && existsSync('dist/index.html')) {
 
 const port = dev ? config.port + 1 : config.port
 serve({ fetch: app.fetch, port, hostname: '127.0.0.1' }, () =>
-  console.log(dev ? `API on http://127.0.0.1:${port}` : `TFT Local running at http://127.0.0.1:${port}`))
+  console.log(dev ? `API on http://127.0.0.1:${port}` : `Hertz running at http://127.0.0.1:${port}`))

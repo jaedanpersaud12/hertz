@@ -1,6 +1,6 @@
-# TFT Local
+# Hertz (repo: tft-local)
 
-A private, locally running Teamfight Tactics stats app and in-game overlay, replacing the MetaTFT app for one
+Hertz is the app's name. A private, locally running Teamfight Tactics stats app and in-game overlay, replacing the MetaTFT app for one
 player (Jaedan, plays on Windows). Built by an agent team (see "How work gets done" below) with Jaedan as owner.
 
 ## Where things are
@@ -43,7 +43,9 @@ as proof. No Riot API key exists in the cloud: every test runs against the fake 
 4. **Stay in scope.** Touch only what the story needs. No drive-by refactors, renames or formatting sweeps.
 5. **No secrets in the repo.** No keys, tokens or personal data in code, fixtures or commits.
 6. **Agent rules are Jaedan's.** Do not edit `CLAUDE.md` or anything in `.claude/` unless Jaedan asks.
-7. **Data files, not code, for per-set things.** HUD layouts, Team Planner tables, tier cut-offs live in files.
+7. **Brand comes from Jaedan.** The Hertz brand (logo, colours, type, art) is being designed separately. Do not
+   invent brand assets; use what is in `brand/` once it exists, and keep the current tokens until then.
+8. **Data files, not code, for per-set things.** HUD layouts, Team Planner tables, tier cut-offs live in files.
 
 ## UI rules
 
