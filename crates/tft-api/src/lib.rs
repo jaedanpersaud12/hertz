@@ -5,6 +5,7 @@
 //! switch stays in the TypeScript server.
 
 mod describe;
+mod engine;
 pub mod js;
 mod jsval;
 mod me;
@@ -51,6 +52,8 @@ struct App {
     /// The one connection that writes: your lists and your own matches.
     write: Arc<Mutex<Connection>>,
     me: Arc<me::Me>,
+    /// `.env` settings: the crawl defaults the settings routes fall back to.
+    config: Config,
 }
 
 pub struct Options {
@@ -81,6 +84,7 @@ pub async fn serve(opts: Options) -> Result<()> {
         http: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build()?,
         write,
         me,
+        config: opts.config.clone(),
     });
     let router = axum::Router::new().fallback(handle).with_state(app);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", opts.port))
@@ -120,6 +124,8 @@ enum Route {
     Traits,
     Explore,
     Lists,
+    Health,
+    CrawlSettings,
     Icon(String, String),
 }
 
@@ -139,6 +145,8 @@ fn route(path: &str) -> Option<Route> {
         ["", "api", "traits"] => Route::Traits,
         ["", "api", "explore"] => Route::Explore,
         ["", "api", "lists"] => Route::Lists,
+        ["", "api", "health"] => Route::Health,
+        ["", "api", "settings", "crawl"] => Route::CrawlSettings,
         ["", "api", "icon", kind, id] if !kind.is_empty() && !id.is_empty() => Route::Icon(p(kind), p(id)),
         _ => return None,
     })
@@ -154,6 +162,8 @@ enum Action {
     Pin,
     SaveTeam,
     DeleteTeam(String),
+    SetCrawlSettings,
+    ResetCrawlSettings,
 }
 
 fn action(method: &Method, path: &str) -> Option<Action> {
@@ -167,6 +177,8 @@ fn action(method: &Method, path: &str) -> Option<Action> {
         ["", "api", "lists", "mark"] if post => Action::Mark,
         ["", "api", "lists", "pin"] if post => Action::Pin,
         ["", "api", "teams"] if post => Action::SaveTeam,
+        ["", "api", "settings", "crawl"] if post => Action::SetCrawlSettings,
+        ["", "api", "settings", "crawl", "reset"] if post => Action::ResetCrawlSettings,
         ["", "api", "teams", id] if delete && !id.is_empty() => Action::DeleteTeam(js::try_decode_component(id)),
         _ => return None,
     })
@@ -209,6 +221,16 @@ async fn act(app: &Arc<App>, a: Action, body: Body) -> Result<Response> {
             json(write(Box::new(move |c| routes::save_team(c, &b))).await?)
         }
         Action::DeleteTeam(id) => json(write(Box::new(move |c| routes::delete_team(c, &id))).await?),
+        Action::SetCrawlSettings => {
+            let (db, config) = (Arc::clone(&app.write), app.config.clone());
+            let (status, body) =
+                tokio::task::spawn_blocking(move || engine::set_settings(&db.lock().unwrap(), &config, &bytes)).await??;
+            json_status(status, body)
+        }
+        Action::ResetCrawlSettings => {
+            let config = app.config.clone();
+            json(write(Box::new(move |c| engine::reset_settings(c, &config))).await?)
+        }
     })
 }
 
@@ -241,6 +263,8 @@ async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
                     Route::Traits => routes::traits(&conn, q),
                     Route::Explore => routes::explore(&conn, q),
                     Route::Lists => routes::lists(&conn),
+                    Route::Health => engine::health(&conn, &app2.config, q),
+                    Route::CrawlSettings => engine::get_settings(&conn, &app2.config, q),
                     Route::Icon(..) => unreachable!(),
                 };
                 app2.pool.give(conn);

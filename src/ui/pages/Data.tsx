@@ -1,9 +1,11 @@
+import { useState } from 'react'
 import { ChartBar, DownloadSimple, Shapes, Stack } from '@phosphor-icons/react'
 import { ago, count, num, type Meta } from '../api'
 import { CollapsibleBanner } from '../interior/collapsible-banner'
 import { CopyButton } from '../interior/copy-button'
 import { TaskSteps } from '../interior/task-steps'
 import { Fact } from '../parts'
+import { CrawlSettingsForm, PipelineHealth } from './Pipeline'
 
 const COMMANDS = [
   { icon: Shapes, title: 'Names and icons', command: 'npm run static', text: 'Download unit, item and trait data for the current set. Run again after each patch.' },
@@ -18,6 +20,8 @@ export function Data({ meta }: { meta: Meta }) {
   // Setup is three steps in order; "current" is the first one not done yet.
   const done = [t.staticRows > 0, t.matches > 0, !!meta.builtAt]
   const current = done.indexOf(false) === -1 ? 3 : done.indexOf(false)
+  // Saving crawl settings changes which servers health lists, so it reloads.
+  const [saves, setSaves] = useState(0)
   return (
     <div className="data-page">
       <div className="command-cards">
@@ -66,6 +70,10 @@ export function Data({ meta }: { meta: Meta }) {
           ))}
         </ul>
       ) : <p className="muted">No matches yet.</p>}
+
+      <PipelineHealth reloadKey={saves} />
+
+      <CrawlSettingsForm onSaved={() => setSaves((n) => n + 1)} />
     </div>
   )
 }
