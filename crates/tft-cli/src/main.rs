@@ -5,6 +5,7 @@
 //!   tft ingest FILE...         store saved match JSON files (one match, or an array of matches, per file)
 //!   tft patches                download the patch calendar and date matches stored without one
 //!   tft stats [--patches N]    rebuild the stat tables for the N most recent patches (same as `npm run stats`)
+//!   tft serve [--port N]       serve the app and its read-only API on 127.0.0.1 (PORT from .env, then 5174)
 //!   tft init                   create or upgrade the database and print where it is
 //!
 //! Settings come from `.env` in the current folder, the same file the TypeScript engine reads.
@@ -64,6 +65,12 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         patches: i64,
     },
+    /// Serve the built app and its read-only API on 127.0.0.1, like `npm start`.
+    Serve {
+        /// Port to listen on. Defaults to PORT from .env, then 5174.
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Create or upgrade the database.
     Init,
 }
@@ -91,6 +98,10 @@ async fn run(command: Command, config: Config) -> Result<()> {
         Command::Init => {
             tft_store::open(&config.db_path)?;
             println!("Database ready at {}", config.db_path.display());
+        }
+
+        Command::Serve { port } => {
+            tft_api::serve(tft_api::Options { port: port.unwrap_or(config.port), db_path: config.db_path }).await?;
         }
 
         Command::Crawl { max, reseed, once } => {

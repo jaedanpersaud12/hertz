@@ -1,8 +1,19 @@
 [package]
 name = "tft-api"
-description = "The /api routes the React app calls. Ported in week 2 (PRD 1 E1)."
+description = "The read-only /api routes the React app calls, and the built app, served by `tft serve`."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+axum.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+tft-core.workspace = true
+tft-riot.workspace = true
+tft-store.workspace = true
+tokio.workspace = true
