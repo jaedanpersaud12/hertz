@@ -13,10 +13,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tft_core::config::{Config, TIERS, platform_route, tier_name, tier_rank};
 use tft_core::patches::Calendar;
 use tft_core::riot::LeagueEntry;
-use tft_store::{Connection, Ingest, load_calendar, params, save_calendar};
+use tft_store::{Connection, Ingest, kv_get, kv_set, load_calendar, params, save_calendar};
 
 /// Look at the same player again after this long.
 const RECRAWL_MS: i64 = 6 * 3600 * 1000;
+
+/// `kv` key holding the fingerprint (never the key itself) of the last API key Riot accepted. On the next start
+/// a rejection of that same key means it has expired, so it is reported at once instead of after the
+/// 2-minute activation wait.
+const KEY_OK: &str = "riot_key_ok";
 
 #[derive(Debug, Clone, Default)]
 pub struct CrawlOptions {
@@ -36,6 +41,10 @@ pub struct Crawler {
     calendar: RwLock<Calendar>,
     stored: AtomicU64,
     stop: Arc<AtomicBool>,
+    /// A group hit a key error, so every group stops (PRD rule 5).
+    key_failed: AtomicBool,
+    /// The key's fingerprint is in `kv` already.
+    key_saved: AtomicBool,
 }
 
 fn now_ms() -> i64 {
@@ -49,19 +58,36 @@ impl Crawler {
             bail!("Unknown server(s) in PLATFORMS: {}", unknown.join(", "));
         }
         let calendar = load_calendar(&conn)?;
+        let riot = RiotClient::new(&config.api_key, &config.api_base, config.rate_margin);
+        // An unreadable value just means the key is treated as new.
+        let known = kv_get::<String>(&conn, KEY_OK).ok().flatten().is_some_and(|fp| fp == riot.key_fingerprint());
+        if known {
+            riot.set_key_worked();
+        }
         Ok(Arc::new(Crawler {
-            riot: RiotClient::new(&config.api_key, &config.api_base, config.rate_margin),
+            riot,
             config,
             opts,
             db: Mutex::new(conn),
             calendar: RwLock::new(calendar),
             stored: AtomicU64::new(0),
             stop,
+            key_failed: AtomicBool::new(false),
+            key_saved: AtomicBool::new(known),
         }))
     }
 
     fn stopping(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
+        self.stop.load(Ordering::Relaxed) || self.key_failed.load(Ordering::Relaxed)
+    }
+
+    /// Once Riot has accepted the key, saves its fingerprint so the next start knows it has worked.
+    fn remember_key(&self) -> Result<()> {
+        if self.riot.key_worked() && !self.key_saved.load(Ordering::Relaxed) {
+            kv_set(&self.db.lock().unwrap(), KEY_OK, &self.riot.key_fingerprint())?;
+            self.key_saved.store(true, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn below_max(&self) -> bool {
@@ -113,7 +139,9 @@ impl Crawler {
             )?;
             if have == 0 || self.opts.reseed {
                 println!("[{platform}] reading ladders...");
-                self.seed(platform).await?;
+                let seeded = self.seed(platform).await;
+                self.remember_key()?;
+                seeded?;
             }
         }
 
@@ -242,9 +270,16 @@ impl Crawler {
         let platforms_json = serde_json::to_string(&platforms)?;
         let mut finished = false;
         while !self.stopping() && !finished && self.below_max() {
-            match self.step(route, &platforms_json).await {
+            let stepped = self.step(route, &platforms_json).await;
+            self.remember_key()?;
+            match stepped {
                 Ok(done) => finished = done,
                 Err(e) => match e.downcast_ref::<RiotError>() {
+                    // A key problem affects every group, so all of them stop, not only this one.
+                    Some(RiotError::Key(_)) => {
+                        self.key_failed.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
                     // Nothing was marked as done, so the same players and matches are retried after the pause.
                     Some(RiotError::Unavailable(msg)) => {
                         println!("[{route}] {msg} Pausing this region for a minute.");
@@ -394,6 +429,7 @@ mod rusqlite_result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::KeyProblem;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::Instant;
@@ -511,6 +547,8 @@ mod tests {
             calendar: RwLock::new(Calendar::default()),
             stored: AtomicU64::new(0),
             stop: Arc::default(),
+            key_failed: AtomicBool::new(false),
+            key_saved: AtomicBool::new(false),
         });
         let status = |c: &Crawler| -> i64 {
             let db = c.db.lock().unwrap();
@@ -564,5 +602,139 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM match_queue WHERE route = 'europe' AND status = 0", [], |r| r.get(0))
             .unwrap();
         assert_eq!(europe_left, 0, "europe finished its queue");
+    }
+
+    fn test_config(base: &str, key: &str) -> Config {
+        Config::from_lookup(|k| match k {
+            "RIOT_API_KEY" => Some(key.into()),
+            "RIOT_API_BASE" => Some(base.into()),
+            "PLATFORMS" => Some("na1,euw1".into()),
+            "SNOWBALL" => Some("false".into()),
+            _ => None,
+        })
+    }
+
+    fn queue(conn: &Connection, id: &str, route: &str, platform: &str) {
+        conn.execute(
+            "INSERT INTO match_queue (match_id, route, platform, seed_rank) VALUES (?1, ?2, ?3, 9)",
+            params![id, route, platform],
+        )
+        .unwrap();
+    }
+
+    /// A crawler on `conn` built by `Crawler::new` (so it reads the remembered key), with the test HTTP client.
+    fn crawler_on(conn: Connection, base: &str, key: &str) -> Arc<Crawler> {
+        let opts = CrawlOptions { once: true, ..Default::default() };
+        let mut crawler = Crawler::new(test_config(base, key), opts, conn, Arc::default()).unwrap();
+        crate::client::init_tls();
+        let http = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
+        let me = Arc::get_mut(&mut crawler).unwrap();
+        let worked = me.riot.key_worked();
+        let riot = std::mem::replace(&mut me.riot, RiotClient::new(key, base, 1.0));
+        me.riot = riot.with_http(http);
+        assert_eq!(me.riot.key_worked(), worked);
+        crawler
+    }
+
+    fn remembered(c: &Crawler) -> Option<String> {
+        kv_get::<String>(&c.db.lock().unwrap(), KEY_OK).unwrap()
+    }
+
+    fn take_db(c: Arc<Crawler>) -> Connection {
+        Arc::try_unwrap(c).ok().expect("one owner").db.into_inner().unwrap()
+    }
+
+    fn accept_all(path: &str, _: usize) -> (u16, &'static str, String) {
+        (200, "", match_body(path.rsplit('/').next().unwrap_or_default()))
+    }
+
+    fn reject_all(_: &str, _: usize) -> (u16, &'static str, String) {
+        (403, "", "{}".into())
+    }
+
+    const KEY: &str = "RGAPI-test-key-one";
+
+    /// A success is remembered by fingerprint only, and survives a restart: a new crawler with the same key
+    /// treats a rejection as expired (one request, at once). A different key is new and gets the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_that_worked_is_remembered_across_restarts_by_fingerprint_only() {
+        let (base, _) = serve(accept_all).await;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(tft_store::schema::SCHEMA).unwrap();
+        queue(&conn, "NA1_1", "americas", "na1");
+        let first = crawler_on(conn, &base, KEY);
+        assert!(!first.riot.key_worked(), "a fresh database knows no key");
+        first.crawl_route("americas", vec!["na1".into()]).await.unwrap();
+        let fp = remembered(&first).expect("a success saves the key's fingerprint");
+        assert_eq!(fp, first.riot.key_fingerprint());
+        let raw: String =
+            first.db.lock().unwrap().query_row("SELECT value FROM kv WHERE key = ?1", [KEY_OK], |r| r.get(0)).unwrap();
+        assert!(!raw.contains(KEY) && !raw.contains("test-key"), "the key itself must never be stored: {raw}");
+
+        // Restart with the same key, and Riot now rejects it.
+        let (base, hits) = serve(reject_all).await;
+        let mut conn = take_db(first);
+        queue(&conn, "NA1_2", "americas", "na1");
+        let second = crawler_on(conn, &base, KEY);
+        assert!(second.riot.key_worked(), "the same key is known to have worked");
+        let started = Instant::now();
+        let err = second.crawl_route("americas", vec!["na1".into()]).await.unwrap_err();
+        assert!(matches!(err.downcast_ref::<RiotError>(), Some(RiotError::Key(KeyProblem::Expired))), "got {err:?}");
+        assert_eq!(hits.lock().unwrap().len(), 1, "an expired key is reported after one request");
+        assert!(Instant::now() - started < Duration::from_secs(1));
+
+        // A different key is new: it gets the activation wait, then is reported as not active.
+        conn = take_db(second);
+        let (base, hits) = serve(reject_all).await;
+        let third = crawler_on(conn, &base, "RGAPI-test-key-two");
+        assert!(!third.riot.key_worked(), "a different key has not worked yet");
+        let started = Instant::now();
+        let err = third.crawl_route("americas", vec!["na1".into()]).await.unwrap_err();
+        assert!(matches!(err.downcast_ref::<RiotError>(), Some(RiotError::Key(KeyProblem::NotActive))), "got {err:?}");
+        assert!(Instant::now() - started >= crate::client::ACTIVATION_WAIT);
+        assert!(hits.lock().unwrap().len() > 1);
+        assert_eq!(remembered(&third), Some(fp), "a key that never worked does not replace the remembered one");
+    }
+
+    fn americas_rejected(path: &str, _: usize) -> (u16, &'static str, String) {
+        let id = path.rsplit('/').next().unwrap_or_default();
+        if path.starts_with("/americas/") {
+            return (403, "", "{}".into());
+        }
+        (200, "x-app-rate-limit: 1:1,1000:120\r\n", match_body(id))
+    }
+
+    /// PRD rule 5: a key error in one group stops every group, not only the one that got it.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_error_in_one_group_stops_all_groups() {
+        let (base, hits) = serve(americas_rejected).await;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(tft_store::schema::SCHEMA).unwrap();
+        queue(&conn, "NA1_1", "americas", "na1");
+        for i in 0..EUROPE_MATCHES {
+            queue(&conn, &format!("EUW1_{i}"), "europe", "euw1");
+        }
+        let crawler = crawler_on(conn, &base, KEY);
+        crawler.riot.set_key_worked(); // so the rejection is reported at once
+
+        let (a, e) = tokio::join!(
+            crawler.crawl_route("americas", vec!["na1".into()]),
+            crawler.crawl_route("europe", vec!["euw1".into()])
+        );
+        let err = a.unwrap_err();
+        assert!(matches!(err.downcast_ref::<RiotError>(), Some(RiotError::Key(KeyProblem::Expired))), "got {err:?}");
+        e.unwrap();
+        let hits = hits.lock().unwrap().clone();
+        let rejected = hits.iter().find(|(_, p)| p.starts_with("/americas/")).unwrap().0;
+        let after = hits.iter().filter(|(t, p)| p.starts_with("/europe/") && *t > rejected).count();
+        // Like Ctrl+C, a stop lets the batch already in flight (up to 20 matches) finish, and nothing after it.
+        assert!(after <= 20, "europe sent {after} requests after the key error; only its batch in flight may finish");
+        let europe_left: i64 = crawler
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM match_queue WHERE route = 'europe' AND status = 0", [], |r| r.get(0))
+            .unwrap();
+        assert!(europe_left >= 80, "europe kept crawling: only {europe_left} matches left in its queue");
     }
 }
