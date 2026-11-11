@@ -16,6 +16,7 @@ pub type Obj = Map<String, Value>;
 
 mod comp_page;
 mod flex;
+mod items_page;
 
 /// Time windows inside a patch, as `WINDOWS` in `src/config.ts`. '' is the whole patch.
 const WINDOWS: [(&str, &str, Option<i64>); 2] = [("", "Whole patch", None), ("3d", "Last 3 days", Some(3))];
@@ -588,6 +589,11 @@ pub fn traits(conn: &Connection, q: Option<&str>) -> Result<Obj> {
 pub fn items(conn: &Connection, q: Option<&str>) -> Result<Obj> {
     let sc = scope(conn, q)?;
     let rs = rows(conn, "SELECT * FROM stat_items WHERE patch = ? AND bucket = ? AND games >= ?", &[&sc.patch, &sc.key, &min_param(&sc)])?;
+    // PRD 3 U6: one item type (?type=) and the best holders. A type tab hides items gone from the set data on the
+    // newest patch; the full list keeps them, as before (an item missing from the set data may also be new).
+    let want_type = js::query(q, "type").filter(|t| !t.is_empty());
+    let hide = want_type.is_some() && items_page::hide_removed(conn, &sc)?;
+    let best = items_page::best_holders(conn, &sc, &min_param(&sc))?;
     // Top five holders per item, from one pass over the unit-item table.
     let mut holders: HashMap<String, Vec<String>> = HashMap::new();
     for h in rows(conn, "SELECT item, character_id FROM stat_unit_items WHERE patch = ? AND bucket = ? ORDER BY games DESC", &[&sc.patch, &sc.key])? {
@@ -598,12 +604,20 @@ pub fn items(conn: &Connection, q: Option<&str>) -> Result<Obj> {
     }
     let mut out = Vec::new();
     for r in &rs {
+        if hide && !items_page::in_set_data(conn, s(r, "item"))? {
+            continue;
+        }
+        let d = describe(conn, Kind::Item, s(r, "item"), false)?;
+        if want_type.as_ref().is_some_and(|t| d.get("type").and_then(Value::as_str) != Some(t.as_str())) {
+            continue;
+        }
         let mut hs = Vec::new();
         for id in holders.get(s(r, "item")).into_iter().flatten() {
             hs.push(Value::Object(describe(conn, Kind::Unit, id, false)?));
         }
-        let d = merge(describe(conn, Kind::Item, s(r, "item"), false)?, rate(r, sc.comps as f64));
-        out.push(with(d, &[("placeChange", g(r, "place_change")), ("holders", Value::Array(hs))]));
+        let d = merge(d, rate(r, sc.comps as f64));
+        let bh = best.get(s(r, "item")).cloned().unwrap_or_default();
+        out.push(with(d, &[("placeChange", g(r, "place_change")), ("holders", Value::Array(hs)), ("bestHolders", Value::Array(bh))]));
     }
     Ok(with(public(&sc), &[("rows", arr(out))]))
 }
@@ -644,8 +658,9 @@ pub fn item(conn: &Connection, q: Option<&str>, id: &str) -> Result<Obj> {
     let prev = prev
         .map(|p| json!({ "patch": sc.prev_patch, "avgPlace": num(f(&p, "sum_place") / f(&p, "games")), "frequency": num(f(&p, "games") / f(&p, "comps")) }))
         .unwrap_or(Value::Null);
+    let emblem = items_page::emblem(conn, &sc, &full)?;
     let full = merge(full, rate(&item, sc.comps as f64));
-    Ok(with(
+    let mut out = with(
         public(&sc),
         &[
             ("item", Value::Object(with(full, &[("placeChange", g(&item, "place_change"))]))),
@@ -653,7 +668,17 @@ pub fn item(conn: &Connection, q: Option<&str>, id: &str) -> Result<Obj> {
             ("prev", prev),
             ("holders", arr(hs)),
         ],
-    ))
+    );
+    if let Some(e) = emblem {
+        out.insert("emblem".into(), e); // PRD 3 U7, emblems only
+    }
+    Ok(out)
+}
+
+/// `GET /api/items/components` (PRD 3 U5).
+pub fn item_components(conn: &Connection, q: Option<&str>) -> Result<Obj> {
+    let sc = scope(conn, q)?;
+    items_page::components(conn, &sc, public(&sc))
 }
 
 // ---- Explorer: live questions against the raw boards -----------------------------

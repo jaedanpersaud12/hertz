@@ -10,6 +10,7 @@ use tft_core::config::{BUCKETS, scope_key};
 pub mod tier;
 pub mod comp_detail;
 pub mod flex;
+pub mod items_depth;
 pub mod cluster;
 pub mod lineage;
 pub mod overrides;
@@ -88,7 +89,9 @@ pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn F
         "CREATE TEMP TABLE IF NOT EXISTS p (id INTEGER PRIMARY KEY, placement INTEGER NOT NULL, level INTEGER, comp_key TEXT);
          CREATE TEMP TABLE IF NOT EXISTS topc (comp_key TEXT PRIMARY KEY) WITHOUT ROWID;",
     )?;
+    items_depth::prepare(conn)?;
 
+    let mut rebuilt = Vec::new();
     for patch in &patches {
         for bucket in &BUCKETS {
             for window in &WINDOWS {
@@ -100,6 +103,7 @@ pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn F
                 build_scope(&tx, patch, &scope, bucket.min, since)?;
                 set_watermark(&tx, patch, &scope)?;
                 tx.commit()?;
+                rebuilt.push(watermark_key(patch, &scope));
 
                 let (matches, comps): (i64, i64) = conn.query_row(
                     "SELECT matches, comps FROM stat_meta WHERE patch = ? AND bucket = ?",
@@ -114,20 +118,23 @@ pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn F
         }
     }
     conn.execute_batch("DROP TABLE IF EXISTS p; DROP TABLE IF EXISTS topc")?;
+    items_depth::inc_drop(conn)?;
     if comp_method(conn)? == Method::Clusters {
         lineage::update(conn)?; // PRD 2 C13; before the trends, which follow it to last patch's comp
     }
-    finish_trends(conn)?;
+    finish_trends(conn, &rebuilt)?;
     conn.execute_batch("PRAGMA optimize")?;
     Ok(())
 }
 
 /// Tier letters and trends once every scope is written ([`tier::finish_all`]). Each scope already got them when
 /// it was written, from the other scopes as they stood then; trends read other scopes, so they are worked out
-/// again here, and a full and an incremental build end with the same values.
-fn finish_trends(conn: &mut Connection) -> Result<()> {
+/// again here, and a full and an incremental build end with the same values. Then the component weights of the
+/// `rebuilt` scopes (PRD 3 U5), which read the tier letters.
+fn finish_trends(conn: &mut Connection, rebuilt: &[String]) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tier::finish_all(&tx)?;
+    items_depth::components_for(&tx, rebuilt)?;
     tx.commit()?;
     Ok(())
 }
@@ -190,13 +197,14 @@ pub fn build_stats_incremental_with(
     }
     conn.execute_batch(INC_DROP)?;
     comp_detail::inc_drop(conn)?;
+    items_depth::inc_drop(conn)?;
     if !touched.is_empty() && comp_method(conn)? == Method::Clusters {
         lineage::update(conn)?; // PRD 2 C13; before the trends, which follow it to last patch's comp
     }
     if touched.is_empty() {
         log("Stats are up to date: no new matches.");
     } else {
-        finish_trends(conn)?;
+        finish_trends(conn, &touched)?;
     }
     Ok(touched)
 }
@@ -426,6 +434,8 @@ fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), t
         tx.execute(sql, [])?;
     }
     comp_detail::inc_sums(&tx)?;
+    items_depth::prepare(&tx)?;
+    items_depth::inc_sums(&tx)?;
     for (job, ..) in &mut planned {
         job.comps =
             tx.query_row("SELECT COUNT(*) FROM inc_b WHERE band >= ? AND w >= ?", params![job.band, job.w], |r| r.get(0))?;
@@ -474,6 +484,7 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         }
         comp_detail::clear(db, patch, &job.scope)?;
         flex::clear(db, patch, &job.scope)?;
+        items_depth::clear(db, patch, &job.scope)?;
         db.execute("INSERT INTO stat_meta VALUES (?,?,?,?,?)", params![patch, job.scope, job.matches, job.comps, now_ms()])?;
         if job.comps == 0 {
             return Ok(());
@@ -499,6 +510,7 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
             params![patch, job.scope, job.band, job.w, job.seg],
         )?;
     }
+    items_depth::write_inc(db, patch, &job.scope, job.band, job.w, job.seg)?;
     build_derived(db, patch, &job.scope)?;
     if job.comps > 0 && comp_method(db)? == Method::Clusters {
         cluster::comps_from_inc(db, patch, &job.scope, job.band, job.w, job.comps)?;
@@ -651,6 +663,7 @@ fn build_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: 
     }
     comp_detail::clear(db, patch, scope)?;
     flex::clear(db, patch, scope)?;
+    items_depth::clear(db, patch, scope)?;
 
     let comps: i64 = db.query_row("SELECT COUNT(*) n FROM p", [], |r| r.get(0))?;
     let matches: i64 = db.query_row(
@@ -667,6 +680,7 @@ fn build_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: 
     }
 
     build_rates(db, patch, scope)?;
+    items_depth::build_full(db, patch, scope)?;
     build_derived(db, patch, scope)?;
     build_comps(db, patch, scope, comps)
 }
@@ -1177,12 +1191,25 @@ mod incremental_tests {
         }
     }
 
+    /// Set data for the item depth tables (PRD 3 U5, U7): the emblems [`special_items`] made give traits, and
+    /// most other items are built from two of five components.
+    fn item_depth_data(conn: &Connection) {
+        conn.execute("UPDATE static_data SET data = json_set(data, '$.trait', 'T' || substr(id, 2)) WHERE kind = 'item'", []).unwrap();
+        for i in 10..40 {
+            conn.execute(
+                "INSERT INTO static_data VALUES ('item', ?, 'X', NULL, json_object('type', 'craftable', 'composition', json_array(?, ?)))",
+                params![format!("I{i:02}"), format!("C{}", i % 5), format!("C{}", (i / 5) % 5)],
+            )
+            .unwrap();
+        }
+    }
+
     /// Every stat table in `a` equals the one in the database at `b`, row for row and value for value
     /// (stat_meta.built_at aside). Returns the number of rows compared.
     pub(crate) fn assert_same_stats(a: &Connection, b: &std::path::Path) -> i64 {
         a.execute("ATTACH DATABASE ? AS fresh", [b.to_str().unwrap()]).unwrap();
         let mut rows = 0;
-        for table in STAT_TABLES.into_iter().chain(comp_detail::TABLES).chain(flex::TABLES) {
+        for table in STAT_TABLES.into_iter().chain(comp_detail::TABLES).chain(flex::TABLES).chain(items_depth::TABLES) {
             let cols = if table == "stat_meta" { "patch, bucket, matches, comps".to_string() } else { "*".to_string() };
             let count = |sql: &str| -> i64 { a.query_row(sql, [], |r| r.get(0)).unwrap() };
             let n = count(&format!("SELECT COUNT(*) FROM main.{table}"));
@@ -1227,6 +1254,7 @@ mod incremental_tests {
         let (dir, mut conn) = fresh_db("main");
         tft_store::save_calendar(&conn, &cal).unwrap();
         special_items(&conn);
+        item_depth_data(&conn);
         store(&mut conn, &cal, 1, &first);
         build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
         let before = built_at(&conn);
@@ -1256,6 +1284,7 @@ mod incremental_tests {
         // The same matches, stored in the same order, through a full rebuild.
         let (fresh_dir, mut fresh) = fresh_db("fresh");
         special_items(&fresh);
+        item_depth_data(&fresh);
         store(&mut fresh, &cal, 1, &first);
         store_with(&mut fresh, &cal, 2, &more, 2);
         build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
@@ -1271,10 +1300,12 @@ mod incremental_tests {
         assert!(q("SELECT COUNT(*) FROM stat_comps WHERE patch = '90.2' AND prev_place IS NOT NULL") > 10);
         assert!(q("SELECT COUNT(*) FROM stat_comps WHERE bucket NOT LIKE '%@3d' AND d3_place IS NOT NULL") > 10);
         assert_eq!(q("SELECT COUNT(DISTINCT tier) FROM stat_comps"), 5, "every letter is used");
-        for table in comp_detail::TABLES.into_iter().chain(flex::TABLES) {
+        for table in comp_detail::TABLES.into_iter().chain(flex::TABLES).chain(items_depth::TABLES) {
             let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
             assert!(n > 50, "{table} has only {n} rows, so the comparison proves little");
         }
+        // PRD 3 U5: the S and A comps decide the weights in every scope that has them.
+        assert!(q("SELECT COUNT(DISTINCT patch || bucket) FROM stat_components") >= 12);
 
         // Nothing new: nothing touched.
         assert!(build_stats_incremental_with(&mut conn, 2, &mut |_| {}).unwrap().is_empty());

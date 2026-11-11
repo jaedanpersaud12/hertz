@@ -542,3 +542,18 @@
 .ibtn:disabled { opacity: 0.5; }
 /* Segmented control labels: same 1px correction as buttons. */
 .seg .whitespace-nowrap { padding-top: 8px; padding-bottom: 6px; }
+
+/* Item page: components (PRD 3 U5) and emblem breakpoints (U7). */
+@layer components {
+  .component-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+  .component-card { min-width: 0; }
+  .component-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .component-head span, .component-items .name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .component-items { display: grid; gap: 6px; }
+  .component-items li { display: grid; grid-template-columns: minmax(0, 1fr) 52px 76px; align-items: center; gap: 10px; }
+  .component-items .name { min-width: 0; }
+  .component-games { text-align: right; font-variant-numeric: tabular-nums; }
+  .component-key { display: grid; grid-template-columns: minmax(0, 1fr) auto 76px; gap: 10px; text-align: right; margin: -2px 0 4px; }
+  .component-items li > :nth-child(2) { text-align: right; }
+  .emblem-answer { margin: 0 0 12px; }
+}

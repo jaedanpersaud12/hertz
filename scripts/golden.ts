@@ -61,6 +61,8 @@ const STAT_TABLES = [
   'stat_comp_special',
   // PRD 2 C8 flex and swaps (migration 6)
   'stat_comp_flex_adds', 'stat_comp_swaps',
+  // PRD 3 item depth (migration 8)
+  'stat_components', 'stat_emblem_tiers',
 ]
 let failures = 0
 const ok = (label: string) => console.log(`  ok  ${label}`)
@@ -322,12 +324,17 @@ async function statsSection(ingested: string) {
     game_datetime = CASE WHEN rowid % 3 = 0 THEN game_datetime - (4 + rowid % 7) * ? ELSE game_datetime END`).run(DAY)
   // The fixture has no emblems, artifacts or radiants. Set data calling one item an emblem gives stat_comp_special
   // rows; it is removed after the rebuild, so nothing the API section reads changes except those rows.
-  pre.prepare("INSERT INTO static_data (kind, id, name, icon, data) VALUES ('item', 'TFT_Item_Thing9', 'Thing 9', NULL, '{\"type\":\"emblem\"}')").run()
+  // PRD 3: the emblem gives TFT99_Shared (stat_emblem_tiers), and two items get recipes (stat_components).
+  pre.prepare("INSERT INTO static_data (kind, id, name, icon, data) VALUES ('item', 'TFT_Item_Thing9', 'Thing 9', NULL, '{\"type\":\"emblem\",\"trait\":\"TFT99_Shared\"}')").run()
+  for (const n of [0, 1]) {
+    pre.prepare("INSERT INTO static_data (kind, id, name, icon, data) VALUES ('item', ?, ?, NULL, '{\"type\":\"craftable\",\"composition\":[\"TFT_Item_BFSword\",\"TFT_Item_ChainVest\"]}')")
+      .run(`TFT_Item_Thing${n}`, `Thing ${n}`)
+  }
   pre.close()
   const PATCHES = 4 // the fixture has three patches; one more checks that a short list is handled
   await run(bin, ['--db', path, 'stats', '--patches', String(PATCHES)], {})
   const post = new Database(path)
-  post.prepare("DELETE FROM static_data WHERE kind = 'item' AND id = 'TFT_Item_Thing9'").run()
+  post.prepare("DELETE FROM static_data WHERE kind = 'item' AND id IN ('TFT_Item_Thing9', 'TFT_Item_Thing0', 'TFT_Item_Thing1')").run()
   post.close()
   const db = new Database(path, { readonly: true })
   for (const table of STAT_TABLES) {
@@ -576,6 +583,10 @@ function apiChecks(db: Database.Database, phase: 'bare' | 'full', icons: { ok: s
   const mins = ['0', '1', '5', '25', '400', '5.5', '', 'abc', '1e1', '0x10', '-3', 'Infinity', '%207%20', '9999999']
   // Query strings parsed the way Hono parses them: the first value wins, names can be encoded, a bare name is empty.
   const quirks = ['?patch=16.22&patch=99.3', '?pat%63h=16.22', '?min', '?min=', '?bucket=MASTER%2B&min=3&window=3d', '?patch=&bucket=', '?window=3d&window=']
+
+  // PRD 3 U5, U6: components and the item type tabs, in every scope.
+  for (const s of scopes) add("/api/items/components", `/api/items/components${s.qs}`, s.qs === "" ? (b: any) => b.rows.length > 0 && b.basis === "top" : undefined)
+  for (const t of ['craftable', 'radiant', 'artifact', 'support', 'emblem', 'other', 'nope', '']) add('/api/items?type=', `/api/items?type=${t}`)
 
   for (const route of ['/api/comps', '/api/units', '/api/items', '/api/traits', '/api/meta']) {
     const has = route === '/api/meta' ? (b: any) => b.totals.matches > 0 && b.byPatch.length > 0 : nonEmpty
@@ -1024,7 +1035,7 @@ async function stressSection(from: string, cwd: string) {
     const urls = [
       '/api/meta', '/api/meta?patch=nope', '/api/static', '/api/comps', '/api/comps?patch=98.1&min=1', ...comp.slice(0, 4).map((c) => `/api/comps/${enc(c)}`),
       `/api/comps/${enc('TFT98_Big|TFT98_U0')}?patch=98.1&min=1`, '/api/comps/nope', '/api/units', '/api/units/TFT99_Unit6', '/api/units/TFT98_U0?patch=98.1',
-      '/api/units/nope', '/api/items', '/api/items/TFT_Item_Thing1', '/api/items/nope', '/api/traits', '/api/explore?units=TFT99_Unit6',
+      '/api/units/nope', '/api/items', '/api/items/components', '/api/items/TFT_Item_Thing1', '/api/items/nope', '/api/traits', '/api/explore?units=TFT99_Unit6',
       '/api/explore?units=nope', '/api/explore', '/api/lists', '/api/me', '/api/me/matches', '/api/icon/unit/TFT99_Unit0', '/api/nothing', '/',
       '/api/health', '/api/settings/crawl',
     ]

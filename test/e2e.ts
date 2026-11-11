@@ -486,6 +486,99 @@ try {
     assert.equal((await get(`/api/items/${ITEMS[0].id}`)).recipe.length, 2)
     ok('traits, items and item detail')
 
+    // PRD 3 U5, U6, U7. The stats above were built before the set data was downloaded, so they have no recipes.
+    // Rebuild with the set data, calling one item an emblem for TFT99_Shared (the fixture has none), and recount.
+    {
+      const rw = new Database(dbPath)
+      rw.prepare("UPDATE static_data SET data = json_set(data, '$.type', 'emblem', '$.trait', 'TFT99_Shared') WHERE kind = 'item' AND id = ?").run(ITEMS[9].id)
+      rw.close()
+      execFileSync(bin, ['stats'], { env: { ...process.env, ...env }, stdio: 'ignore' }) // `run` is a counter in this block
+
+      // U5: per component, its items weighted by place change on the S and A comps' units, from the raw boards.
+      const t0 = Date.now()
+      const comps5 = await get('/api/items/components')
+      const took = Date.now() - t0
+      assert.equal(comps5.basis, 'top'); assert.deepEqual(comps5.tiers, ['S', 'A'])
+      const top = (await get('/api/comps?min=1')).rows.filter((r: any) => r.tier === 'S' || r.tier === 'A').map((r: any) => r.id)
+      assert.ok(top.length > 0, 'the fixture lists S or A comps')
+      // A listed comp is one archetype's boards (checked above: split labels are merged back together).
+      const archOf = (id: string) => ARCHETYPES.findIndex((a) => id.startsWith(a.trait + '|'))
+      const topBoards = boards.filter((b: any) => top.map(archOf).includes(b.arch))
+      const base = new Map<string, number[]>()
+      for (const b of topBoards) for (const id of new Set<string>(b.units.map((x: any) => x.character_id))) base.set(`${b.arch}|${id}`, [...(base.get(`${b.arch}|${id}`) ?? []), b.placement])
+      const recount = new Map<string, { games: number; diff: number }>()
+      for (const b of topBoards) {
+        const pairs = new Set<string>(b.units.flatMap((x: any) => x.itemNames.map((i: string) => `${x.character_id}|${i}`)))
+        for (const pair of pairs) {
+          const [unit, item] = pair.split('|')
+          const ps = base.get(`${b.arch}|${unit}`)!
+          const r = recount.get(item) ?? { games: 0, diff: 0 }
+          recount.set(item, { games: r.games + 1, diff: r.diff + b.placement - ps.reduce((x, y) => x + y, 0) / ps.length })
+        }
+      }
+      assert.deepEqual(comps5.rows.map((c: any) => c.id).sort(), ['TFT_Item_BFSword', 'TFT_Item_ChainVest'])
+      for (const c of comps5.rows) {
+        assert.deepEqual(c.items.map((i: any) => i.id).sort(), ITEMS.slice(0, 6).map((i) => i.id).filter((id) => recount.get(id)!.games >= 5).sort())
+        for (const i of c.items) {
+          const r = recount.get(i.id)!
+          assert.equal(i.games, r.games); near(i.weight, r.diff / r.games, `${c.id} ${i.id} weight`)
+        }
+        const ws = c.items.map((i: any) => i.weight)
+        assert.deepEqual(ws, [...ws].sort((a, b) => a - b), 'best first')
+      }
+      assert.ok(took < 100, `/api/items/components took ${took} ms`)
+      ok(`components: what each builds, weighted by place change on S and A comps, matches a recount (${took} ms)`)
+
+      // U6: type tabs and five best holders, against a recount over the boards of the newest patch.
+      const t1 = Date.now()
+      const list = await get('/api/items')
+      const took6 = Date.now() - t1
+      assert.ok(took6 < 100, `/api/items took ${took6} ms`)
+      assert.deepEqual((await get('/api/items?type=emblem')).rows.map((r: any) => r.id), [ITEMS[9].id])
+      assert.equal((await get('/api/items?type=craftable')).rows.length, 6)
+      assert.equal((await get('/api/items?type=radiant')).rows.length, 0)
+      const latest = boards // every ranked fixture match is on 99.3, the newest patch
+      const unitPlaces = new Map<string, number[]>(), itemPlaces = new Map<string, number[]>()
+      for (const b of latest) {
+        for (const id of new Set<string>(b.units.map((x: any) => x.character_id))) unitPlaces.set(id, [...(unitPlaces.get(id) ?? []), b.placement])
+        const pairs = new Set<string>(b.units.flatMap((x: any) => x.itemNames.map((i: string) => `${x.character_id}|${i}`)))
+        for (const pair of pairs) itemPlaces.set(pair, [...(itemPlaces.get(pair) ?? []), b.placement])
+      }
+      const mean = (xs: number[]) => xs.reduce((x, y) => x + y, 0) / xs.length
+      for (const row of list.rows) {
+        const want = [...itemPlaces].filter(([k, ps]) => k.endsWith(`|${row.id}`) && ps.length >= 10)
+          .map(([k, ps]) => ({ id: k.split('|')[0], games: ps.length, change: mean(ps) - mean(unitPlaces.get(k.split('|')[0])!) }))
+          .sort((a, b) => a.change - b.change || b.games - a.games || (a.id < b.id ? -1 : 1)).slice(0, 5)
+        assert.deepEqual(row.bestHolders.map((h: any) => h.id), want.map((w) => w.id), `${row.id} best holders`)
+        row.bestHolders.forEach((h: any, n: number) => near(h.placeChange, want[n].change, `${row.id} ${h.id} place change`))
+      }
+      assert.ok(list.rows.some((r: any) => r.bestHolders.length === 5))
+      ok(`item type tabs, and five best holders per item match a recount (${took6} ms)`)
+
+      // U7: the trait level on boards holding the emblem, and the breakpoint it completes on winning boards.
+      const emblemBoards = latest.filter((b: any) => b.units.some((x: any) => x.itemNames.includes(ITEMS[9].id)))
+      const shared = (b: any) => b.traits.find((t: any) => t.name === 'TFT99_Shared').tier_current
+      const e = (await get(`/api/items/${ITEMS[9].id}`)).emblem
+      assert.equal(e.trait.id, 'TFT99_Shared')
+      for (const lv of [0, 1]) {
+        const at = emblemBoards.filter((b: any) => shared(b) === lv)
+        const row = e.levels.find((l: any) => l.level === lv)
+        assert.equal(row.games, at.length); assert.equal(row.wins, at.filter((b: any) => b.placement === 1).length)
+        assert.equal(row.top4, at.filter((b: any) => b.placement <= 4).length); near(row.avgPlace, mean(at.map((b: any) => b.placement)), 'emblem avg place')
+      }
+      assert.deepEqual(e.levels.map((l: any) => [l.level, l.units]), [[0, null], [1, 2]])
+      const wins = emblemBoards.filter((b: any) => shared(b) === 1 && b.placement === 1).length
+      assert.equal(e.basis, wins >= 10 ? 'wins' : 'top4'); assert.equal(e.breakpoint.level, 1)
+      ok(`emblem breakpoints match a recount; the fixture has ${wins} winning boards with the trait, so it ranks by ${e.basis === 'wins' ? '1st place' : 'top 4'}`)
+
+      assert.equal((await get('/api/items/components?data=worst')).basis, 'all')
+      assert.deepEqual((await get('/api/items/components?data=empty')).rows, [])
+      assert.equal((await get('/api/items/components?data=one')).rows.length, 1)
+      assert.equal((await get('/api/items?data=worst')).rows[0].bestHolders[0].placeChange, -3.21)
+      assert.equal((await get(`/api/items/${ITEMS[9].id}?data=worst`)).emblem.levels.length, 6)
+      ok('stress modes cover components, best holders and emblem levels')
+    }
+
     const pairQ = await get(`/api/explore?units=${UNITS[17].id},${UNITS[16].id}`)
     const both = boards.filter((b: any) => [17, 16].every((i) => b.units.some((x: any) => x.character_id === UNITS[i].id)))
     assert.equal(pairQ.summary.games, both.length); near(pairQ.summary.avgPlace, avg(both), 'explorer avg place')

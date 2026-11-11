@@ -428,6 +428,98 @@ fn comp_page(body: &mut Obj, worst: bool) {
     }
 }
 
+/// The item page's stats depth (PRD 3 U5, U6, U7): five best holders per item, six builds per component, every
+/// emblem level. `worst` gives them the extremes and the fallback weights; `keep` (one, empty) shrinks the nested
+/// lists the way [`shrink`] does the top-level ones.
+fn items_page(path: &str, body: &mut Obj, worst: bool, keep: Option<usize>) {
+    let fill = |xs: &mut Vec<Value>, n: usize| {
+        if xs.is_empty() {
+            return;
+        }
+        let base = xs.clone();
+        *xs = (0..n)
+            .map(|i| {
+                let mut v = base[i % base.len()].clone();
+                if i >= base.len()
+                    && let Value::Object(o) = &mut v
+                {
+                    let id = format!("{}~{i}", js_string(o.get("id")));
+                    o.insert("id".into(), json!(id));
+                }
+                v
+            })
+            .collect();
+    };
+    let ends = |xs: &mut Vec<Value>, key: &str, best: Value, worst_v: Value| {
+        for (x, v) in xs.iter_mut().zip([best, worst_v]) {
+            if let Value::Object(o) = x {
+                o.insert(key.into(), v);
+            }
+        }
+        if let Some(Value::Object(o)) = xs.first_mut() {
+            o.insert("games".into(), json!(12_345_678));
+        }
+    };
+    let nested = |body: &mut Obj, list: &str, key: &str, n: usize, extreme: &dyn Fn(&mut Vec<Value>)| {
+        if let Some(Value::Array(rows)) = body.get_mut(list) {
+            for r in rows.iter_mut() {
+                if let Some(Value::Array(xs)) = r.get_mut(key) {
+                    match keep {
+                        Some(k) => xs.truncate(k),
+                        None => {
+                            fill(xs, n);
+                            if worst {
+                                extreme(xs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    if path == "/api/items" {
+        nested(body, "rows", "bestHolders", 5, &|xs| ends(xs, "placeChange", json!(-3.21), json!(3.4)));
+    }
+    if path == "/api/items/components" {
+        nested(body, "rows", "items", 6, &|xs| ends(xs, "weight", json!(-3.21), json!(3.4)));
+        if worst {
+            body.insert("basis".into(), json!("all"));
+        }
+    }
+    if path.starts_with("/api/items/")
+        && let Some(Value::Object(e)) = body.get_mut("emblem")
+    {
+        let bp = e.get("breakpoint").cloned().filter(|b| !b.is_null());
+        if let Some(Value::Array(levels)) = e.get_mut("levels") {
+            match keep {
+                // One row: the breakpoint's own, so the answer and the table agree.
+                Some(1) if bp.is_some() => *levels = vec![bp.unwrap()],
+                Some(k) => levels.truncate(k),
+                None if worst && !levels.is_empty() => {
+                    let base = levels[0].clone();
+                    *levels = (0..=5)
+                        .map(|l| {
+                            spread(&base, vec![
+                                ("level", json!(l)), ("units", if l == 0 { Value::Null } else { json!(l * 2) }),
+                                ("games", json!(if l == 1 { 12_345_678 } else { 1 })), ("wins", json!(if l == 1 { 12_345_678 } else { 0 })),
+                                ("avgPlace", json!(if l == 1 { 1 } else { 8 })), ("winRate", json!(if l == 1 { 1 } else { 0 })),
+                                ("top4Rate", json!(if l == 1 { 1 } else { 0 })),
+                            ])
+                        })
+                        .collect();
+                }
+                None => {}
+            }
+        }
+        if keep == Some(0) {
+            e.insert("breakpoint".into(), Value::Null);
+        } else if worst {
+            let bp = e.get("levels").and_then(|l| l.get(1)).cloned().unwrap_or(Value::Null);
+            e.insert("breakpoint".into(), bp);
+        }
+    }
+}
+
 fn many(body: &mut Obj) {
     if let Some(Value::Array(base)) = body.get("rows")
         && !base.is_empty()
@@ -590,15 +682,25 @@ pub fn stress(mode: &str, path: &str, body: &mut Value) {
         return;
     }
     match mode {
-        "worst" => worst(path, b),
+        "worst" => {
+            worst(path, b);
+            items_page(path, b, true, None);
+        }
         "many" => {
             many(b);
             if path.starts_with("/api/comps/") {
                 comp_page(b, false);
             }
+            items_page(path, b, false, None);
         }
-        "one" => shrink(path, b, 1),
-        "empty" => shrink(path, b, 0),
+        "one" => {
+            shrink(path, b, 1);
+            items_page(path, b, false, Some(1));
+        }
+        "empty" => {
+            shrink(path, b, 0);
+            items_page(path, b, false, Some(0));
+        }
         _ => {}
     }
 }
@@ -606,6 +708,36 @@ pub fn stress(mode: &str, path: &str, body: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD 3 U5, U6, U7: the nested item lists fill up and take the extremes under worst, and shrink under one and empty.
+    #[test]
+    fn item_page_lists_fill_and_shrink() {
+        let unit = json!({ "id": "U", "name": "U", "icon": null, "cost": 1, "traits": [], "games": 9, "placeChange": -1 });
+        let item = json!({ "id": "I", "name": "I", "icon": null, "type": "craftable", "weight": -0.5, "games": 9 });
+        let level = json!({ "level": 1, "units": 2, "games": 9, "wins": 1, "top4": 5, "avgPlace": 3, "winRate": 0.1, "top4Rate": 0.5 });
+        let run = |mode: &str, path: &str, body: Value| -> Value {
+            let mut b = body;
+            stress(mode, path, &mut b);
+            b
+        };
+        let list = json!({ "rows": [{ "id": "I", "name": "I", "type": "craftable", "holders": [], "bestHolders": [unit] }] });
+        let w = run("worst", "/api/items", list.clone());
+        assert_eq!(w["rows"][0]["bestHolders"].as_array().unwrap().len(), 5);
+        assert_eq!(w["rows"][0]["bestHolders"][0]["placeChange"], json!(-3.21));
+        assert_eq!(w["rows"][0]["bestHolders"][1]["placeChange"], json!(3.4));
+        assert_eq!(run("empty", "/api/items", list.clone())["rows"], json!([]));
+        let comps = json!({ "basis": "top", "rows": [{ "id": "C", "name": "C", "type": "component", "items": [item] }] });
+        let w = run("worst", "/api/items/components", comps.clone());
+        assert_eq!((w["basis"].clone(), w["rows"][0]["items"].as_array().unwrap().len()), (json!("all"), 6));
+        assert_eq!(w["rows"][0]["items"][0]["weight"], json!(-3.21));
+        assert_eq!(run("one", "/api/items/components", comps)["rows"][0]["items"].as_array().unwrap().len(), 1);
+        let detail = json!({ "item": { "id": "E", "type": "emblem" }, "emblem": { "trait": null, "basis": "wins", "breakpoint": level, "levels": [level] } });
+        let w = run("worst", "/api/items/E", detail.clone());
+        assert_eq!(w["emblem"]["levels"].as_array().unwrap().len(), 6);
+        assert_eq!(w["emblem"]["breakpoint"]["level"], json!(1));
+        let e = run("empty", "/api/items/E", detail);
+        assert_eq!((e["emblem"]["levels"].clone(), e["emblem"]["breakpoint"].clone()), (json!([]), Value::Null));
+    }
 
     #[test]
     fn hashes_like_javascript() {

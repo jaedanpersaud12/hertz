@@ -115,7 +115,10 @@ CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime 
 ///    (C13), rebuilt with the stats when the comp method is `clusters`. See `cluster.rs` in tft-stats.
 /// 6. Flex and swaps on the comp page (PRD 2 C8), written by `tft-stats` (`flex.rs`) like migration 4's tables;
 ///    and the difficulty you give a comp (C10), yours and never rebuilt: `level` is easy, medium or hard.
-pub const MIGRATIONS: [(u32, &str); 6] = [
+/// 8. Item depth (PRD 3 U5, U7), written by `tft-stats` (`items_depth.rs`) per scope: what each component builds,
+///    weighted by place change on S and A comps (`stat_components`), and the trait level each emblem's trait is at
+///    on the boards that hold it (`stat_emblem_tiers`). Number 7 is taken by other PRD 3 work.
+pub const MIGRATIONS: [(u32, &str); 7] = [
     (1, "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)"),
     (
         2,
@@ -186,6 +189,21 @@ CREATE TABLE IF NOT EXISTS stat_comp_swaps (
 CREATE TABLE IF NOT EXISTS comp_difficulty (comp_key TEXT PRIMARY KEY, level TEXT NOT NULL);
 ",
     ),
+    (
+        8,
+        "
+CREATE TABLE IF NOT EXISTS stat_components (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, component TEXT NOT NULL, item TEXT NOT NULL,
+  weight REAL NOT NULL, games INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, component, item)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_emblem_tiers (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, item TEXT NOT NULL, trait TEXT NOT NULL, tier_current INTEGER NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL, wins INTEGER NOT NULL, top4 INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, item, trait, tier_current)
+) WITHOUT ROWID;
+",
+    ),
 ];
 
 const RATES: &str = "games INTEGER NOT NULL, sum_place INTEGER NOT NULL, wins INTEGER NOT NULL, top4 INTEGER NOT NULL";
@@ -207,7 +225,8 @@ pub const STAT_TABLES: [&str; 13] = [
 /// 4: the comp page tables (migration 4) are filled by a rebuild, so stats built before them are rebuilt in full.
 /// 5: stat_comps gained core and flex, and stat_comp_variants was added (PRD 2 C1, C2).
 /// 6: the flex and swap tables (migration 6) are filled by a rebuild, so stats built before them are rebuilt in full.
-pub const STATS_VERSION: i64 = 6;
+/// 8: the item depth tables (migration 8) are filled by a rebuild (PRD 3 U5, U7). 7 is taken by other PRD 3 work.
+pub const STATS_VERSION: i64 = 8;
 
 pub fn stats_schema() -> String {
     let r = RATES;

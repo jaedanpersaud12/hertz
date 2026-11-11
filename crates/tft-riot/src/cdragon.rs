@@ -100,6 +100,8 @@ pub struct CdItem {
     pub icon: Option<String>,
     pub composition: Option<Vec<String>>,
     pub effects: Option<Map<String, Value>>,
+    /// The traits an item gives (an emblem's trait), for PRD 3 U7.
+    pub associated_traits: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -284,11 +286,15 @@ pub fn store_static(conn: &mut Connection, data: &CdData, channel: &str) -> Resu
                 .flatten()
                 .map(|(name, v)| CdVar { name: name.clone(), value: Some(vec![v.as_f64(); 4]) })
                 .collect();
-            let data = json!({
+            let mut data = json!({
                 "composition": composition,
                 "type": item_type(&id, &composition),
                 "text": clean_text(i.desc.as_deref(), &vars),
             });
+            // The trait an emblem gives (PRD 3 U7). Only written when there is one, so other items are unchanged.
+            if let Some(t) = i.associated_traits.iter().flatten().find(|t| !t.is_empty()) {
+                data["trait"] = json!(t);
+            }
             ins.execute(params!["item", id, name, icon_url(i.icon.as_deref(), channel), data.to_string()])?;
         }
     }
@@ -675,5 +681,25 @@ mod tests {
             "ability": { "name": "Hit", "text": "Deal 100/150/900 damage." }, "stats": { "hp": 800, "range": 1 } }));
         assert_eq!(row("trait"), ("Bruiser".into(), None, json!({ "breakpoints": [ { "units": 2, "style": 1 }, { "units": 4, "style": 3 } ] })));
         assert_eq!(row("item").2, json!({ "composition": ["TFT_Item_BFSword", "TFT_Item_ChainVest"], "type": "craftable", "text": "Gain 15 AD." }));
+    }
+
+    /// PRD 3 U7: an emblem's trait comes from `associatedTraits`; items without one store no trait.
+    #[test]
+    fn emblems_store_the_trait_they_give() {
+        let mut data: Value = serde_json::from_str(&set_data("X")).unwrap();
+        data["items"].as_array_mut().unwrap().extend([
+            json!({ "apiName": "TFT16_Item_BruiserEmblemItem", "name": "Bruiser Emblem", "composition": ["TFT_Item_Spatula", "TFT_Item_GiantsBelt"],
+                    "associatedTraits": ["TFT16_Bruiser"] }),
+            json!({ "apiName": "TFT_Item_Y", "name": "Y", "associatedTraits": [] }),
+        ]);
+        let mut conn = tft_store::open(&temp_db("emblem")).unwrap();
+        store_static(&mut conn, &serde_json::from_value(data).unwrap(), "latest").unwrap();
+        let data = |id: &str| -> Value {
+            serde_json::from_str(&conn.query_row("SELECT data FROM static_data WHERE id = ?", [id], |r| r.get::<_, String>(0)).unwrap()).unwrap()
+        };
+        assert_eq!(data("TFT16_Item_BruiserEmblemItem")["trait"], json!("TFT16_Bruiser"));
+        assert_eq!(data("TFT16_Item_BruiserEmblemItem")["type"], json!("emblem"));
+        assert!(data("TFT_Item_Y").get("trait").is_none());
+        assert!(data("TFT_Item_X").get("trait").is_none());
     }
 }

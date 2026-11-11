@@ -134,6 +134,7 @@ enum Route {
     Units,
     Unit(String),
     Items,
+    ItemComponents,
     Item(String),
     Traits,
     Explore,
@@ -155,6 +156,7 @@ fn route(path: &str) -> Option<Route> {
         ["", "api", "units"] => Route::Units,
         ["", "api", "units", id] if !id.is_empty() => Route::Unit(p(id)),
         ["", "api", "items"] => Route::Items,
+        ["", "api", "items", "components"] => Route::ItemComponents,
         ["", "api", "items", id] if !id.is_empty() => Route::Item(p(id)),
         ["", "api", "traits"] => Route::Traits,
         ["", "api", "explore"] => Route::Explore,
@@ -303,6 +305,7 @@ async fn answer(app: Arc<App>, req: Request<Body>) -> Response {
                     Route::Units => routes::units(&conn, q),
                     Route::Unit(id) => routes::unit(&conn, q, &id, &app2.comps),
                     Route::Items => routes::items(&conn, q),
+                    Route::ItemComponents => routes::item_components(&conn, q),
                     Route::Item(id) => routes::item(&conn, q, &id),
                     Route::Traits => routes::traits(&conn, q),
                     Route::Explore => routes::explore(&conn, q),
@@ -434,6 +437,8 @@ mod tests {
     #[test]
     fn routes_like_hono() {
         assert!(matches!(route("/api/comps"), Some(Route::Comps)));
+        assert!(matches!(route("/api/items/components"), Some(Route::ItemComponents)));
+        assert!(matches!(route("/api/items/TFT_Item_X"), Some(Route::Item(id)) if id == "TFT_Item_X"));
         assert!(matches!(route("/api/comps/A|B"), Some(Route::Comp(id)) if id == "A|B"));
         assert!(matches!(route("/api/units/a%2Fb"), Some(Route::Unit(id)) if id == "a/b"));
         assert!(route("/api/comps/").is_none());
