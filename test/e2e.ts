@@ -149,6 +149,38 @@ try {
   }
   ok(`boards group into ${ARCHETYPES.length} comps, split labels merged, games and average place match a recount`)
 
+  // Comp page sections (PRD 2 C5 to C7), recounted from the fixture boards of one comp. Its carry (unit 17) always
+  // holds three items, so every one of its boards is a carry board.
+  {
+    const key = compRows.find((c) => c.comp_key.startsWith('TFT99_Vanguard|')).comp_key
+    const mine = boards.filter((b: any) => b.arch === 0)
+    const sum = (bs: any[]) => bs.reduce((n, b) => n + b.placement, 0)
+    for (const [band, lo, hi] of [[1, 1, 2], [2, 3, 4], [3, 5, 8]]) {
+      const bs = mine.filter((b: any) => b.placement >= lo && b.placement <= hi)
+      const row = stat("SELECT SUM(games) games, SUM(sum_place) sp, SUM(sum_round) sr FROM stat_comp_level_bands WHERE bucket='ALL' AND comp_key=? AND band=?", key, band)
+      assert.equal(row.games, bs.length); assert.equal(row.sp, sum(bs)); assert.equal(row.sr, bs.reduce((n: number, b: any) => n + b.last_round, 0))
+    }
+    const carry = UNITS[17].id
+    const has = (b: any, id: string) => b.units.some((u: any) => u.character_id === id)
+    const full = mine.filter((b: any) => b.units.some((u: any) => u.character_id === carry && u.itemNames.length === 3))
+    assert.equal(full.length, mine.length)
+    const cu = stat("SELECT * FROM stat_comp_carry_units WHERE bucket='ALL' AND comp_key=? AND character_id=?", key, carry)
+    assert.equal(cu.full_games, full.length); assert.equal(cu.full_sum_place, sum(full)); assert.equal(cu.full_top4, full.filter((b: any) => b.placement <= 4).length)
+    const builds = stat("SELECT SUM(games) games, COUNT(*) n FROM stat_comp_builds WHERE bucket='ALL' AND comp_key=? AND character_id=?", key, carry)
+    assert.equal(builds.games, full.length, 'each board has one build on the carry')
+    const built = new Set(full.map((b: any) => [...b.units.find((u: any) => u.character_id === carry).itemNames].sort().join('|')))
+    assert.equal(builds.n, built.size)
+    const withItem = full.filter((b: any) => b.units.some((u: any) => u.character_id === carry && u.itemNames.includes(ITEMS[9].id)))
+    assert.equal(stat("SELECT games FROM stat_comp_carry_items WHERE bucket='ALL' AND comp_key=? AND character_id=? AND item=?", key, carry, ITEMS[9].id).games, withItem.length)
+    const holder = UNITS[12].id // a 4-cost unit next to a 5-cost carry
+    const held = full.filter((b: any) => has(b, holder))
+    const h = stat("SELECT * FROM stat_comp_holders WHERE bucket='ALL' AND comp_key=? AND carry=? AND holder=?", key, carry, holder)
+    assert.equal(h.games, held.length); assert.equal(h.sum_place, sum(held)); assert.equal(h.top4, held.filter((b: any) => b.placement <= 4).length)
+    assert.equal(stat("SELECT COUNT(*) n FROM stat_comp_holders WHERE bucket='ALL' AND carry=? AND holder=?", carry, UNITS[16].id).n, 0, 'same cost is not a holder')
+    assert.equal(stat("SELECT COUNT(*) n FROM stat_comp_special").n, 0, 'the fixture has no emblems, artifacts or radiants')
+  }
+  ok('comp page sections: levelling bands, carry builds and items, and item holders match a recount')
+
   const master = stat("SELECT matches FROM stat_meta WHERE bucket='MASTER+'").matches
   const all = stat("SELECT matches FROM stat_meta WHERE bucket='ALL'").matches
   assert.ok(master > 0 && master < all)
@@ -237,6 +269,15 @@ try {
     const detail = await get(`/api/comps/${encodeURIComponent(vanguard.id)}`)
     assert.equal(detail.levels.length, 1); assert.equal(detail.levels[0].level, 8); assert.ok(detail.builds[0].items.length > 3)
     ok('comps: names, core units, carry items, traits, playstyle tags, levels')
+    assert.deepEqual(detail.levelling.map((b: any) => [b.label, b.commonLevel]), [['1st–2nd', 8], ['3rd–4th', 8], ['5th–8th', 8]])
+    assert.equal(detail.levelling.reduce((n: number, b: any) => n + b.games, 0), vanguard.games)
+    assert.equal(detail.carries[0].unit.id, UNITS[17].id); assert.ok(detail.carries[0].items.length > 0)
+    assert.ok(detail.carries[0].items.every((i: any, n: number, xs: any[]) => i.games >= 10 && (n === 0 || xs[n - 1].avgPlace <= i.avgPlace)))
+    const holders = detail.holders[0].units
+    assert.ok(holders.some((u: any) => u.id === UNITS[12].id && u.sharedTraits.includes('Vanguard')))
+    assert.ok(holders.every((u: any) => (u.cost ?? 0) < 5), 'holders cost less than the carry')
+    assert.deepEqual(detail.special, [])
+    ok('comp page: levelling by placement band, carry items, item holders, special items')
 
     // Tier list (PRD 2 C3): every comp graded by the formula in config/tier-list.json, worked out again here.
     const cfg = JSON.parse(readFileSync(join(root, 'config', 'tier-list.json'), 'utf8'))

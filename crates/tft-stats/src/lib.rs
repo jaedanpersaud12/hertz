@@ -8,6 +8,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tft_core::config::{BUCKETS, scope_key};
 
 pub mod tier;
+pub mod comp_detail;
 
 /// A comp needs this share of all boards (and at least this many) to get its own row.
 pub const COMP_MIN_SHARE: f64 = 0.002;
@@ -176,6 +177,7 @@ pub fn build_stats_incremental_with(
         update_patch(conn, patch, log, &mut touched)?;
     }
     conn.execute_batch(INC_DROP)?;
+    comp_detail::inc_drop(conn)?;
     if touched.is_empty() {
         log("Stats are up to date: no new matches.");
     } else {
@@ -408,6 +410,7 @@ fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), t
     for sql in INC_RATES.iter().chain(INC_COMPS.iter()) {
         tx.execute(sql, [])?;
     }
+    comp_detail::inc_sums(&tx)?;
     for (job, ..) in &mut planned {
         job.comps =
             tx.query_row("SELECT COUNT(*) FROM inc_b WHERE band >= ? AND w >= ?", params![job.band, job.w], |r| r.get(0))?;
@@ -448,10 +451,12 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         for table in ["stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels"] {
             db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), k)?;
         }
+        comp_detail::clear(db, patch, &job.scope)?;
     } else {
         for table in STAT_TABLES {
             db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), k)?;
         }
+        comp_detail::clear(db, patch, &job.scope)?;
         db.execute("INSERT INTO stat_meta VALUES (?,?,?,?,?)", params![patch, job.scope, job.matches, job.comps, now_ms()])?;
         if job.comps == 0 {
             return Ok(());
@@ -546,6 +551,7 @@ fn write_comps(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         ),
         k4,
     )?;
+    comp_detail::write_inc(db, patch, &job.scope, job.band, job.w)?;
     tier::finish_scope(db, patch, &job.scope)
 }
 
@@ -622,6 +628,7 @@ fn build_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: 
     for table in STAT_TABLES {
         db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), k)?;
     }
+    comp_detail::clear(db, patch, scope)?;
 
     let comps: i64 = db.query_row("SELECT COUNT(*) n FROM p", [], |r| r.get(0))?;
     let matches: i64 = db.query_row(
@@ -779,6 +786,7 @@ fn build_comps(db: &Connection, patch: &str, scope: &str, comps: i64) -> Result<
          FROM p JOIN topc USING (comp_key) GROUP BY p.comp_key, COALESCE(p.level, 0)",
         k,
     )?;
+    comp_detail::build_full(db, patch, scope)?;
     tier::finish_scope(db, patch, scope)
 }
 
@@ -1125,12 +1133,23 @@ mod incremental_tests {
         (dir, conn)
     }
 
+    /// Set data making four of the synthetic items emblems, so the comp page's special items have rows.
+    fn special_items(conn: &Connection) {
+        for i in 0..4 {
+            conn.execute(
+                "INSERT INTO static_data VALUES ('item', ?, 'E', NULL, '{\"type\":\"emblem\"}')",
+                [format!("I{i:02}")],
+            )
+            .unwrap();
+        }
+    }
+
     /// Every stat table in `a` equals the one in the database at `b`, row for row and value for value
     /// (stat_meta.built_at aside). Returns the number of rows compared.
     fn assert_same_stats(a: &Connection, b: &std::path::Path) -> i64 {
         a.execute("ATTACH DATABASE ? AS fresh", [b.to_str().unwrap()]).unwrap();
         let mut rows = 0;
-        for table in STAT_TABLES {
+        for table in STAT_TABLES.into_iter().chain(comp_detail::TABLES) {
             let cols = if table == "stat_meta" { "patch, bucket, matches, comps".to_string() } else { "*".to_string() };
             let count = |sql: &str| -> i64 { a.query_row(sql, [], |r| r.get(0)).unwrap() };
             let n = count(&format!("SELECT COUNT(*) FROM main.{table}"));
@@ -1174,6 +1193,7 @@ mod incremental_tests {
 
         let (dir, mut conn) = fresh_db("main");
         tft_store::save_calendar(&conn, &cal).unwrap();
+        special_items(&conn);
         store(&mut conn, &cal, 1, &first);
         build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
         let before = built_at(&conn);
@@ -1202,6 +1222,7 @@ mod incremental_tests {
 
         // The same matches, stored in the same order, through a full rebuild.
         let (fresh_dir, mut fresh) = fresh_db("fresh");
+        special_items(&fresh);
         store(&mut fresh, &cal, 1, &first);
         store_with(&mut fresh, &cal, 2, &more, 2);
         build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
@@ -1217,6 +1238,10 @@ mod incremental_tests {
         assert!(q("SELECT COUNT(*) FROM stat_comps WHERE patch = '90.2' AND prev_place IS NOT NULL") > 10);
         assert!(q("SELECT COUNT(*) FROM stat_comps WHERE bucket NOT LIKE '%@3d' AND d3_place IS NOT NULL") > 10);
         assert_eq!(q("SELECT COUNT(DISTINCT tier) FROM stat_comps"), 5, "every letter is used");
+        for table in comp_detail::TABLES {
+            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            assert!(n > 50, "{table} has only {n} rows, so the comparison proves little");
+        }
 
         // Nothing new: nothing touched.
         assert!(build_stats_incremental_with(&mut conn, 2, &mut |_| {}).unwrap().is_empty());

@@ -247,6 +247,9 @@ fn worst(path: &str, body: &mut Obj) {
     walk(&mut whole, &mut comp_and_players);
     let Value::Object(b) = whole else { unreachable!() };
     *body = b;
+    if path.starts_with("/api/comps/") {
+        comp_page(body, true);
+    }
 
     let long_ago = num(now_ms() - 400.0 * DAY);
     if path == "/api/meta" {
@@ -286,9 +289,9 @@ fn worst(path: &str, body: &mut Obj) {
     }
 }
 
-const LISTS: [&str; 18] = [
+const LISTS: [&str; 21] = [
     "rows", "matches", "teams", "favs", "hidden", "builds", "levels", "partners", "items", "holders", "comps", "trend",
-    "stars", "itemCounts", "units", "traits", "recent", "byPatch",
+    "stars", "itemCounts", "units", "traits", "recent", "byPatch", "levelling", "carries", "special",
 ];
 
 fn shrink(path: &str, body: &mut Obj, keep: usize) {
@@ -331,6 +334,85 @@ fn shrink(path: &str, body: &mut Obj, keep: usize) {
             json!({ "games": 0 })
         };
         body.insert("summary".into(), summary);
+    }
+}
+
+/// The comp page sections of `/api/comps/:id` (PRD 2 C5, C6, C7, C9) at the most the API lists: two carries,
+/// three builds and five items each, six holders, twelve special items, all three placement bands with every level.
+/// `worst` also gives the rows the extremes and leaves one band with no known level or round.
+fn comp_page(body: &mut Obj, worst: bool) {
+    let fill = |xs: &mut Vec<Value>, n: usize| {
+        if xs.is_empty() {
+            return;
+        }
+        let base = xs.clone();
+        *xs = (0..n)
+            .map(|i| {
+                let mut v = base[i % base.len()].clone();
+                if i >= base.len() {
+                    walk(&mut v, &mut |o: &mut Obj| {
+                        if let Some(Value::String(id)) = o.get("id") {
+                            let id = format!("{id}~{i}");
+                            o.insert("id".into(), json!(id));
+                        }
+                    });
+                }
+                v
+            })
+            .collect();
+    };
+    if let Some(Value::Array(carries)) = body.get_mut("carries") {
+        fill(carries, 2);
+        for c in carries.iter_mut() {
+            for (key, n) in [("builds", 3), ("items", 5)] {
+                if let Some(Value::Array(xs)) = c.get_mut(key) {
+                    fill(xs, n);
+                }
+                if worst {
+                    extreme(c.get_mut(key));
+                }
+            }
+        }
+    }
+    if let Some(Value::Array(holders)) = body.get_mut("holders") {
+        fill(holders, 2);
+        for h in holders.iter_mut() {
+            if let Some(Value::Array(xs)) = h.get_mut("units") {
+                fill(xs, 6);
+            }
+            if worst {
+                extreme(h.get_mut("units"));
+            }
+        }
+    }
+    if let Some(Value::Array(xs)) = body.get_mut("special") {
+        fill(xs, 12);
+    }
+    if worst {
+        extreme(body.get_mut("special"));
+    }
+    if let Some(Value::Array(bands)) = body.get_mut("levelling")
+        && !bands.is_empty()
+    {
+        let labels = [(1, "1st–2nd"), (2, "3rd–4th"), (3, "5th–8th")];
+        *bands = labels
+            .iter()
+            .map(|(band, label)| {
+                let unknown = worst && *band == 2;
+                let levels: Vec<Value> = if unknown {
+                    Vec::new()
+                } else {
+                    (1..=10).map(|l| json!({ "level": l, "games": 1_000 * l, "share": l as f64 / 55.0 })).collect()
+                };
+                json!({
+                    "band": band, "label": label, "games": if worst { 12_345_678 } else { 400 },
+                    "avgPlace": if worst { 8.0 } else { 1.5 + *band as f64 * 1.5 },
+                    "commonLevel": if unknown { Value::Null } else { json!(10) },
+                    "avgRound": if unknown { Value::Null } else { json!(41.7) },
+                    "levels": levels,
+                })
+            })
+            .collect();
     }
 }
 
@@ -497,7 +579,12 @@ pub fn stress(mode: &str, path: &str, body: &mut Value) {
     }
     match mode {
         "worst" => worst(path, b),
-        "many" => many(b),
+        "many" => {
+            many(b);
+            if path.starts_with("/api/comps/") {
+                comp_page(b, false);
+            }
+        }
         "one" => shrink(path, b, 1),
         "empty" => shrink(path, b, 0),
         _ => {}
@@ -554,5 +641,43 @@ mod tests {
         let mut b = json!([1]);
         stress("worst", "/api/units", &mut b);
         assert_eq!(b, json!([1]));
+    }
+
+    #[test]
+    fn comp_page_sections_fill_to_the_most_shown_and_empty_out() {
+        let unit = json!({ "id": "U", "name": "U", "icon": null, "cost": 4, "traits": [] });
+        let item = json!({ "id": "I", "name": "I", "icon": null, "type": "emblem" });
+        let body = json!({
+            "comp": null,
+            "levelling": [{ "band": 1, "label": "1st–2nd", "games": 3, "avgPlace": 1.5, "commonLevel": 8, "avgRound": 30, "levels": [] }],
+            "carries": [{ "unit": unit, "games": 9, "builds": [{ "items": [item, item, item], "games": 5, "freq": 0.5, "avgPlace": 3, "placeChange": -1 }],
+                          "items": [{ "id": "I", "name": "I", "icon": null, "type": "craftable", "games": 10, "freq": 1, "avgPlace": 3, "placeChange": 0.5 }] }],
+            "holders": [{ "carry": unit, "games": 9, "top4": 4, "units": [{ "id": "H", "name": "H", "icon": null, "cost": 1, "traits": [], "games": 5, "top4": 2, "top4Share": 0.5, "avgPlace": 4, "sharedTraits": [], "sameRole": true }] }],
+            "special": [{ "item": item, "holder": unit, "games": 30, "freq": 0.3, "avgPlace": 4, "placeChange": -0.5 }],
+        });
+        let mut worst = body.clone();
+        stress("worst", "/api/comps/X%7CU", &mut worst);
+        assert_eq!(worst["carries"].as_array().unwrap().len(), 2);
+        assert_eq!(worst["carries"][1]["builds"].as_array().unwrap().len(), 3);
+        assert_eq!(worst["carries"][0]["items"].as_array().unwrap().len(), 5);
+        assert_eq!(worst["carries"][0]["items"][0]["games"], json!(12_345_678));
+        assert_eq!(worst["holders"][0]["units"].as_array().unwrap().len(), 6);
+        assert_eq!(worst["special"].as_array().unwrap().len(), 12);
+        assert_eq!(worst["special"][1]["placeChange"], json!(3.4));
+        assert_eq!(worst["levelling"].as_array().unwrap().len(), 3);
+        assert_eq!(worst["levelling"][1]["avgRound"], Value::Null);
+        // Copies get their own ids, so lists keyed by id stay unique.
+        assert_ne!(worst["special"][0]["item"]["id"], worst["special"][1]["item"]["id"]);
+        let mut many = body.clone();
+        stress("many", "/api/comps/X%7CU", &mut many);
+        assert_eq!(many["levelling"][1]["levels"].as_array().unwrap().len(), 10);
+        let mut empty = body.clone();
+        stress("empty", "/api/comps/X%7CU", &mut empty);
+        for k in ["levelling", "carries", "holders", "special"] {
+            assert_eq!(empty[k], json!([]), "{k}");
+        }
+        let mut one = body;
+        stress("one", "/api/comps/X%7CU", &mut one);
+        assert_eq!(one["special"].as_array().unwrap().len(), 1);
     }
 }

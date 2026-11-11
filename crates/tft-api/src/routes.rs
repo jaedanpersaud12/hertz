@@ -14,6 +14,8 @@ use tft_core::order::locale_cmp;
 
 pub type Obj = Map<String, Value>;
 
+mod comp_page;
+
 /// Time windows inside a patch, as `WINDOWS` in `src/config.ts`. '' is the whole patch.
 const WINDOWS: [(&str, &str, Option<i64>); 2] = [("", "Whole patch", None), ("3d", "Last 3 days", Some(3))];
 
@@ -416,10 +418,11 @@ pub fn comp(conn: &Connection, q: Option<&str>, id: &str, cache: &CompCache) -> 
         }
         builds.push(json!({ "unit": u, "items": out }));
     }
-    Ok(with(
+    let body = with(
         public(&sc),
         &[("comp", Value::Object(comp.clone())), ("levels", Value::Array(levels)), ("builds", Value::Array(builds))],
-    ))
+    );
+    Ok(with(body, &comp_page::sections(conn, &sc, id, comp)?))
 }
 
 // ---- Units ---------------------------------------------------------------------

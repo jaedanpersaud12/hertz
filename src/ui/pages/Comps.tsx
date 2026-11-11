@@ -1,18 +1,156 @@
 import { ArrowDown, ArrowUp, CaretDown, EyeSlash, PushPin } from '@phosphor-icons/react'
 import { motion, useReducedMotion } from 'motion/react'
-import { useEffect, useMemo, useState } from 'react'
-import { count, pct, useApi, useFilters, useMarks, type Comp, type CompOptions, type Entity, type Marks, type Scope } from '../api'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { count, num, pct, useApi, useFilters, useMarks, type Comp, type CompOptions, type Entity, type Marks, type Scope } from '../api'
 import { useAccordion, useAutoHeight, type AccordionHeaderProps, type AccordionPanelProps } from '../interior/accordion'
 import { ContextMenu, type ContextMenuItem } from '../interior/context-menu'
 import { CopyButton } from '../interior/copy-button'
-import { Button, Change, Dist, Empty, FavButton, GradeChip, Icon, IconButton, PlaceRail, Search, Select, Status, Tag, TraitChip, UnitChip } from '../parts'
+import { Button, Change, Empty, FavButton, GradeChip, Icon, IconButton, PlaceRail, placeTone, Search, Select, Status, Tag, TraitChip, UnitChip } from '../parts'
 import { anyFilter, filterQuery, NO_FILTERS, PLAYSTYLES, readFilters, writeFilters, type TierFilters } from '../tierFilters'
 import tierConfig from '../../../config/tier-list.json'
 
+type Rated = { games: number; freq: number; avgPlace: number; placeChange: number }
+type Band = {
+  band: number; label: string; games: number; avgPlace: number; commonLevel: number | null; avgRound: number | null
+  levels: { level: number; games: number; share: number }[]
+}
 type Detail = Scope & {
   comp: Comp | null
   levels: { level: number; games: number; share: number; avgPlace: number }[]
-  builds: { unit: Entity; items: (Entity & { games: number; freq: number; avgPlace: number; placeChange: number })[] }[]
+  builds: { unit: Entity; items: (Entity & Rated)[] }[]
+  levelling: Band[]
+  carries: { unit: Entity; games: number; builds: (Rated & { items: Entity[] })[]; items: (Entity & Rated)[] }[]
+  holders: { carry: Entity; games: number; top4: number; units: (Entity & { games: number; top4: number; top4Share: number; avgPlace: number; sharedTraits: string[]; sameRole: boolean })[] }[]
+  special: (Rated & { item: Entity; holder: Entity })[]
+}
+
+/** A section's own empty state: what is missing and what to do about it. */
+const None = ({ children }: { children: ReactNode }) => <p className="muted small detail-none">{children}</p>
+const MORE = 'Collect more matches, or pick a wider rank filter or the whole patch.'
+
+/** C5: one stacked bar per placement band, a segment per final level. */
+function Levelling({ bands }: { bands: Band[] }) {
+  return (
+    <section className="detail-levelling">
+      <h4>Levelling <Tag kind="level">Estimated</Tag></h4>
+      <p className="muted small">The level boards ended on, by where they placed. Riot only reports the final level, so when to level is an estimate.</p>
+      {bands.length ? (
+        <ul className="bands">
+          {bands.map((b) => (
+            <li key={b.band}>
+              <span className="band-label">{b.label}<span className="muted small">{count(b.games, 'game')}</span></span>
+              <span className="band-bar" role="img" aria-label={b.levels.map((l) => `level ${l.level} ${pct(l.share, 0)}`).join(', ') || 'level not reported'}>
+                {b.levels.map((l) => (
+                  <span key={l.level} className={l.level === b.commonLevel ? 'common' : ''} style={{ flexGrow: l.share }} title={`Level ${l.level}: ${pct(l.share)} (${count(l.games, 'game')})`}>
+                    {l.share >= 0.12 ? l.level : ''}
+                  </span>
+                ))}
+              </span>
+              <span className="band-facts">
+                <span>{b.commonLevel != null ? `Usually ${b.commonLevel}` : 'Level not reported'}</span>
+                <span className="muted small">{b.avgRound != null ? `Last round ${Math.round(b.avgRound)}` : 'Last round not reported'}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : <None>No levels recorded for this comp yet. {MORE}</None>}
+    </section>
+  )
+}
+
+const ItemRow = ({ e, change }: { e: Entity; change: Rated }) => (
+  <li>
+    <Icon e={e} size={22} plain /> <span className="carry-item" title={e.name}>{e.name}</span>
+    <span className="muted">{pct(change.freq, 0)}</span>
+    <Change value={change.placeChange} />
+  </li>
+)
+
+/** C6: per carry, its most played builds and its best single items. */
+function Carries({ carries }: { carries: Detail['carries'] }) {
+  return (
+    <section className="grow">
+      <h4>Carry items</h4>
+      <p className="muted small">From boards where a unit holds three items. Place change against the carry's average with any three items (builds) or on the board at all (single items). Negative is better.</p>
+      {carries.length ? (
+        <div className="carry-grid">
+          {carries.map((c) => (
+            <div key={c.unit.id} className="carry">
+              <div className="carry-head"><Icon e={c.unit} size={26} /> <span className="carry-name"><span className="carry-item">{c.unit.name}</span><span className="muted small">{count(c.games, 'game')} with three items</span></span></div>
+              <h5>Top builds</h5>
+              {c.builds.length ? (
+                <ul>
+                  {c.builds.map((b) => (
+                    <li key={b.items.map((i) => i.id).join('|')} className="build">
+                      <span className="build-items" title={b.items.map((i) => i.name).join(', ')}>{b.items.map((i, n) => <Icon key={n} e={i} size={22} plain />)}</span>
+                      <span className="muted">{pct(b.freq, 0)}</span>
+                      <Change value={b.placeChange} />
+                    </li>
+                  ))}
+                </ul>
+              ) : <None>No build has 5 games yet.</None>}
+              <h5>Best single items</h5>
+              {c.items.length ? <ul>{c.items.map((i) => <ItemRow key={i.id} e={i} change={i} />)}</ul> : <None>No item has 10 games yet.</None>}
+            </div>
+          ))}
+        </div>
+      ) : <None>No carry holds three items often enough to show builds. {MORE}</None>}
+    </section>
+  )
+}
+
+/** C7: cheaper units that can hold a carry's items early. */
+function Holders({ holders }: { holders: Detail['holders'] }) {
+  const listed = holders.filter((h) => h.units.length)
+  return (
+    <section className="grow">
+      <h4>Hold items early on</h4>
+      <p className="muted small">Cheaper units that share a trait or role with the carry, by how often they were on its top 4 boards.</p>
+      {listed.length ? (
+        <div className="carry-grid">
+          {listed.map((h) => (
+            <div key={h.carry.id} className="carry">
+              <div className="carry-head"><Icon e={h.carry} size={26} /> <span className="carry-item">For {h.carry.name}</span></div>
+              <ul>
+                {h.units.map((u) => {
+                  const why = u.sharedTraits.length ? `Shares ${u.sharedTraits.join(', ')}` : u.sameRole ? 'Same role' : 'Cheaper unit'
+                  return (
+                    <li key={u.id} className="holder" title={`${why}. On ${count(u.top4, 'top 4 board')} of ${count(h.top4, 'top 4 board')}, average place ${u.avgPlace.toFixed(2)}.`}>
+                      <Icon e={u} size={22} /> <span className="carry-item">{u.name} <span className="muted small">{why}</span></span>
+                      <span className="muted">{pct(u.top4Share, 0)}</span>
+                      <span className={`tone-${placeTone(u.avgPlace)}`}>{u.avgPlace.toFixed(2)}</span>
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
+          ))}
+        </div>
+      ) : <None>No cheaper unit shares a trait or role with the carry yet. {MORE}</None>}
+    </section>
+  )
+}
+
+/** C9: emblems, artifacts and radiant items on this comp. */
+function Special({ rows }: { rows: Detail['special'] }) {
+  return (
+    <section className="grow">
+      <h4>Emblems, artifacts and radiants</h4>
+      <p className="muted small">Each on its holder, with 30 games or more. Place change against this comp's average.</p>
+      {rows.length ? (
+        <ul className="special">
+          {rows.map((r) => (
+            <li key={`${r.item.id}|${r.holder.id}`}>
+              <Icon e={r.item} size={22} plain /> <span className="carry-item" title={r.item.name}>{r.item.name}</span>
+              <span className="special-holder"><Icon e={r.holder} size={20} /> <span className="carry-item" title={r.holder.name}>{r.holder.name}</span></span>
+              <span className="muted">{num(r.games)}</span>
+              <Change value={r.placeChange} />
+            </li>
+          ))}
+        </ul>
+      ) : <None>No emblem, artifact or radiant item has 30 games on this comp yet.</None>}
+    </section>
+  )
 }
 
 function CompDetail({ comp }: { comp: Comp }) {
@@ -22,33 +160,10 @@ function CompDetail({ comp }: { comp: Comp }) {
   const boardText = `${comp.name}: ${comp.units.map((u) => `${u.name}${u.items?.length ? ` (${u.items.map((i) => i.name).join(', ')})` : ''}`).join(', ')}`
   return (
     <div className="comp-detail">
-      <section>
-        <h4>Final level</h4>
-        <p className="muted small">Share of games ending at each level, and how they placed. Top 4 in {pct(comp.top4Rate)} of games overall.</p>
-        <Dist rows={data.levels.map((l) => ({ label: `Level ${l.level}`, share: l.share, avgPlace: l.avgPlace, games: l.games }))} />
-        <div className="mt-4"><CopyButton className="ibtn" value={boardText} label="Copy board as text" copiedLabel="Copied" /></div>
-      </section>
-
-      <section className="grow">
-        <h4>Items on the carries</h4>
-        <p className="muted small">Place change compares boards with the item against this comp's average. Negative is better.</p>
-        <div className="carry-grid">
-          {data.builds.map((b) => (
-            <div key={b.unit.id} className="carry">
-              <div className="carry-head"><Icon e={b.unit} size={26} /> {b.unit.name}</div>
-              <ul>
-                {b.items.map((i) => (
-                  <li key={i.id}>
-                    <Icon e={i} size={22} plain /> <span className="carry-item" title={i.name}>{i.name}</span>
-                    <span className="muted">{pct(i.freq, 0)}</span>
-                    <Change value={i.games >= 5 ? i.placeChange : null} />
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </div>
-      </section>
+      <Levelling bands={data.levelling ?? []} />
+      <Carries carries={data.carries ?? []} />
+      <Holders holders={data.holders ?? []} />
+      <Special rows={data.special ?? []} />
 
       {comp.flex.length ? (
         <section>
@@ -59,6 +174,7 @@ function CompDetail({ comp }: { comp: Comp }) {
           </div>
         </section>
       ) : null}
+      <div className="detail-copy"><CopyButton className="ibtn" value={boardText} label="Copy board as text" copiedLabel="Copied" /></div>
     </div>
   )
 }

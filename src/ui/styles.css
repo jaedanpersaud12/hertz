@@ -274,6 +274,29 @@
   .carry li { display: grid; grid-template-columns: 22px 1fr 40px 46px; gap: 8px; align-items: center; padding: 3px 0; font-size: 13px; }
   .carry li > :nth-child(n + 3) { text-align: right; }
   .carry-item { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .comp-detail h4 .tag { margin-left: 6px; vertical-align: 1px; }
+  .comp-detail h5 { font-size: 11.5px; font-weight: 500; color: var(--muted); margin: 8px 0 2px; }
+  .carry-name { display: grid; min-width: 0; line-height: 1.3; }
+  .carry-name .muted { font-weight: 400; }
+  .detail-none { margin-top: 6px; }
+  .detail-copy { flex-basis: 100%; }
+  /* Levelling: one stacked bar per placement band. */
+  .detail-levelling { flex: 1 1 320px; max-width: 460px; }
+  .bands { display: grid; grid-template-columns: max-content minmax(80px, 1fr) max-content; gap: 12px 12px; align-items: center; margin-top: 10px; font-size: 13px; }
+  .bands li { display: contents; }
+  .band-label { display: grid; line-height: 1.3; color: var(--text-2); white-space: nowrap; }
+  .band-bar { display: flex; height: 20px; border-radius: 5px; overflow: hidden; gap: 1px; background: var(--well); box-shadow: inset 0 1px 1px rgb(0 0 0 / 0.4); }
+  .band-bar span { flex-basis: 0; min-width: 2px; display: grid; place-items: center; font-size: 11px; color: var(--text-2); background: rgb(255 255 255 / 0.08); }
+  .band-bar span:nth-child(even) { background: rgb(255 255 255 / 0.13); }
+  .band-bar span.common { background: var(--text-2); color: var(--bg); font-weight: 600; }
+  .band-facts { display: grid; line-height: 1.3; white-space: nowrap; }
+  .carry li.build { grid-template-columns: 1fr 40px 46px; }
+  .build-items { display: flex; gap: 3px; }
+  .holder .carry-item .muted { margin-left: 4px; }
+  .special { max-width: 760px; }
+  .special li { display: grid; grid-template-columns: 22px minmax(0, 1.2fr) minmax(0, 1fr) 80px 46px; gap: 8px; align-items: center; padding: 3px 0; font-size: 13px; }
+  .special li > :nth-child(n + 4) { text-align: right; }
+  .special-holder { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-2); }
   .flex-units { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
   .flex-unit { display: grid; justify-items: center; gap: 2px; }
 

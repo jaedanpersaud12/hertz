@@ -108,7 +108,10 @@ CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime 
 ///    chosen for sampling; `done` turns 1 once all its players are in `rank_samples`. Rows are never removed, so
 ///    choosing a match again after a restart is a no-op.
 /// 3. The engine log (E10): warnings and errors from the crawler and supervisor, newest kept. See `health.rs`.
-pub const MIGRATIONS: [(u32, &str); 3] = [
+/// 4. The comp page sections (PRD 2 C5, C6, C7, C9), written by `tft-stats` (`comp_detail.rs`) per scope like the
+///    other stat tables. Kept out of [`STAT_TABLES`] so a stats-version bump never drops tables only a migration
+///    makes; every rebuild of a scope deletes and rewrites its rows.
+pub const MIGRATIONS: [(u32, &str); 4] = [
     (1, "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)"),
     (
         2,
@@ -119,6 +122,42 @@ CREATE INDEX IF NOT EXISTS rank_sample_pending ON rank_sample_queue(done, platfo
 ",
     ),
     (3, "CREATE TABLE IF NOT EXISTS engine_log (at INTEGER, region TEXT, level TEXT, message TEXT)"),
+    (
+        4,
+        "
+CREATE TABLE IF NOT EXISTS stat_comp_level_bands (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, comp_key TEXT NOT NULL, band INTEGER NOT NULL, level INTEGER NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL, rounds INTEGER NOT NULL, sum_round INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, comp_key, band, level)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_comp_carry_units (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, comp_key TEXT NOT NULL, character_id TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL, full_games INTEGER NOT NULL, full_sum_place INTEGER NOT NULL,
+  full_top4 INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, comp_key, character_id)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_comp_carry_items (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, comp_key TEXT NOT NULL, character_id TEXT NOT NULL, item TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, comp_key, character_id, item)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_comp_builds (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, comp_key TEXT NOT NULL, character_id TEXT NOT NULL, build TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, comp_key, character_id, build)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_comp_holders (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, comp_key TEXT NOT NULL, carry TEXT NOT NULL, holder TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL, top4 INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, comp_key, carry, holder)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_comp_special (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, comp_key TEXT NOT NULL, item TEXT NOT NULL, holder TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, comp_key, item, holder)
+) WITHOUT ROWID;
+",
+    ),
 ];
 
 const RATES: &str = "games INTEGER NOT NULL, sum_place INTEGER NOT NULL, wins INTEGER NOT NULL, top4 INTEGER NOT NULL";
@@ -137,7 +176,8 @@ pub const STAT_TABLES: [&str; 12] = [
 
 /// Bump when the stat table layout changes: old stat tables are dropped and rebuilt on the next stats run.
 /// 3: stat_comps gained score, tier, prev_place and d3_place (PRD 2 C3, C4).
-pub const STATS_VERSION: i64 = 3;
+/// 4: the comp page tables (migration 4) are filled by a rebuild, so stats built before them are rebuilt in full.
+pub const STATS_VERSION: i64 = 4;
 
 pub fn stats_schema() -> String {
     let r = RATES;
