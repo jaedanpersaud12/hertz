@@ -126,13 +126,29 @@ pub async fn run_supervisor(crawler: Arc<Crawler>, opts: SupervisorOptions) -> R
     supervise(crawl, &mut jobs, opts.timings).await
 }
 
-/// The one place the stats step is called, so an incremental build can replace it here.
+/// Raw rows are kept for this many patches; older patches keep only their stat tables (E8).
+pub const PATCHES_KEPT: usize = 3;
+
+/// The one place the stats step is called. Incremental (E5): only scopes with new matches are rebuilt, and the
+/// result equals a full rebuild.
 pub fn build_stats_step(conn: &mut Connection, patch_count: i64) -> Result<()> {
-    tft_stats::build_stats(conn, patch_count)
+    tft_stats::build_stats_incremental_with(conn, patch_count, &mut |line| println!("{line}"))?;
+    Ok(())
 }
 
-/// Daily prune and compact. A placeholder: the prune story (E9) fills it in.
-pub fn prune_when_idle(_conn: &mut Connection) -> Result<()> {
+/// Daily, when the crawler is idle: drop raw rows of patches older than the newest [`PATCHES_KEPT`], then compact.
+pub fn prune_when_idle(conn: &mut Connection) -> Result<()> {
+    let pruned = tft_store::prune_old_patches(conn, PATCHES_KEPT)?;
+    if !pruned.patches.is_empty() {
+        let c = tft_store::compact(conn)?;
+        println!(
+            "Pruned raw matches of patch {} ({} matches); database {} MB -> {} MB",
+            pruned.patches.join(", "),
+            pruned.matches,
+            c.before / 1_000_000,
+            c.after / 1_000_000
+        );
+    }
     Ok(())
 }
 
