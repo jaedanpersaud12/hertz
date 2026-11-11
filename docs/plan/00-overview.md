@@ -134,6 +134,8 @@ PRDs overlap on purpose: the comps work starts as soon as the Rust store can rea
 
 Week 1 also holds the three checks everything else leans on: the Riot policy read, the set schedule, and the parity harness. Phase 2 falls over the holidays, so it carries the fewest must-have stories per week.
 
+**Set schedule, checked 11 Nov 2026:** Set 19 goes live on **1 December 2026** with patch 19.1. The current set's last patch, 18.7, ships 11 November. The Set 19 PBE date is not announced yet. Source: seemeta.com's TFT release-date page (unofficial, updated 10 Nov 2026), which agrees with Riot's 2026 roadmap of a winter 2026 Set 19. Recheck Riot's patch notes in late November. On 1 December, plan for the three-day pause in the risks table: static data, HUD regions, Team Planner table.
+
 ## PRD 1: Rust engine and data pipeline at scale
 
 **Weeks 1 to 3.** The engine is ported to Rust with identical output, then made to run unattended and hold a million matches per patch.
