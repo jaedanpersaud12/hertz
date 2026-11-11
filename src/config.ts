@@ -63,5 +63,5 @@ export const config = {
   riotId: riotIdFromEnv(),
   myPlatform: (process.env.MY_PLATFORM ?? '').toLowerCase(),
   /** Fraction of the published rate limit we allow ourselves. */
-  rateMargin: Number(process.env.RATE_MARGIN ?? 0.95),
+  rateMargin: Number(process.env.RATE_MARGIN ?? 1.0),
 }

@@ -165,8 +165,17 @@ impl Crawler {
         );
         if let Ok((m, p, q)) = totals {
             let c = &self.riot.counts;
+            // Each routing group's share of its long rate-limit window, averaged since its first request.
+            let mut groups: Vec<&str> = self.config.platforms.iter().filter_map(|p| platform_route(p)).collect();
+            groups.sort();
+            groups.dedup();
+            let slots: Vec<String> = groups
+                .iter()
+                .filter_map(|g| self.riot.slot_use(g).map(|u| format!("{g} {:.1}/{}", u.average, u.riot_limit)))
+                .collect();
+            let slots = if slots.is_empty() { "none yet".to_string() } else { slots.join(", ") };
             println!(
-                "stored {stored} this run ({per_hour}/hour) | database: {m} matches, {p} players, {q} queued | requests ok {}, rate-limited {}, retried {}",
+                "stored {stored} this run ({per_hour}/hour) | database: {m} matches, {p} players, {q} queued | requests ok {}, 429s {}, retried {} | slots used per 2 min: {slots}",
                 c.ok.load(Ordering::Relaxed),
                 c.limited.load(Ordering::Relaxed),
                 c.retried.load(Ordering::Relaxed),
@@ -380,4 +389,180 @@ impl Crawler {
 
 mod rusqlite_result {
     pub type Result<T> = std::result::Result<T, tft_store::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
+
+    type Hits = Arc<Mutex<Vec<(Instant, String)>>>;
+
+    /// Like the client tests' `serve()`, but answers by path, because two routing groups send at once.
+    /// `answer(path, n)` gets the request path and how many requests that path has seen before, and
+    /// returns status, extra header lines (each ending in CRLF) and body.
+    async fn serve(answer: fn(&str, usize) -> (u16, &'static str, String)) -> (String, Hits) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits: Hits = Arc::default();
+        let seen = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let path = String::from_utf8_lossy(&req).split(' ').nth(1).unwrap_or_default().to_string();
+                let before = {
+                    let mut seen = seen.lock().unwrap();
+                    let before = seen.iter().filter(|(_, p)| *p == path).count();
+                    seen.push((Instant::now(), path.clone()));
+                    before
+                };
+                let (status, headers, body) = answer(&path, before);
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                     connection: close\r\n{headers}\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://127.0.0.1:{port}/{{host}}"), hits)
+    }
+
+    /// A ranked two-player match with the given id.
+    fn match_body(id: &str) -> String {
+        serde_json::json!({
+            "metadata": { "match_id": id, "participants": ["a", "b"] },
+            "info": {
+                "game_datetime": 1_000, "game_length": 2100.5, "game_version": "TFT Unreal Version ?.?.?.?",
+                "queue_id": 1100, "tft_set_number": 16,
+                "participants": [
+                    { "puuid": format!("{id}-a"), "placement": 1, "traits": [], "units": [] },
+                    { "puuid": format!("{id}-b"), "placement": 2, "traits": [], "units": [] }
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    const STUCK: &str = "/americas/tft/match/v1/matches/NA1_1";
+    const EUROPE_MATCHES: usize = 120;
+
+    /// PRD rule 6, crawler half. americas' only queued match gets six 500s, then answers. europe answers
+    /// every match, one per second (its rate-limit header says 1:1), so it is busy for about two minutes.
+    fn riot(path: &str, before: usize) -> (u16, &'static str, String) {
+        let id = path.rsplit('/').next().unwrap_or_default();
+        if path == STUCK {
+            return if before < 6 { (500, "", String::new()) } else { (200, "", match_body(id)) };
+        }
+        if path.contains("/by-puuid/") {
+            return (200, "", "[]".into());
+        }
+        if path.starts_with("/europe/tft/match/v1/matches/") {
+            return (200, "x-app-rate-limit: 1:1,1000:120\r\n", match_body(id));
+        }
+        (404, "", String::new())
+    }
+
+    /// Six failed tries on one group pause that group's crawl for 60 s; the other group keeps going, and the
+    /// match stays queued until it is fetched after the pause.
+    #[tokio::test(start_paused = true)]
+    async fn six_server_errors_pause_only_that_group_for_a_minute_and_the_match_stays_queued() {
+        let (base, hits) = serve(riot).await;
+        let config = Config::from_lookup(|k| match k {
+            "RIOT_API_KEY" => Some("test-key".into()),
+            "RIOT_API_BASE" => Some(base.clone()),
+            "PLATFORMS" => Some("na1,euw1".into()),
+            "SNOWBALL" => Some("false".into()), // no new players, so only the queued matches are fetched
+            _ => None,
+        });
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(tft_store::schema::SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO match_queue (match_id, route, platform, seed_rank) VALUES ('NA1_1','americas','na1',9)",
+            [],
+        )
+        .unwrap();
+        for i in 0..EUROPE_MATCHES {
+            conn.execute(
+                "INSERT INTO match_queue (match_id, route, platform, seed_rank) VALUES (?1,'europe','euw1',9)",
+                [format!("EUW1_{i}")],
+            )
+            .unwrap();
+        }
+        // No request timeout and no idle pool, so the only timers are the client's, limiter's and crawler's.
+        crate::client::init_tls();
+        let http = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
+        let crawler = Arc::new(Crawler {
+            riot: RiotClient::new(&config.api_key, &config.api_base, config.rate_margin).with_http(http),
+            opts: CrawlOptions { once: true, ..Default::default() },
+            config,
+            db: Mutex::new(conn),
+            calendar: RwLock::new(Calendar::default()),
+            stored: AtomicU64::new(0),
+            stop: Arc::default(),
+        });
+        let status = |c: &Crawler| -> i64 {
+            let db = c.db.lock().unwrap();
+            db.query_row("SELECT status FROM match_queue WHERE match_id = 'NA1_1'", [], |r| r.get(0)).unwrap()
+        };
+
+        let me = Arc::clone(&crawler);
+        let crawl = tokio::spawn(async move {
+            let (a, e) = tokio::join!(
+                me.crawl_route("americas", vec!["na1".into()]),
+                me.crawl_route("europe", vec!["euw1".into()])
+            );
+            a.and(e)
+        });
+
+        // Wait for the sixth failed try, then look at the queue during the pause.
+        let sixth = loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let stuck: Vec<Instant> =
+                hits.lock().unwrap().iter().filter(|(_, p)| p == STUCK).map(|(t, _)| *t).collect();
+            if stuck.len() >= 6 {
+                break stuck[5];
+            }
+        };
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(status(&crawler), 0, "the match must stay queued after Unavailable");
+
+        crawl.await.unwrap().unwrap();
+        let hits = hits.lock().unwrap().clone();
+        let americas: Vec<Instant> =
+            hits.iter().filter(|(_, p)| p.starts_with("/americas/")).map(|(t, _)| *t).collect();
+        assert_eq!(americas.len(), 7, "six failed tries, then one after the pause");
+        let waited = americas[6] - sixth;
+        assert!(waited >= Duration::from_secs(60), "americas went again {waited:?} after giving up, expected 60 s");
+        let europe_during =
+            hits.iter().filter(|(t, p)| p.starts_with("/europe/") && *t > sixth && *t < americas[6]).count();
+        assert!(europe_during >= 30, "europe sent only {europe_during} requests during americas' pause");
+
+        assert_eq!(status(&crawler), 1, "the match is fetched and stored after the pause");
+        let stored: i64 = crawler
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM matches WHERE match_id = 'NA1_1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 1);
+        let europe_left: i64 = crawler
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM match_queue WHERE route = 'europe' AND status = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(europe_left, 0, "europe finished its queue");
+    }
 }
