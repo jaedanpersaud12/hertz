@@ -15,6 +15,7 @@ use tft_core::order::locale_cmp;
 pub type Obj = Map<String, Value>;
 
 mod comp_page;
+mod flex;
 
 /// Time windows inside a patch, as `WINDOWS` in `src/config.ts`. '' is the whole patch.
 const WINDOWS: [(&str, &str, Option<i64>); 2] = [("", "Whole patch", None), ("3d", "Last 3 days", Some(3))];
@@ -292,14 +293,16 @@ fn load_comps(conn: &Connection, sc: &Scope, cache: &CompCache) -> Result<std::s
             Some(Value::Null) | None => 0.0,
             Some(v) => number_of(v),
         };
+        // Playstyle (PRD 2 C10), from the data: `reroll` when the main carry costs 1 to 3 and averages 2.5 stars
+        // or more; otherwise by the average final level, `fast9` from 8.6, `fast8` from 7.6, else `level`.
         let reroll = (1.0..=3.0).contains(&carry_cost) && main.is_some_and(|m| f(m, "sum_star") / f(m, "games") >= 2.5);
         let lvl = js_round(avg_level);
         let play = if reroll {
             json!({ "kind": "reroll", "label": format!("Reroll lvl {lvl}") })
         } else if avg_level >= 8.6 {
-            json!({ "kind": "fast", "label": "Fast 9" })
+            json!({ "kind": "fast9", "label": "Fast 9" })
         } else if avg_level >= 7.6 {
-            json!({ "kind": "fast", "label": "Fast 8" })
+            json!({ "kind": "fast8", "label": "Fast 8" })
         } else {
             json!({ "kind": "level", "label": format!("Lvl {lvl}") })
         };
@@ -335,7 +338,7 @@ fn load_comps(conn: &Connection, sc: &Scope, cache: &CompCache) -> Result<std::s
     Ok(comps)
 }
 
-fn marks(conn: &Connection) -> Result<Obj> {
+pub(crate) fn marks(conn: &Connection) -> Result<Obj> {
     let rs = rows(conn, "SELECT comp_key, fav, hidden FROM comp_marks", &[])?;
     let truthy = |r: &Obj, k: &str| f(r, k) != 0.0 && !f(r, k).is_nan();
     let pinned = match row(conn, "SELECT value FROM kv WHERE key = ?", &[&"pinned"])? {
@@ -348,6 +351,7 @@ fn marks(conn: &Connection) -> Result<Obj> {
             ("favs", rs.iter().filter(|r| truthy(r, "fav")).map(|r| g(r, "comp_key")).collect()),
             ("hidden", rs.iter().filter(|r| truthy(r, "hidden")).map(|r| g(r, "comp_key")).collect()),
             ("pinned", pinned),
+            ("difficulty", Value::Object(crate::difficulty::all(conn)?)), // PRD 2 C10
         ],
     ))
 }
@@ -362,7 +366,15 @@ pub fn comps(conn: &Connection, q: Option<&str>, cache: &CompCache) -> Result<Ob
     let listed: Vec<&Obj> = all.iter().filter(|r| f(r, "games") >= sc.min).collect();
     // The tier list's filters (PRD 2 C11). With none asked for, every listed comp.
     let filters = crate::tierlist::Filters::from_query(q);
-    let rows: Vec<Obj> = listed.iter().filter(|r| filters.keep(r)).map(|r| (*r).clone()).collect();
+    // Your difficulty tags (C10) on each row, and ?difficulty= among the filters.
+    let tags = crate::difficulty::all(conn)?;
+    let want = js::query(q, "difficulty").filter(|v| !v.is_empty());
+    let rows: Vec<Obj> = listed
+        .iter()
+        .filter(|r| filters.keep(r))
+        .map(|r| with((*r).clone(), &[("difficulty", tags.get(s(r, "id")).cloned().unwrap_or(Value::Null))]))
+        .filter(|r| crate::difficulty::keep(want.as_deref(), r))
+        .collect();
     Ok(with(merge(public(&sc), marks(conn)?), &[("rows", arr(rows)), ("options", crate::tierlist::options(&listed))]))
 }
 
@@ -421,7 +433,8 @@ pub fn comp(conn: &Connection, q: Option<&str>, id: &str, cache: &CompCache) -> 
         public(&sc),
         &[("comp", Value::Object(comp.clone())), ("levels", Value::Array(levels)), ("builds", Value::Array(builds))],
     );
-    Ok(with(body, &comp_page::sections(conn, &sc, id, comp)?))
+    let body = with(body, &comp_page::sections(conn, &sc, id, comp)?);
+    Ok(with(body, &flex::sections(conn, &sc, id, comp)?))
 }
 
 // ---- Units ---------------------------------------------------------------------

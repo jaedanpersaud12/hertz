@@ -113,7 +113,9 @@ CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime 
 ///    makes; every rebuild of a scope deletes and rewrites its rows.
 /// 5. Comps you renamed or merged (PRD 2 C14), never rebuilt, and which comp of last patch each comp continues
 ///    (C13), rebuilt with the stats when the comp method is `clusters`. See `cluster.rs` in tft-stats.
-pub const MIGRATIONS: [(u32, &str); 5] = [
+/// 6. Flex and swaps on the comp page (PRD 2 C8), written by `tft-stats` (`flex.rs`) like migration 4's tables;
+///    and the difficulty you give a comp (C10), yours and never rebuilt: `level` is easy, medium or hard.
+pub const MIGRATIONS: [(u32, &str); 6] = [
     (1, "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)"),
     (
         2,
@@ -168,6 +170,22 @@ CREATE TABLE IF NOT EXISTS comp_lineage (patch TEXT NOT NULL, comp_id TEXT NOT N
   prev_comp_id TEXT NOT NULL, overlap REAL NOT NULL, PRIMARY KEY (patch, comp_id));
 ",
     ),
+    (
+        6,
+        "
+CREATE TABLE IF NOT EXISTS stat_comp_flex_adds (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, comp_key TEXT NOT NULL, character_id TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, comp_key, character_id)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_comp_swaps (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, comp_key TEXT NOT NULL, out_unit TEXT NOT NULL, in_unit TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, comp_key, out_unit, in_unit)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS comp_difficulty (comp_key TEXT PRIMARY KEY, level TEXT NOT NULL);
+",
+    ),
 ];
 
 const RATES: &str = "games INTEGER NOT NULL, sum_place INTEGER NOT NULL, wins INTEGER NOT NULL, top4 INTEGER NOT NULL";
@@ -188,7 +206,8 @@ pub const STAT_TABLES: [&str; 13] = [
 /// 3: stat_comps gained score, tier, prev_place and d3_place (PRD 2 C3, C4).
 /// 4: the comp page tables (migration 4) are filled by a rebuild, so stats built before them are rebuilt in full.
 /// 5: stat_comps gained core and flex, and stat_comp_variants was added (PRD 2 C1, C2).
-pub const STATS_VERSION: i64 = 5;
+/// 6: the flex and swap tables (migration 6) are filled by a rebuild, so stats built before them are rebuilt in full.
+pub const STATS_VERSION: i64 = 6;
 
 pub fn stats_schema() -> String {
     let r = RATES;

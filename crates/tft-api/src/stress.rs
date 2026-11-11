@@ -120,18 +120,20 @@ fn extremes() -> [Vec<(&'static str, Value)>; 3] {
             // The tier list (PRD 2 C3, C4): top tier, rising fast on both trends.
             ("tier", json!("S")), ("score", json!(12.345_678)), ("prevPlace", json!(4.21)), ("d3Place", json!(1)),
             ("patchDelta", json!(-3.21)), ("d3Delta", json!(-3.456)), ("rising", json!(true)),
+            ("difficulty", json!("hard")), ("baseGames", json!(12_345_678)), // C10, C8
         ],
         vec![
             ("games", json!(1)), ("avgPlace", json!(8)), ("winRate", json!(0)), ("top4Rate", json!(0)),
             ("frequency", json!(0.00004)), ("pickRate", json!(0.0003)), ("placeChange", json!(3.4)),
             ("tier", json!("D")), ("score", json!(-12.345_678)), ("prevPlace", json!(4.6)), ("d3Place", json!(8)),
             ("patchDelta", json!(3.4)), ("d3Delta", json!(3.456)), ("rising", json!(false)),
+            ("difficulty", json!("medium")), ("baseGames", json!(10)),
         ],
         // Not graded yet, and new this patch: nothing to compare with.
         vec![
             ("placeChange", Value::Null), ("avgStar", json!(3)), ("tier", Value::Null), ("score", Value::Null),
             ("prevPlace", Value::Null), ("d3Place", Value::Null), ("patchDelta", Value::Null), ("d3Delta", Value::Null),
-            ("rising", json!(false)),
+            ("rising", json!(false)), ("difficulty", Value::Null),
         ],
     ]
 }
@@ -289,9 +291,10 @@ fn worst(path: &str, body: &mut Obj) {
     }
 }
 
-const LISTS: [&str; 21] = [
+const LISTS: [&str; 24] = [
     "rows", "matches", "teams", "favs", "hidden", "builds", "levels", "partners", "items", "holders", "comps", "trend",
     "stars", "itemCounts", "units", "traits", "recent", "byPatch", "levelling", "carries", "special",
+    "addAt9", "swaps", "variants",
 ];
 
 fn shrink(path: &str, body: &mut Obj, keep: usize) {
@@ -390,6 +393,15 @@ fn comp_page(body: &mut Obj, worst: bool) {
     }
     if worst {
         extreme(body.get_mut("special"));
+    }
+    // C8: six units added at 9, eight swaps; C2: four variants (/api/comps/:id/variants).
+    for (key, n) in [("addAt9", 6), ("swaps", 8), ("variants", 4)] {
+        if let Some(Value::Array(xs)) = body.get_mut(key) {
+            fill(xs, n);
+        }
+        if worst {
+            extreme(body.get_mut(key));
+        }
     }
     if let Some(Value::Array(bands)) = body.get_mut("levelling")
         && !bands.is_empty()
@@ -617,6 +629,10 @@ mod tests {
         assert_eq!((b["rows"][1]["tier"].clone(), b["rows"][1]["d3Delta"].clone()), (json!("D"), json!(3.456)));
         assert_eq!((b["rows"][2]["tier"].clone(), b["rows"][2]["prevPlace"].clone(), b["rows"][2]["patchDelta"].clone()), (Value::Null, Value::Null, Value::Null));
         assert_eq!(b["rows"][3], row("d"), "a fourth row keeps its real values");
+        let tagged = json!({ "rows": [{ "id": "a", "difficulty": null }, { "id": "b", "difficulty": null }, { "id": "c", "difficulty": "easy" }] });
+        let mut t = tagged.clone();
+        stress("worst", "/api/comps", &mut t);
+        assert_eq!(t["rows"].as_array().unwrap().iter().map(|r| r["difficulty"].clone()).collect::<Vec<_>>(), [json!("hard"), json!("medium"), Value::Null]);
         assert_ne!(b["options"]["units"][0]["name"], json!("U"), "filter choices get the awkward names too");
         let mut b = body.clone();
         stress("empty", "/api/comps", &mut b);
@@ -654,6 +670,8 @@ mod tests {
                           "items": [{ "id": "I", "name": "I", "icon": null, "type": "craftable", "games": 10, "freq": 1, "avgPlace": 3, "placeChange": 0.5 }] }],
             "holders": [{ "carry": unit, "games": 9, "top4": 4, "units": [{ "id": "H", "name": "H", "icon": null, "cost": 1, "traits": [], "games": 5, "top4": 2, "top4Share": 0.5, "avgPlace": 4, "sharedTraits": [], "sameRole": true }] }],
             "special": [{ "item": item, "holder": unit, "games": 30, "freq": 0.3, "avgPlace": 4, "placeChange": -0.5 }],
+            "addAt9": [{ "unit": unit, "games": 12, "freq": 0.3, "avgPlace": 4, "placeChange": -0.5, "baseGames": 20 }],
+            "swaps": [{ "out": unit, "in": unit, "games": 12, "freq": 0.3, "avgPlace": 4, "placeChange": 0.5, "baseGames": 40 }],
         });
         let mut worst = body.clone();
         stress("worst", "/api/comps/X%7CU", &mut worst);
@@ -673,7 +691,11 @@ mod tests {
         assert_eq!(many["levelling"][1]["levels"].as_array().unwrap().len(), 10);
         let mut empty = body.clone();
         stress("empty", "/api/comps/X%7CU", &mut empty);
-        for k in ["levelling", "carries", "holders", "special"] {
+        assert_eq!(worst["addAt9"].as_array().unwrap().len(), 6);
+        assert_eq!(worst["swaps"].as_array().unwrap().len(), 8);
+        assert_eq!((worst["swaps"][0]["games"].clone(), worst["swaps"][1]["placeChange"].clone()), (json!(12_345_678), json!(3.4)));
+        assert_ne!(worst["swaps"][0]["in"]["id"], worst["swaps"][1]["in"]["id"]);
+        for k in ["levelling", "carries", "holders", "special", "addAt9", "swaps"] {
             assert_eq!(empty[k], json!([]), "{k}");
         }
         let mut one = body;

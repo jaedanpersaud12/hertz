@@ -59,6 +59,8 @@ const STAT_TABLES = [
   // PRD 2 comp page sections (migration 4)
   'stat_comp_level_bands', 'stat_comp_carry_units', 'stat_comp_carry_items', 'stat_comp_builds', 'stat_comp_holders',
   'stat_comp_special',
+  // PRD 2 C8 flex and swaps (migration 6)
+  'stat_comp_flex_adds', 'stat_comp_swaps',
 ]
 let failures = 0
 const ok = (label: string) => console.log(`  ok  ${label}`)
@@ -930,6 +932,15 @@ async function writeSection(from: string, bare: string) {
     me((b) => b.configured === true && b.riotId === 'Tester#NA1' && /RIOT_API_KEY/.test(b.error)),
     refresh((b) => b.ok === false && /RIOT_API_KEY/.test(b.error)),
     myMatches((b) => b.configured === true && b.matches.length === 0),
+    // Difficulty you give a comp (PRD 2 C10): set, on the rows and filterable, refused when unknown, cleared.
+    post('POST /api/comps/:id/difficulty', `/api/comps/${encodeURIComponent(comps[0])}/difficulty`, { level: 'hard' }, 200, (b) => b.difficulty[comps[0]] === 'hard'),
+    post('POST /api/comps/:id/difficulty', `/api/comps/${encodeURIComponent(comps[1])}/difficulty`, { level: 'easy' }, 200, (b) => Object.keys(b.difficulty).length === 2),
+    get('GET /api/comps', '/api/comps?difficulty=hard', (b) => b.rows.length === 1 && b.rows[0].difficulty === 'hard'),
+    get('GET /api/comps', '/api/comps?difficulty=none', (b) => b.rows.length > 0 && b.rows.every((r: any) => r.difficulty === null)),
+    post('POST /api/comps/:id/difficulty', `/api/comps/${encodeURIComponent(comps[0])}/difficulty`, { level: 'brutal' }, 400),
+    post('POST /api/comps/:id/difficulty', `/api/comps/${encodeURIComponent(comps[0])}/difficulty`, 'not json', 400),
+    post('POST /api/comps/:id/difficulty', `/api/comps/${encodeURIComponent(comps[1])}/difficulty`, { level: null }, 200, (b) => Object.keys(b.difficulty).length === 1),
+    lists((b) => b.difficulty[comps[0]] === 'hard'),
   ])
 
   // 2. The same database with a key and the fake Riot API: the account saved above is looked up.

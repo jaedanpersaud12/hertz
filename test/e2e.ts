@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 
+import { compareHash, pickForCompare, readCompare } from '../src/ui/compare'
 import { filterQuery, NO_FILTERS, readFilters, writeFilters } from '../src/ui/tierFilters'
 import { ARCHETYPES, idsByPlayer, ITEMS, matches, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, UNITS, archetypeOf } from './world'
 
@@ -181,6 +182,35 @@ try {
   }
   ok('comp page sections: levelling bands, carry builds and items, and item holders match a recount')
 
+  // Flex (PRD 2 C8), recounted for every comp from the fixture boards with the cores worked out here: units on
+  // half the comp's boards, and for "add at 9" half its level 8 boards when it has 10 of them (else the core).
+  {
+    let adds = 0, swaps = 0
+    for (const [i, arch] of ARCHETYPES.entries()) {
+      const key = compRows.find((c) => c.comp_key.startsWith(arch.trait + '|')).comp_key
+      const mine = boards.filter((b: any) => b.arch === i)
+      const on = (b: any) => new Set<string>(b.units.map((u: any) => u.character_id))
+      const ids = [...new Set(mine.flatMap((b: any) => [...on(b)]))] as string[]
+      const coreOf = (bs: any[]) => ids.filter((id) => bs.filter((b) => on(b).has(id)).length * 2 >= bs.length)
+      const core = coreOf(mine)
+      const l8 = mine.filter((b: any) => b.level === 8)
+      const core8 = l8.length >= 10 ? coreOf(l8) : core
+      const tally = (m: Map<string, [number, number]>, k: string, b: any) => { const t = m.get(k) ?? [0, 0]; m.set(k, [t[0] + 1, t[1] + b.placement]) }
+      const wantAdds = new Map<string, [number, number]>(), wantSwaps = new Map<string, [number, number]>()
+      for (const b of mine) {
+        const u = on(b)
+        if (b.level >= 9) for (const id of u) if (!core8.includes(id)) tally(wantAdds, id, b)
+        for (const out of core) if (!u.has(out)) for (const id of u) if (!core.includes(id)) tally(wantSwaps, `${out}>${id}`, b)
+      }
+      const got = (sql: string) => new Map((db.prepare(sql).all(key) as any[]).map((r) => [r.k, [r.games, r.sum_place]]))
+      assert.deepEqual(got("SELECT character_id k, games, sum_place FROM stat_comp_flex_adds WHERE bucket='ALL' AND comp_key=?"), wantAdds, `adds of ${key}`)
+      assert.deepEqual(got("SELECT out_unit || '>' || in_unit k, games, sum_place FROM stat_comp_swaps WHERE bucket='ALL' AND comp_key=?"), wantSwaps, `swaps of ${key}`)
+      adds += wantAdds.size; swaps += wantSwaps.size
+    }
+    assert.ok(adds > 0 && swaps > 20, `${adds} adds, ${swaps} swaps: too few to prove much`)
+  }
+  ok('flex: units added at 9 and swaps for core units match a recount for every comp')
+
   const master = stat("SELECT matches FROM stat_meta WHERE bucket='MASTER+'").matches
   const all = stat("SELECT matches FROM stat_meta WHERE bucket='ALL'").matches
   assert.ok(master > 0 && master < all)
@@ -251,6 +281,7 @@ try {
     const get = async (p: string) => (await call(p)).body
     const post = async (p: string, body: unknown) => (await call(p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).body
 
+    const stat2 = (sql: string, ...a: unknown[]) => { const d = new Database(dbPath, { readonly: true }); try { return d.prepare(sql).get(...a) as any } finally { d.close() } }
     const meta = await get('/api/meta')
     assert.equal(meta.patch, '99.3'); assert.equal(meta.totals.matches, rankedMatches.length); assert.equal(meta.windows.length, 2)
 
@@ -278,6 +309,32 @@ try {
     assert.ok(holders.every((u: any) => (u.cost ?? 0) < 5), 'holders cost less than the carry')
     assert.deepEqual(detail.special, [])
     ok('comp page: levelling by placement band, carry items, item holders, special items')
+
+    // Flex on the comp page (C8): 10 games or more, the baseline too; place change against it.
+    const vSwaps = detail.swaps as any[]
+    assert.ok(vSwaps.length > 0 && vSwaps.length <= 8, `${vSwaps.length} swaps`)
+    for (const sw of vSwaps) {
+      assert.ok(sw.games >= 10 && sw.baseGames >= 10)
+      const row = stat2("SELECT games, sum_place FROM stat_comp_swaps WHERE bucket='ALL' AND comp_key=? AND out_unit=? AND in_unit=?", vanguard.id, sw.out.id, sw.in.id)
+      const base = stat2("SELECT games, sum_place FROM stat_comp_units WHERE bucket='ALL' AND comp_key=? AND character_id=?", vanguard.id, sw.out.id)
+      near(sw.placeChange, row.sum_place / row.games - base.sum_place / base.games, 'swap place change')
+      near(sw.freq, row.games / (vanguard.games - base.games), 'swap share of boards without the core unit')
+      assert.ok(vanguard.units.some((u: any) => u.id === sw.out.id), 'the unit swapped out is on the comp board')
+    }
+    assert.ok(vSwaps.every((x, n) => n === 0 || vSwaps[n - 1].games >= x.games), 'most played first')
+    assert.deepEqual(detail.addAt9, [], 'every Vanguard board is level 8')
+    const sniper = comps.rows.find((r: any) => r.id.startsWith('TFT99_Sniper|'))
+    const sDetail = await get(`/api/comps/${encodeURIComponent(sniper.id)}`)
+    // Sniper boards are all level 9 with no level 8 ones, so its core is the baseline: its flex units are added at 9.
+    assert.ok(sDetail.addAt9.length > 0 && sDetail.addAt9.length <= 6, `${sDetail.addAt9.length} adds`)
+    for (const a of sDetail.addAt9) {
+      assert.ok(a.games >= 10 && a.baseGames >= 10 && !sniper.units.some((u: any) => u.id === a.unit.id))
+      const row = stat2("SELECT games, sum_place FROM stat_comp_flex_adds WHERE bucket='ALL' AND comp_key=? AND character_id=?", sniper.id, a.unit.id)
+      const nine = stat2("SELECT SUM(games) games, SUM(sum_place) sum_place FROM stat_comp_levels WHERE bucket='ALL' AND comp_key=? AND level >= 9", sniper.id)
+      near(a.placeChange, row.sum_place / row.games - (nine.sum_place - row.sum_place) / (nine.games - row.games), 'add at 9 place change')
+      near(a.freq, row.games / nine.games, 'share of level 9 boards')
+    }
+    ok('comp page: swap options with place change against the core unit, add at 9 with its minimums')
 
     // Your name for a comp (PRD 2 C14): shown in the list at once, gone again when the override is deleted.
     const path = `/api/comps/${encodeURIComponent(vanguard.id)}`
@@ -362,6 +419,53 @@ try {
     assert.equal((await get('/api/comps?data=one')).rows.length, 1)
     assert.equal((await get('/api/comps?data=many&unit=' + vanguard.carries[0].id)).rows.length, 1000)
     ok('stress modes cover tier letters, trends and filters')
+
+    // Playstyle (C10) from the data: reroll, Fast 8 and Fast 9 are kinds of their own, and filterable.
+    const kind = (trait: string) => comps.rows.find((r: any) => r.id.startsWith(`${trait}|`)).play.kind
+    assert.deepEqual(['TFT99_Vanguard', 'TFT99_Sniper', 'TFT99_Brawler'].map(kind), ['fast8', 'fast9', 'reroll'])
+    assert.ok(['fast8', 'fast9', 'reroll'].every((k) => options.playstyles.includes(k)), options.playstyles.join())
+    assert.deepEqual(ids((await get('/api/comps?min=1&playstyle=fast9')).rows), ids(all.filter((r) => r.play.label === 'Fast 9')))
+    ok('playstyle tags: reroll, Fast 8 and Fast 9 from the average level and the carry, each a filter')
+
+    // Difficulty (C10): yours, set and cleared over HTTP, on each row, and a filter (with "none" for untagged).
+    const setDifficulty = (id: string, level: unknown) => call(`/api/comps/${encodeURIComponent(id)}/difficulty`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ level }) })
+    const hard = await setDifficulty(vanguard.id, 'hard')
+    assert.equal(hard.status, 200); assert.deepEqual(hard.body.difficulty, { [vanguard.id]: 'hard' })
+    assert.deepEqual((await get('/api/lists')).difficulty, { [vanguard.id]: 'hard' })
+    const tagged = (await get('/api/comps?min=1&difficulty=hard')).rows
+    assert.deepEqual(ids(tagged), [vanguard.id]); assert.equal(tagged[0].difficulty, 'hard')
+    assert.deepEqual(ids((await get('/api/comps?min=1&difficulty=none')).rows), ids(all.filter((r) => r.id !== vanguard.id)))
+    assert.equal((await get(`/api/comps?min=1&difficulty=hard&playstyle=fast9`)).rows.length, 0, 'combines with the other filters')
+    assert.equal((await setDifficulty(vanguard.id, 'impossible')).status, 400)
+    assert.equal((await setDifficulty(vanguard.id, 3)).status, 400)
+    assert.deepEqual((await get('/api/lists')).difficulty, { [vanguard.id]: 'hard' }, 'a refused level changes nothing')
+    assert.deepEqual((await setDifficulty(vanguard.id, null)).body.difficulty, {})
+    assert.deepEqual((await get('/api/comps?min=1&difficulty=hard')).rows, [])
+    assert.ok((await get('/api/comps?min=1')).rows.every((r: any) => r.difficulty === null))
+    assert.equal(writeFilters('?data=worst', { ...NO_FILTERS, difficulty: 'hard' }), '?data=worst&difficulty=hard')
+    assert.equal(readFilters('?difficulty=none').difficulty, 'none')
+    assert.equal((await get('/api/comps?data=worst')).rows[0].difficulty, 'hard', 'stress gives rows a difficulty')
+    ok('difficulty: set, filtered on and cleared, kept by comp id, refused when it is not easy, medium or hard')
+
+    // Compare (C12): the page URL holds both ids, and picking two from the tier list opens it.
+    assert.equal(compareHash('A|B', 'C/D'), '#/compare/A%7CB/C%2FD')
+    assert.deepEqual(readCompare(compareHash('A|B', 'C/D')), ['A|B', 'C/D'])
+    assert.deepEqual(readCompare('#/compare'), ['', '']); assert.deepEqual(readCompare('#/compare/A'), ['A', ''])
+    assert.equal(readCompare('#/comps'), null); assert.deepEqual(readCompare('#/compare/%E0%A4%A/x'), ['%E0%A4%A', 'x'])
+    assert.deepEqual(pickForCompare(null, 'A'), { waiting: 'A', open: null })
+    assert.deepEqual(pickForCompare('A', 'A'), { waiting: null, open: null }, 'picking the same comp again drops it')
+    assert.deepEqual(pickForCompare('A', 'B|C'), { waiting: null, open: '#/compare/A/B%7CC' })
+    const [left, right] = readCompare(compareHash(vanguard.id, sniper.id))!
+    assert.deepEqual([(await get(`/api/comps/${encodeURIComponent(left)}`)).comp.id, (await get(`/api/comps/${encodeURIComponent(right)}`)).comp.id], [vanguard.id, sniper.id])
+    ok('compare: both comp ids round-trip through the URL and load')
+
+    // Stress modes reach the flex lists.
+    const sid = encodeURIComponent(sniper.id)
+    const sw = await get(`/api/comps/${sid}?data=worst`)
+    assert.equal(sw.addAt9.length, 6); assert.equal(sw.swaps.length, 8); assert.equal(sw.swaps[0].games, 12_345_678)
+    assert.deepEqual([(await get(`/api/comps/${sid}?data=empty`)).addAt9, (await get(`/api/comps/${sid}?data=empty`)).swaps], [[], []])
+    assert.equal((await get(`/api/comps/${sid}?data=one`)).swaps.length, 1)
+    ok('stress modes cover add at 9 and swaps')
 
     const units = await get('/api/units')
     assert.equal(units.rows.length, 20)

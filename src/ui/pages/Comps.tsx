@@ -1,14 +1,16 @@
 import { ArrowDown, ArrowUp, CaretDown, EyeSlash, PushPin } from '@phosphor-icons/react'
 import { motion, useReducedMotion } from 'motion/react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { count, num, pct, useApi, useFilters, useMarks, type Comp, type CompOptions, type Entity, type Marks, type Scope } from '../api'
+import { count, num, pct, useApi, useFilters, useMarks, type Comp, type CompOptions, type Difficulty, type Entity, type Marks, type Scope } from '../api'
 import { useAccordion, useAutoHeight, type AccordionHeaderProps, type AccordionPanelProps } from '../interior/accordion'
 import { ContextMenu, type ContextMenuItem } from '../interior/context-menu'
 import { CopyButton } from '../interior/copy-button'
 import { Button, Change, Empty, FavButton, GradeChip, Icon, IconButton, PlaceRail, placeTone, Search, Select, Status, Tag, TraitChip, UnitChip } from '../parts'
-import { anyFilter, filterQuery, NO_FILTERS, PLAYSTYLES, readFilters, writeFilters, type TierFilters } from '../tierFilters'
+import { anyFilter, DIFFICULTIES, filterQuery, NO_FILTERS, PLAYSTYLES, readFilters, UNTAGGED, writeFilters, type TierFilters } from '../tierFilters'
 import tierConfig from '../../../config/tier-list.json'
 import { CompOverrides } from '../CompOverrides'
+import { CompareTray, useComparePick } from '../CompCompare'
+import { Flex, Variants, type AddAt9, type Swap } from '../CompFlex'
 
 type Rated = { games: number; freq: number; avgPlace: number; placeChange: number }
 type Band = {
@@ -23,6 +25,8 @@ type Detail = Scope & {
   carries: { unit: Entity; games: number; builds: (Rated & { items: Entity[] })[]; items: (Entity & Rated)[] }[]
   holders: { carry: Entity; games: number; top4: number; units: (Entity & { games: number; top4: number; top4Share: number; avgPlace: number; sharedTraits: string[]; sameRole: boolean })[] }[]
   special: (Rated & { item: Entity; holder: Entity })[]
+  addAt9: AddAt9[]
+  swaps: Swap[]
 }
 
 /** A section's own empty state: what is missing and what to do about it. */
@@ -164,7 +168,9 @@ function CompDetail({ comp }: { comp: Comp }) {
       <Levelling bands={data.levelling ?? []} />
       <Carries carries={data.carries ?? []} />
       <Holders holders={data.holders ?? []} />
+      <Flex adds={data.addAt9 ?? []} swaps={data.swaps ?? []} />
       <Special rows={data.special ?? []} />
+      <Variants id={comp.id} />
 
       {comp.flex.length ? (
         <section>
@@ -218,6 +224,8 @@ export function CompRow({ comp, open = false, onToggle, header, panel, exitOnHid
   const fav = marks.favs.includes(comp.id)
   const hidden = marks.hidden.includes(comp.id)
   const pinned = marks.pinned === comp.id
+  const difficulty = marks.difficulty[comp.id] ?? null
+  const [waiting, pick] = useComparePick()
   const [leaving, setLeaving] = useState(false)
   const toggleHidden = () => {
     if (hidden || !exitOnHide) return marks.toggleHidden(comp.id)
@@ -229,6 +237,10 @@ export function CompRow({ comp, open = false, onToggle, header, panel, exitOnHid
     { id: 'fav', label: fav ? 'Remove from favourites' : 'Add to favourites' },
     { id: 'pin', label: pinned ? 'Unpin' : 'Pin to your panel' },
     { id: 'hide', label: hidden ? 'Show this comp again' : 'Hide this comp' },
+    { id: 'compare', label: waiting === comp.id ? 'Stop comparing this comp' : waiting ? 'Compare with the comp you picked' : 'Compare with another comp' },
+    { id: 'sep-d', type: 'separator' },
+    ...Object.entries(DIFFICULTIES).map(([level, label]) => ({ id: `difficulty:${level}`, label: difficulty === level ? `Difficulty: ${label} (set)` : `Difficulty: ${label}` })),
+    ...(difficulty ? [{ id: 'difficulty:', label: 'Clear difficulty' }] : []),
     { id: 'sep', type: 'separator' },
     { id: 'carry', label: `Open ${comp.carries[0]?.name ?? 'main carry'}` },
   ]
@@ -236,11 +248,16 @@ export function CompRow({ comp, open = false, onToggle, header, panel, exitOnHid
     if (id === 'fav') marks.toggleFav(comp.id)
     if (id === 'pin') marks.pin(pinned ? null : comp.id)
     if (id === 'hide') toggleHidden()
+    if (id === 'compare') pick(comp.id)
+    if (id.startsWith('difficulty:')) {
+      const level = id.slice('difficulty:'.length)
+      marks.setDifficulty(comp.id, level && level !== difficulty ? (level as Difficulty) : null)
+    }
     if (id === 'carry' && comp.carries[0]) location.hash = `/units/${encodeURIComponent(comp.carries[0].id)}`
   }
 
   return (
-    <li className={`comp${leaving ? ' leaving' : ''}`} id={`comp-${comp.id}`}>
+    <li className={`comp${leaving ? ' leaving' : ''}${waiting === comp.id ? ' comparing' : ''}`} id={`comp-${comp.id}`}>
       <ContextMenu items={menu} onSelect={onMenu} label={`Actions for ${comp.name}`}>
         <div className="comp-row" onClick={onToggle} style={onToggle ? undefined : { cursor: 'default' }}>
           <span className="comp-grade">
@@ -250,6 +267,7 @@ export function CompRow({ comp, open = false, onToggle, header, panel, exitOnHid
             <span className="comp-name">{comp.name}</span>
             <span className="comp-tags">
               <Tag kind={comp.play.kind}>{comp.play.label}</Tag>
+              {difficulty ? <Tag kind="difficulty">{DIFFICULTIES[difficulty]}</Tag> : null}
               {comp.rising ? <Tag kind="rising">Rising</Tag> : null}
               {comp.frequency < 0.01 ? <Tag kind="rare">Rare</Tag> : null}
             </span>
@@ -315,6 +333,13 @@ function choices(any: string, list: Entity[], current: string) {
   return current && !list.some((e) => e.id === current) ? [...opts, { value: current, label: current }] : opts
 }
 
+/** Your difficulty tags (C10) as filter choices, and comps you have not tagged. */
+const DIFFICULTY_CHOICES = [
+  { value: '', label: 'Any difficulty' },
+  ...Object.entries(DIFFICULTIES).map(([value, label]) => ({ value, label })),
+  { value: UNTAGGED, label: 'No difficulty set' },
+]
+
 function FilterBar({ options, f, set }: { options: CompOptions | undefined; f: TierFilters; set: (f: TierFilters) => void }) {
   const o = options ?? { units: [], traits: [], items: [], playstyles: [] }
   const plays = o.playstyles.map((k) => ({ id: k, name: PLAYSTYLES[k] ?? k, icon: null }))
@@ -325,6 +350,7 @@ function FilterBar({ options, f, set }: { options: CompOptions | undefined; f: T
       <Select label="Any trait" prefix={label('Trait:', f.trait)} value={f.trait} onChange={(trait) => set({ ...f, trait })} options={choices('Any trait', o.traits, f.trait)} />
       <Select label="Any item" prefix={label('Item:', f.item)} value={f.item} onChange={(item) => set({ ...f, item })} options={choices('Any item', o.items, f.item)} />
       <Select label="Any playstyle" value={f.playstyle} onChange={(playstyle) => set({ ...f, playstyle })} options={choices('Any playstyle', plays, f.playstyle)} />
+      <Select label="Any difficulty" value={f.difficulty} onChange={(difficulty) => set({ ...f, difficulty })} options={DIFFICULTY_CHOICES} />
       <label className="check" title={RISING_HINT}><input type="checkbox" checked={f.rising} onChange={(e) => set({ ...f, rising: e.target.checked })} /> Rising only</label>
       {anyFilter(f) ? <Button size="sm" variant="ghost" onClick={() => set(NO_FILTERS)}>Clear filters</Button> : null}
     </div>
@@ -336,7 +362,10 @@ export function Comps() {
   const marks = useMarks()
   const [tf, setTf] = useTierFilters()
   const fq = filterQuery(tf)
-  const { data, error, loading } = useApi<Scope & Marks & { rows: Comp[]; options: CompOptions }>(`/api/comps${fq ? `?${fq}` : ''}`, f)
+  const { data, error, loading, reload } = useApi<Scope & Marks & { rows: Comp[]; options: CompOptions }>(`/api/comps${fq ? `?${fq}` : ''}`, f)
+  // The difficulty filter runs on the server, so a tag changed while it is on needs the list again.
+  const tags = JSON.stringify(marks.difficulty)
+  useEffect(() => { if (tf.difficulty) reload() }, [tags])
   const [search, setSearch] = useState('')
   const [sort, setSort] = useState('tier')
   const [favOnly, setFavOnly] = useState(false)
@@ -394,6 +423,7 @@ export function Comps() {
           <div className="mt-4"><Button onClick={() => setTf(NO_FILTERS)}>Clear filters</Button></div>
         </div>
       ) : <Empty scope={data} what="No comp" />}
+      <CompareTray comps={data.rows} />
     </>
   )
 }

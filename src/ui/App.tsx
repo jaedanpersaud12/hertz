@@ -11,6 +11,7 @@ import { TooltipGroup } from './interior/tooltip-group'
 import { Button, IconButton, PlaceRail, Select, Status, TraitChip, UnitChip } from './parts'
 import { Builder } from './pages/Builder'
 import { Comps } from './pages/Comps'
+import { Compare } from './CompCompare'
 import { Data } from './pages/Data'
 import { Explore, type StaticData } from './pages/Explore'
 import { History } from './pages/History'
@@ -222,7 +223,7 @@ export function App() {
   }
 
   const current = TITLES[page] ? page : page === 'identity' ? '' : 'comps'
-  const heading = page === 'identity' ? null : id && page === 'units' ? null : id && page === 'items' ? null : TITLES[current]
+  const heading = page === 'compare' ? 'Compare comps' : page === 'identity' ? null : id && page === 'units' ? null : id && page === 'items' ? null : TITLES[current]
   const hasStats = m && m.patches.length > 0
   const isMac = /Mac/i.test(navigator.platform)
 
@@ -278,7 +279,7 @@ export function App() {
                 <header className="page-head">
                   <div>
                     <h1>{heading}</h1>
-                    <p className="page-sub">{SUBTITLES[current]}</p>
+                    <p className="page-sub">{page === 'compare' ? 'Two comps side by side: board, stats, items and trend.' : SUBTITLES[current]}</p>
                   </div>
                 </header>
               ) : null}
@@ -292,6 +293,7 @@ export function App() {
                 : page === 'history' ? <History />
                 : page === 'identity' ? <IdentitySheet />
                 : page === 'data' ? (m ? <Data meta={m} /> : null)
+                : page === 'compare' ? <Compare />
                 : <Comps />}
             </main>
             {wide ? <aside className="side" aria-label="Your panel"><Panel f={f} meta={m} /></aside> : null}

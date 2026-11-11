@@ -25,10 +25,13 @@ export type Comp = Rates & {
   tier: Grade | null; score: number | null
   /** Average place last patch and in the last 3 days; the deltas are against this row's avgPlace (negative is better). */
   prevPlace: number | null; d3Place: number | null; patchDelta: number | null; d3Delta: number | null; rising: boolean
+  /** Your difficulty tag (PRD 2 C10), on /api/comps rows only. The live value is in Marks.difficulty. */
+  difficulty?: Difficulty | null
 }
 /** What the tier list's filters can pick from, out of the comps listed before filtering. */
 export type CompOptions = { units: Entity[]; traits: Entity[]; items: Entity[]; playstyles: string[] }
-export type Marks = { favs: string[]; hidden: string[]; pinned: string | null }
+export type Difficulty = 'easy' | 'medium' | 'hard'
+export type Marks = { favs: string[]; hidden: string[]; pinned: string | null; difficulty: Record<string, Difficulty> }
 
 // ---- Filters shared by every stats page ---------------------------------------
 export type Filters = { patch: string; bucket: string; window: string; min: number }
@@ -77,19 +80,23 @@ export type MarksApi = Marks & {
   toggleFav: (key: string) => void
   toggleHidden: (key: string) => void
   pin: (key: string | null) => void
+  /** PRD 2 C10: null clears it. */
+  setDifficulty: (key: string, level: Difficulty | null) => void
 }
-export const MarksCtx = createContext<MarksApi>({ favs: [], hidden: [], pinned: null, setFav() {}, toggleFav() {}, toggleHidden() {}, pin() {} })
+export const MarksCtx = createContext<MarksApi>({ favs: [], hidden: [], pinned: null, difficulty: {}, setFav() {}, toggleFav() {}, toggleHidden() {}, pin() {}, setDifficulty() {} })
 export const useMarks = () => useContext(MarksCtx)
 
 export function useMarksState(): MarksApi {
-  const [marks, setMarks] = useState<Marks>({ favs: [], hidden: [], pinned: null })
+  const [raw, setMarks] = useState<Marks>({ favs: [], hidden: [], pinned: null, difficulty: {} })
   useEffect(() => { fetch(stressed('/api/lists')).then((r) => r.json()).then(setMarks).catch(() => {}) }, [])
+  const marks = { ...raw, difficulty: raw.difficulty ?? {} }
   return {
     ...marks,
     setFav: (key, fav) => send<Marks>('/api/lists/mark', { key, fav }).then(setMarks).catch(() => {}),
     toggleFav: (key) => send<Marks>('/api/lists/mark', { key, fav: !marks.favs.includes(key) }).then(setMarks).catch(() => {}),
     toggleHidden: (key) => send<Marks>('/api/lists/mark', { key, hidden: !marks.hidden.includes(key) }).then(setMarks).catch(() => {}),
     pin: (key) => send<Marks>('/api/lists/pin', { key }).then(setMarks).catch(() => {}),
+    setDifficulty: (key, level) => send<Marks>(`/api/comps/${encodeURIComponent(key)}/difficulty`, { level }).then(setMarks).catch(() => {}),
   }
 }
 

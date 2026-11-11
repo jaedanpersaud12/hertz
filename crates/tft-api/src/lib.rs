@@ -6,6 +6,7 @@
 
 mod comp_admin;
 mod describe;
+mod difficulty;
 mod engine;
 pub mod js;
 mod jsval;
@@ -278,6 +279,9 @@ async fn answer(app: Arc<App>, req: Request<Body>) -> Response {
     let query = req.uri().query().map(str::to_string);
     if let Some(r) = comp_admin::route(&method, &path) {
         return comp_admin::handle(&app, r, req.into_body(), query).await; // PRD 2: renames, merges, variants
+    }
+    if let Some(id) = difficulty::route(&method, &path) {
+        return difficulty::handle(&app, id, req.into_body()).await; // PRD 2 C10
     }
     if let Some(a) = action(&method, &path) {
         return act(&app, a, req.into_body()).await.unwrap_or_else(server_error);
