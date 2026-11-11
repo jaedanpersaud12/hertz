@@ -1,11 +1,15 @@
-//! `tft`: the engine without the app.
+//! `tft`: the Hertz engine without the app, in one program.
 //!
-//!   tft crawl                  collect matches until Ctrl+C (same as `npm run crawl`)
-//!   tft crawl --once           stop when every known player is up to date
+//!   tft run [--port N]         serve the app and keep collecting matches, in one process (Ctrl+C stops both)
+//!   tft crawl                  collect matches until Ctrl+C, rebuilding the stats every 10 minutes when new ones arrive
+//!   tft crawl --once           stop when every known player is up to date, then build the stats once
+//!   tft crawl --no-supervisor  collect matches only: no stats builds, data refresh or pruning
 //!   tft ingest FILE...         store saved match JSON files (one match, or an array of matches, per file)
 //!   tft patches                download the patch calendar and date matches stored without one
 //!   tft stats [--patches N]    rebuild the stat tables for the N most recent patches (same as `npm run stats`)
+//!   tft stats --incremental    rebuild only the parts with new matches, and list them
 //!   tft serve [--port N]       serve the app and its read-only API on 127.0.0.1 (PORT from .env, then 5174)
+//!   tft health                 matches per hour per server, matches waiting, the last problem, how old the stats are
 //!   tft init                   create or upgrade the database and print where it is
 //!
 //! Settings come from `.env` in the current folder, the same file the TypeScript engine reads.
@@ -17,11 +21,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tft_core::config::{Config, tier_rank};
 use tft_core::riot::RiotMatch;
-use tft_riot::{CrawlOptions, Crawler, RiotError};
+use std::time::Duration;
+use tft_riot::cdragon::Source;
+use tft_riot::{CrawlOptions, Crawler, KeyProblem, RiotError, SupervisorOptions, Timings, run_supervisor};
 use tft_store::{Ingest, load_calendar, relabel_unknown, save_calendar};
 
 #[derive(Parser)]
-#[command(name = "tft", version, about = "TFT Local engine")]
+#[command(
+    name = "tft",
+    version,
+    about = "The Hertz engine: collects TFT matches from the Riot API, builds the stats and serves the app.",
+    after_help = "Settings come from .env in the current folder. Start with `tft run` to do everything at once."
+)]
 struct Cli {
     /// Database file. Defaults to DB_PATH from .env, then data/tft.db.
     #[arg(long, global = true)]
@@ -32,7 +43,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Collect ranked matches from the Riot API.
+    /// Serve the app and keep collecting matches in the same process. Ctrl+C stops both.
+    ///
+    /// The stats are rebuilt every 10 minutes when new matches arrived. Without a Riot API key the app is still
+    /// served; the crawl waits until you add the key and start again.
+    Run {
+        /// Port to listen on. Defaults to PORT from .env, then 5174.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Refresh the player list from the ladders first.
+        #[arg(long)]
+        reseed: bool,
+    },
+    /// Collect ranked matches from the Riot API until Ctrl+C.
+    ///
+    /// Also rebuilds the stats every 10 minutes when new matches arrived, downloads the patch calendar and set
+    /// data every 3 hours, and prunes old raw matches once a day.
     Crawl {
         /// Stop after storing this many matches.
         #[arg(long)]
@@ -40,12 +66,16 @@ enum Command {
         /// Refresh the player list from the ladders first.
         #[arg(long)]
         reseed: bool,
-        /// Stop when every known player is up to date.
+        /// Stop when every known player is up to date, then build the stats once.
         #[arg(long)]
         once: bool,
+        /// Only collect matches: no stats builds, data refresh or pruning while crawling.
+        #[arg(long)]
+        no_supervisor: bool,
     },
     /// Store saved match files, as if the crawler had fetched them.
     Ingest {
+        /// Match JSON files: one match, or an array of matches, per file.
         files: Vec<PathBuf>,
         /// Server the matches were found on.
         #[arg(long, default_value = "na1")]
@@ -64,6 +94,9 @@ enum Command {
         /// How many of the most recent patches to rebuild.
         #[arg(long, default_value_t = 2)]
         patches: i64,
+        /// Rebuild only the ranks and time windows that have new matches, and list them. Gives the same tables.
+        #[arg(long)]
+        incremental: bool,
     },
     /// Serve the built app and its read-only API on 127.0.0.1, like `npm start`.
     Serve {
@@ -71,6 +104,8 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Show how the crawl is doing: matches per hour per server, matches waiting, the last problem, stats age.
+    Health,
     /// Create or upgrade the database.
     Init,
 }
@@ -104,20 +139,71 @@ async fn run(command: Command, config: Config) -> Result<()> {
             tft_api::serve(tft_api::Options { port: port.unwrap_or(config.port), db_path: config.db_path }).await?;
         }
 
-        Command::Crawl { max, reseed, once } => {
-            let stop = Arc::new(AtomicBool::new(false));
-            let flag = Arc::clone(&stop);
-            tokio::spawn(async move {
-                while tokio::signal::ctrl_c().await.is_ok() {
-                    if flag.swap(true, Ordering::Relaxed) {
-                        std::process::exit(1);
-                    }
-                    println!("\nFinishing requests in flight, then stopping...");
-                }
-            });
+        Command::Crawl { max, reseed, once, no_supervisor } => {
+            let stop = stop_on_ctrl_c();
             let conn = tft_store::open(&config.db_path)?;
-            let crawler = Crawler::new(config, CrawlOptions { max, reseed, once }, conn, stop)?;
-            crawler.run().await?;
+            let db_path = config.db_path.clone();
+            let crawler = Crawler::new(config, CrawlOptions { max, reseed, once }, conn, Arc::clone(&stop))?;
+            if no_supervisor {
+                crawler.run().await?;
+            } else {
+                run_supervisor(crawler, supervisor_options(&db_path)).await?;
+                // Stopped by --once or --max, not by Ctrl+C: leave the stats up to date with what was stored.
+                if !stop.load(Ordering::Relaxed) {
+                    tokio::task::spawn_blocking(move || {
+                        tft_riot::supervisor::build_stats_step(&mut tft_store::open(&db_path)?, tft_stats::DEFAULT_PATCHES)
+                    })
+                    .await??;
+                }
+            }
+        }
+
+        Command::Run { port, reseed } => {
+            let stop = stop_on_ctrl_c();
+            let db_path = config.db_path.clone();
+            // Opened once before both halves start, so they never race to create or upgrade the tables.
+            let conn = tft_store::open(&db_path)?;
+            let mut server =
+                tokio::spawn(tft_api::serve(tft_api::Options { port: port.unwrap_or(config.port), db_path: db_path.clone() }));
+            let key_missing = config.api_key.trim().is_empty();
+            let crawler = Crawler::new(config, CrawlOptions { reseed, ..Default::default() }, conn, Arc::clone(&stop))?;
+            let mut crawl = tokio::spawn(async move {
+                if key_missing {
+                    // The crawl would only fail on its first request; say why once and keep the app up.
+                    return Err(RiotError::Key(KeyProblem::Missing).into());
+                }
+                run_supervisor(crawler, supervisor_options(&db_path)).await
+            });
+            let mut crawling = true;
+            loop {
+                tokio::select! {
+                    served = &mut server => {
+                        stop.store(true, Ordering::Relaxed);
+                        served??;
+                        bail!("The server stopped on its own.");
+                    }
+                    done = &mut crawl, if crawling => {
+                        crawling = false;
+                        crawl_ended(done?);
+                    }
+                    _ = stopped(&stop) => break,
+                }
+            }
+            // Ctrl+C: the crawler finishes the requests in flight, then the server stops taking requests.
+            if crawling {
+                crawl_ended(crawl.await?);
+            }
+            server.abort();
+            let _ = server.await;
+            println!("Stopped.");
+        }
+
+        Command::Health => {
+            let conn = tft_store::open(&config.db_path)?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+            for line in health_lines(&tft_store::health(&conn)?, now) {
+                println!("{line}");
+            }
         }
 
         Command::Ingest { files, platform, tier, no_snowball } => {
@@ -149,7 +235,7 @@ async fn run(command: Command, config: Config) -> Result<()> {
             println!("Stored {added} matches ({repeats} were already stored).");
         }
 
-        Command::Stats { patches } => {
+        Command::Stats { patches, incremental } => {
             let mut conn = tft_store::open(&config.db_path)?;
             // Matches stored without a patch (Riot stopped sending one) get dated from the patch calendar first.
             let unknown: i64 =
@@ -169,7 +255,14 @@ async fn run(command: Command, config: Config) -> Result<()> {
                     println!("Could not reach Community Dragon for the patch calendar. Check your connection and run this again.");
                 }
             }
-            tft_stats::build_stats(&mut conn, patches)?;
+            if incremental {
+                let touched = tft_stats::build_stats_incremental_with(&mut conn, patches, &mut |line| println!("{line}"))?;
+                if !touched.is_empty() {
+                    println!("Rebuilt {} scopes: {}", touched.len(), touched.join(", "));
+                }
+            } else {
+                tft_stats::build_stats(&mut conn, patches)?;
+            }
         }
 
         Command::Patches => {
@@ -193,6 +286,97 @@ async fn run(command: Command, config: Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Sets the returned flag on the first Ctrl+C so the crawler finishes what is in flight; a second one exits at once.
+fn stop_on_ctrl_c() -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    tokio::spawn(async move {
+        while tokio::signal::ctrl_c().await.is_ok() {
+            if flag.swap(true, Ordering::Relaxed) {
+                std::process::exit(1);
+            }
+            println!("\nFinishing requests in flight, then stopping...");
+        }
+    });
+    stop
+}
+
+/// Resolves once `stop` is set.
+async fn stopped(stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn supervisor_options(db_path: &std::path::Path) -> SupervisorOptions {
+    SupervisorOptions {
+        db_path: db_path.to_path_buf(),
+        patch_count: tft_stats::DEFAULT_PATCHES,
+        source: Source::live(),
+        timings: Timings::default(),
+    }
+}
+
+/// `tft run`: the crawl has ended while the app keeps being served. Says why, in the crawler's words.
+fn crawl_ended(result: Result<()>) {
+    match result {
+        Ok(()) => println!("The crawl stopped. The app is still being served; press Ctrl+C to stop it."),
+        Err(err) => {
+            match err.downcast_ref::<RiotError>() {
+                Some(RiotError::Key(msg)) => eprintln!("\n{msg}"),
+                _ => eprintln!("The crawl stopped: {err:#}"),
+            }
+            eprintln!("The app is still being served without new matches. Press Ctrl+C to stop it.");
+        }
+    }
+}
+
+/// `tft health` as plain lines.
+fn health_lines(h: &tft_store::Health, now: i64) -> Vec<String> {
+    let ago = |at: i64| {
+        let mins = (now - at).max(0) / 60_000;
+        match mins {
+            0 => "just now".to_string(),
+            1 => "1 minute ago".to_string(),
+            m if m < 120 => format!("{m} minutes ago"),
+            m => format!("{} hours ago", m / 60),
+        }
+    };
+    let mut out = Vec::new();
+    if h.per_region.is_empty() {
+        out.push("Matches stored: none in the last 24 hours.".to_string());
+    } else {
+        out.push("Matches stored, per server:".to_string());
+        for r in &h.per_region {
+            let day: i64 = r.matches_last_24h_per_hour.iter().sum();
+            out.push(format!("  {:<6} {} in the last hour, {} in the last 24 hours", r.region, r.matches_last_hour, day));
+        }
+    }
+    if h.queue_depth_per_region.is_empty() {
+        out.push("Matches waiting to be fetched: 0".to_string());
+    } else {
+        let total: i64 = h.queue_depth_per_region.iter().map(|q| q.pending).sum();
+        let each: Vec<String> = h.queue_depth_per_region.iter().map(|q| format!("{} {}", q.region, q.pending)).collect();
+        out.push(format!("Matches waiting to be fetched: {total} ({})", each.join(", ")));
+    }
+    match &h.last_error {
+        None => out.push("Last problem: none.".to_string()),
+        Some(e) => {
+            let region = if e.region.is_empty() { String::new() } else { format!(" on {}", e.region) };
+            out.push(format!("Last problem ({}{region}, {}): {}", e.level, ago(e.at), e.message));
+        }
+    }
+    match (h.stats_built_at, h.stats_age_minutes) {
+        (Some(at), Some(mins)) => out.push(format!("Stats built {} ({mins} minutes old).", ago(at))),
+        _ => out.push("Stats: not built yet. Run `tft stats` or keep `tft crawl` running.".to_string()),
+    }
+    match h.newest_match_at {
+        Some(at) => out.push(format!("Newest match stored {}.", ago(at))),
+        None => out.push("Newest match stored: none yet.".to_string()),
+    }
+    out
 }
 
 /// 1234567 as "1,234,567", as `toLocaleString('en-US')` prints it.

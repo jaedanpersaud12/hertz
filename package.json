@@ -15,8 +15,9 @@
     "test": "tsx test/e2e.ts",
     "parity": "tsx scripts/parity.ts",
     "resume": "tsx scripts/resume.ts",
+    "cli": "tsx scripts/cli.ts",
     "test:rust": "cargo test -q && cargo clippy -q --all-targets -- -D warnings",
-    "gate": "npm run test:rust && npm run parity && npm run resume && npm test && npm run build"
+    "gate": "npm run test:rust && npm run parity && npm run resume && npm run cli && npm test && npm run build"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",

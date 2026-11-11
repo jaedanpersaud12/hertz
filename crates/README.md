@@ -18,18 +18,26 @@ Needs Rust (https://rustup.rs). On Windows the installer also offers the Visual 
 
 ```
 cargo build --release -p tft-cli          # builds target/release/tft (tft.exe on Windows)
-target/release/tft crawl                  # same as npm run crawl; reads the same .env and database
-target/release/tft crawl --once           # stop when every known player is up to date
+target/release/tft run                    # serve the app and keep collecting matches; Ctrl+C stops both
+target/release/tft crawl                  # collect matches until Ctrl+C; stats rebuilt every 10 minutes when new ones arrive
+target/release/tft crawl --once           # stop when every known player is up to date, then build the stats once
+target/release/tft crawl --no-supervisor  # collect matches only: no stats builds, data refresh or pruning
+target/release/tft stats                  # rebuild the stat tables for the 2 most recent patches
+target/release/tft stats --incremental    # rebuild only the parts with new matches, and list them
+target/release/tft serve                  # serve the app and its read-only API on 127.0.0.1
+target/release/tft health                 # matches per hour per server, matches waiting, the last problem, stats age
 target/release/tft patches                # download the patch calendar, date matches stored without one
 target/release/tft ingest saved.json      # store saved match files
+target/release/tft --help                 # every command; `tft <command> --help` for its options
 ```
 
-The Rust crawler writes the same database the TypeScript app reads, so you can switch crawlers at any time.
-Stats are still built by `npm run stats` until `tft-stats` lands.
+Everything reads the same `.env` and database as the TypeScript app, so you can switch engines at any time.
+`tft run` works without a Riot API key: the app is served and the crawl says what to do about the key.
 
 ## Checks
 
 ```
 npm run test:rust     cargo test and clippy
 npm run parity        both engines on the same input, every row compared
+npm run cli           the tft commands against the fake Riot API
 ```
