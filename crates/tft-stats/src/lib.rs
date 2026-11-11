@@ -66,6 +66,14 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Settings for a stats build on this connection: a 256 MB page cache and up to 2 GB of the file memory-mapped,
+/// instead of SQLite's 2 MB default, so the many passes over the raw rows read from memory, not the disk.
+fn tune_for_build(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "cache_size", -262_144)?;
+    conn.pragma_update(None, "mmap_size", 2_147_483_648i64)?;
+    Ok(())
+}
+
 /// Rebuilds the stats for the `patch_count` most recent patches, printing one line per scope.
 pub fn build_stats(conn: &mut Connection, patch_count: i64) -> Result<()> {
     build_stats_with(conn, patch_count, &mut |s| println!("{s}"))
@@ -73,6 +81,7 @@ pub fn build_stats(conn: &mut Connection, patch_count: i64) -> Result<()> {
 
 /// [`build_stats`] with the progress lines sent to `log`.
 pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn FnMut(&str)) -> Result<()> {
+    tune_for_build(conn)?;
     let patches = recent_patches(conn, patch_count)?;
 
     if patches.is_empty() {
@@ -191,6 +200,7 @@ pub fn build_stats_incremental_with(
         return Ok(Vec::new());
     }
 
+    tune_for_build(conn)?;
     conn.execute_batch(INC_TEMP)?;
     let mut touched = Vec::new();
     for patch in &patches {
