@@ -244,7 +244,7 @@ mod tests {
         conn.execute_batch(
             r#"
             INSERT INTO stat_meta VALUES ('99.1', 'ALL', 13, 100, 1);
-            INSERT INTO stat_comps VALUES ('99.1', 'ALL', 'X|C', 100, 450, 10, 50, 800);
+            INSERT INTO stat_comps (patch, bucket, comp_key, games, sum_place, wins, top4, sum_level) VALUES ('99.1', 'ALL', 'X|C', 100, 450, 10, 50, 800);
             INSERT INTO stat_comp_units VALUES ('99.1', 'ALL', 'X|C', 'C', 100, 200, 290, 90, 450),
               ('99.1', 'ALL', 'X|C', 'H1', 100, 200, 0, 0, 450), ('99.1', 'ALL', 'X|C', 'H2', 100, 200, 0, 0, 450),
               ('99.1', 'ALL', 'X|C', 'H3', 100, 200, 0, 0, 450), ('99.1', 'ALL', 'X|C', 'H4', 100, 200, 0, 0, 450);

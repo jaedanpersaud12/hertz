@@ -56,6 +56,9 @@ const RUN_START = Date.now()
 const STAT_TABLES = [
   'stat_meta', 'stat_units', 'stat_unit_dist', 'stat_traits', 'stat_items', 'stat_unit_items', 'stat_unit_builds',
   'stat_comps', 'stat_comp_units', 'stat_comp_items', 'stat_comp_traits', 'stat_comp_levels',
+  // PRD 2 comp page sections (migration 4)
+  'stat_comp_level_bands', 'stat_comp_carry_units', 'stat_comp_carry_items', 'stat_comp_builds', 'stat_comp_holders',
+  'stat_comp_special',
 ]
 let failures = 0
 const ok = (label: string) => console.log(`  ok  ${label}`)
@@ -315,9 +318,15 @@ async function statsSection(ingested: string) {
   const pre = new Database(path)
   pre.prepare(`UPDATE matches SET rank = rowid % 10,
     game_datetime = CASE WHEN rowid % 3 = 0 THEN game_datetime - (4 + rowid % 7) * ? ELSE game_datetime END`).run(DAY)
+  // The fixture has no emblems, artifacts or radiants. Set data calling one item an emblem gives stat_comp_special
+  // rows; it is removed after the rebuild, so nothing the API section reads changes except those rows.
+  pre.prepare("INSERT INTO static_data (kind, id, name, icon, data) VALUES ('item', 'TFT_Item_Thing9', 'Thing 9', NULL, '{\"type\":\"emblem\"}')").run()
   pre.close()
   const PATCHES = 4 // the fixture has three patches; one more checks that a short list is handled
   await run(bin, ['--db', path, 'stats', '--patches', String(PATCHES)], {})
+  const post = new Database(path)
+  post.prepare("DELETE FROM static_data WHERE kind = 'item' AND id = 'TFT_Item_Thing9'").run()
+  post.close()
   const db = new Database(path, { readonly: true })
   for (const table of STAT_TABLES) {
     const info = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string; pk: number }[]
