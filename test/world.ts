@@ -151,3 +151,48 @@ export async function startFakeRiot() {
   const port = (server.address() as { port: number }).port
   return { port, seen, close: () => new Promise<void>((r) => server.close(() => r())) }
 }
+
+// ---- Fake Community Dragon -------------------------------------------------
+
+/** The patch folders Community Dragon lists, as its /json/ listing gives them: two patches, plus "latest" and "pbe". */
+export const CDRAGON_LISTING = [
+  { name: '16.21', type: 'directory', mtime: 'Wed, 21 Oct 2026 07:15:23 GMT' }, { name: 'latest', type: 'directory', mtime: 'Wed, 04 Nov 2026 07:47:21 GMT' },
+  { name: '16.22', type: 'directory', mtime: 'Wed, 04 Nov 2026 07:47:21 GMT' }, { name: 'pbe', type: 'directory', mtime: 'Thu, 27 Feb 2025 06:58:53 GMT' },
+]
+
+/** Set data for the fake world, shaped like Community Dragon's en_us.json: an old set and set 99 with every unit and trait. */
+export function fakeSetData() {
+  const icon = (n: string) => `ASSETS/Characters/${n}/HUD/${n}_Square.TFT_Set99.tex`
+  const traitNames = [...ARCHETYPES.map((a) => a.trait), 'TFT99_Shared', 'TFT99_Loner']
+  return {
+    items: ITEMS.map((i, n) => ({ apiName: i.id, name: `Thing ${n}`, icon: `ASSETS/Maps/TFT/Icons/Items/Thing${n}.TFT_Set99.tex`, composition: n < 6 ? ['TFT_Item_BFSword', 'TFT_Item_ChainVest'] : [] })),
+    sets: {
+      '98': { name: 'Old', champions: [], traits: [] },
+      '99': {
+        name: 'Test Set',
+        traits: traitNames.map((t) => ({ apiName: t, name: t.replace('TFT99_', ''), effects: [{ minUnits: 2, style: 1 }, { minUnits: 4, style: 2 }, { minUnits: 6, style: 4 }] })),
+        champions: UNITS.map((unit, n) => ({
+          apiName: unit.id, name: `Unit ${n}`, cost: unit.cost, role: 'Attack Carry', tileIcon: icon(`TFT99_Unit${n}`),
+          traits: ARCHETYPES.filter((a) => a.core.includes(n)).map((a) => a.trait.replace('TFT99_', '')).concat(n % 2 ? ['Shared'] : []),
+          ability: { name: 'Big Hit', desc: 'Deal <physicalDamage>@Damage@ (%i:scaleAD%)</physicalDamage> damage.<br>Stun for @StunDuration@ seconds.', variables: [{ name: 'Damage', value: [0, 100, 150, 900] }, { name: 'StunDuration', value: [1, 1, 1, 1] }] },
+          stats: { hp: 800, mana: 60, initialMana: 0, damage: 55, armor: 40, magicResist: 40, attackSpeed: 0.75, range: 4 },
+        })),
+      },
+    },
+  }
+}
+
+/** Starts a fake Community Dragon on a free local port: the patch listing at /json/ and the set data at /latest/. */
+export async function startFakeCdragon() {
+  const seen: string[] = []
+  const server = createServer((req, res) => {
+    seen.push(req.url ?? '')
+    const send = (body: unknown) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body))
+    if (req.url === '/json/') return send(CDRAGON_LISTING)
+    if (req.url === '/latest/cdragon/tft/en_us.json') return send(fakeSetData())
+    res.writeHead(404).end()
+  })
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+  const port = (server.address() as { port: number }).port
+  return { port, base: `http://127.0.0.1:${port}`, seen, close: () => new Promise<void>((r) => server.close(() => r())) }
+}

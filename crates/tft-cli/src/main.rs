@@ -10,6 +10,8 @@
 //!   tft stats --incremental    rebuild only the parts with new matches, and list them
 //!   tft serve [--port N] [--dev]  serve the app and its API on 127.0.0.1 (PORT from .env, then 5174)
 //!                              --dev: the API alone on PORT+1 for Vite, with the ?data= stress switch
+//!   tft refresh                download the patch calendar and the set data (names, costs, icons) now
+//!   tft recluster              label every stored board with its comp again, after the comp rules change
 //!   tft health                 matches per hour per server, matches waiting, the last problem, how old the stats are
 //!   tft init                   create or upgrade the database and print where it is
 //!
@@ -111,6 +113,16 @@ enum Command {
         #[arg(long)]
         dev: bool,
     },
+    /// Download the patch calendar and the set data (names, costs, icons, recipes) from Community Dragon now.
+    ///
+    /// `tft crawl` and `tft run` also do this at start and every 3 hours. CDRAGON_BASE in .env points it at
+    /// another address (tests use a fake one).
+    Refresh,
+    /// Label every stored board with its comp again, using the current comp rules.
+    ///
+    /// Run it after changing the rules in tft-core's cluster.rs, or once on a database made before comps existed,
+    /// then `tft stats`.
+    Recluster,
     /// Show how the crawl is doing: matches per hour per server, matches waiting, the last problem, stats age.
     Health,
     /// Create or upgrade the database.
@@ -278,6 +290,37 @@ async fn run(command: Command, config: Config) -> Result<()> {
             }
         }
 
+        Command::Refresh => {
+            let mut conn = tft_store::open(&config.db_path)?;
+            let src = cdragon_source();
+            let r = tft_riot::cdragon::refresh(&mut conn, &src)
+                .await
+                .context("Could not download the patch calendar from Community Dragon. Check your connection and run this again")?;
+            let cal = load_calendar(&conn)?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+            println!("Patch calendar saved. Current patch: {}.", cal.patch_at(now));
+            if let Some(p) = &r.new_patch {
+                println!("New patch: {p}.");
+            }
+            if r.relabelled > 0 {
+                println!("Dated {} matches to their patch.", thousands(r.relabelled));
+            }
+            match (&r.static_set, &r.static_error) {
+                (Some(s), _) => println!(
+                    "Set data saved: set {} ({}), {} units, {} traits, {} items.",
+                    s.set_number, s.set_name, s.units, s.traits, s.items
+                ),
+                (None, Some(e)) => bail!("Could not download the set data: {e}"),
+                (None, None) => println!("Set data is already up to date."),
+            }
+        }
+
+        Command::Recluster => {
+            let mut conn = tft_store::open(&config.db_path)?;
+            recluster(&mut conn, &mut |line| println!("{line}"))?;
+            println!("Done. Run \"npm run stats\" to rebuild the numbers.");
+        }
+
         Command::Patches => {
             let mut conn = tft_store::open(&config.db_path)?;
             let cal = match tft_riot::cdragon::fetch_calendar(&tft_riot::http_client()).await {
@@ -328,11 +371,87 @@ async fn stopped(stop: &AtomicBool) {
     }
 }
 
+/// Community Dragon, or CDRAGON_BASE from .env when it is set.
+fn cdragon_source() -> Source {
+    let mut src = Source::live();
+    if let Ok(base) = std::env::var("CDRAGON_BASE")
+        && !base.trim().is_empty()
+    {
+        src.base = base.trim().trim_end_matches('/').to_string();
+    }
+    src
+}
+
+/// Gives every stored board the comp label the current rules give it, in steps of 20,000 boards, as
+/// `src/stats/recluster.ts` did. Boards with no units keep the label they have.
+fn recluster(conn: &mut rusqlite::Connection, log: &mut dyn FnMut(String)) -> Result<()> {
+    use tft_core::cluster::{KeyTrait, KeyUnit, comp_key};
+    let total: i64 = conn.query_row("SELECT COUNT(*) n FROM participants", [], |r| r.get(0))?;
+    let max_id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) n FROM participants", [], |r| r.get(0))?;
+    const STEP: i64 = 20_000;
+    let mut done = 0usize;
+    let mut from = 1;
+    while from <= max_id {
+        let to = from + STEP - 1;
+        // Boards in the order their first unit was stored, each with its units and traits in stored order.
+        let mut order: Vec<i64> = Vec::new();
+        type Unit = (String, i64, Option<i64>, i64);
+        type Trait = (String, i64, i64, i64);
+        let mut units: std::collections::HashMap<i64, Vec<Unit>> = Default::default();
+        let mut traits: std::collections::HashMap<i64, Vec<Trait>> = Default::default();
+        {
+            let mut q = conn.prepare_cached(
+                "SELECT participant_id, character_id, star, rarity, n_items FROM units WHERE participant_id BETWEEN ? AND ?",
+            )?;
+            let mut rows = q.query([from, to])?;
+            while let Some(r) = rows.next()? {
+                let id: i64 = r.get(0)?;
+                let list = units.entry(id).or_insert_with(|| {
+                    order.push(id);
+                    Vec::new()
+                });
+                list.push((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?));
+            }
+            let mut q = conn.prepare_cached(
+                "SELECT participant_id, name, num_units, tier_current, style FROM traits WHERE participant_id BETWEEN ? AND ?",
+            )?;
+            let mut rows = q.query([from, to])?;
+            while let Some(r) = rows.next()? {
+                traits.entry(r.get(0)?).or_default().push((r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?));
+            }
+        }
+        let tx = conn.transaction()?;
+        {
+            let mut update = tx.prepare_cached("UPDATE participants SET comp_key = ? WHERE id = ?")?;
+            for id in &order {
+                let us: Vec<KeyUnit> = units[id]
+                    .iter()
+                    .map(|(c, star, rarity, n)| KeyUnit { character_id: c, star: *star, rarity: *rarity, n_items: *n })
+                    .collect();
+                let ts: Vec<KeyTrait> = traits
+                    .get(id)
+                    .map(|v| {
+                        v.iter()
+                            .map(|(name, n, tier, style)| KeyTrait { name, num_units: *n, tier_current: *tier, style: *style })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                update.execute(rusqlite::params![comp_key(&us, &ts), id])?;
+            }
+        }
+        tx.commit()?;
+        done += order.len();
+        log(format!("{} of {} boards", thousands(done), thousands(total as usize)));
+        from += STEP;
+    }
+    Ok(())
+}
+
 fn supervisor_options(db_path: &std::path::Path) -> SupervisorOptions {
     SupervisorOptions {
         db_path: db_path.to_path_buf(),
         patch_count: tft_stats::DEFAULT_PATCHES,
-        source: Source::live(),
+        source: cdragon_source(),
         timings: Timings::default(),
     }
 }

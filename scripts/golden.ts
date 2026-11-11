@@ -18,6 +18,8 @@
  *    body. Then the routes that change things, step by step, with the answers and every table they write after
  *    each step, and the number of requests sent to the fake Riot API.
  * 5. Dev stress switch: `tft serve --dev` with ?data=worst | empty | one | many and odd values.
+ * 6. Tools: `tft recluster` on boards that lost their labels and on a database made before comps existed, and
+ *    `tft refresh` storing the fake set data from a fake Community Dragon (data compared parsed).
  *
  * Normalised, as parity did: `ms` on the Explorer; `created` on teams saved and `fetchedAt` on your account
  * during the run; stat_meta.built_at (set to one fixed time before serving, where parity copied it across).
@@ -39,7 +41,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import Database from 'better-sqlite3'
-import { otherModeMatches, rankedMatches, startFakeRiot, WORLD_NOW } from '../test/world'
+import { CDRAGON_LISTING, fakeSetData, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, WORLD_NOW } from '../test/world'
 
 const UPDATE = process.argv.includes('--update')
 // TEMPORARY, removed with the TypeScript engine: --from-ts runs the TypeScript engine instead, to record from it.
@@ -386,6 +388,72 @@ async function crawlSection() {
   const second = await crawl('second crawl', {})
   if (second.total === 0) ok('a second crawl made no requests')
   else fail('second crawl', `    made ${second.total} requests`)
+}
+
+// ---- Section 6: recluster and set data -----------------------------------------------------
+
+async function toolsSection(ingested: string) {
+  console.log('\nRecluster and set data')
+  const recluster = async (path: string) =>
+    FROM_TS ? run(process.execPath, ['--import', 'tsx', 'src/stats/recluster.ts'], { DB_PATH: path }) : run(bin, ['--db', path, 'recluster'], {})
+  const wiped = join(dir, 'recluster.db')
+  copyFileSync(ingested, wiped)
+  const w = new Database(wiped)
+  w.exec('UPDATE participants SET comp_key = NULL')
+  w.close()
+  put('tools', 'recluster: output', (await recluster(wiped)).trim().split('\n'))
+  const a = new Database(wiped, { readonly: true })
+  const labels = a.prepare('SELECT id, comp_key FROM participants ORDER BY id').raw().all() as unknown[][]
+  if (!labels.some((r) => r[1] !== null)) fail('recluster', '    no board got a label, so this proves nothing')
+  put('tools', 'recluster: participants', labels)
+  a.close()
+
+  // A database made by the first version of this project gains the new columns, and its boards get comp labels.
+  const old = join(dir, 'old.db')
+  const o = new Database(old)
+  o.exec(`
+    CREATE TABLE participants (id INTEGER PRIMARY KEY, match_id TEXT NOT NULL, puuid TEXT NOT NULL, placement INTEGER NOT NULL, level INTEGER, last_round INTEGER, gold_left INTEGER, damage INTEGER);
+    CREATE TABLE units (participant_id INTEGER NOT NULL, character_id TEXT NOT NULL, star INTEGER NOT NULL, n_items INTEGER NOT NULL, build TEXT);
+    CREATE TABLE traits (participant_id INTEGER NOT NULL, name TEXT NOT NULL, num_units INTEGER NOT NULL, tier_current INTEGER NOT NULL, style INTEGER NOT NULL);
+    INSERT INTO participants VALUES (1, 'M1', 'p', 3, 8, 30, 0, 50), (2, 'M1', 'q', 4, 8, 30, 0, 50);
+    INSERT INTO units VALUES (1,'A',2,3,'x|y|z'), (1,'B',2,0,NULL), (1,'C',1,0,NULL), (1,'D',2,1,NULL), (2,'A',2,0,NULL);
+    INSERT INTO traits VALUES (1,'Big',6,3,4), (1,'Small',2,1,1);`)
+  o.close()
+  put('tools', 'recluster old database: output', (await recluster(old)).trim().split('\n'))
+  const b = new Database(old, { readonly: true })
+  put('tools', 'recluster old database: schema', b.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all())
+  put('tools', 'recluster old database: participants', b.prepare('SELECT * FROM participants ORDER BY id').all())
+  b.close()
+
+  // Set data from (a fake) Community Dragon.
+  const st = join(dir, 'static.db')
+  copyFileSync(ingested, st)
+  if (FROM_TS) {
+    // TEMPORARY: the TypeScript storeStatic on the same data.
+    const { openDb } = await import('../src/db')
+    const { storeStatic } = await import('../src/static/fetch')
+    const db = openDb(st)
+    storeStatic(db as any, fakeSetData() as any)
+    db.close()
+  } else {
+    const cd = await startFakeCdragon()
+    try {
+      await run(bin, ['--db', st, 'refresh'], { CDRAGON_BASE: cd.base })
+    } finally {
+      await cd.close()
+    }
+    const db = new Database(st, { readonly: true })
+    const cal = (db.prepare("SELECT value FROM kv WHERE key = 'patch_calendar'").get() as any)?.value
+    const want = CDRAGON_LISTING.filter((e) => /^\d+\.\d+$/.test(e.name)).map((e) => ({ patch: e.name, since: Date.parse(e.mtime) }))
+    if (cal === JSON.stringify(want)) ok('tft refresh saved the patch calendar from the listing')
+    else fail('patch calendar', `    expected ${JSON.stringify(want)}, got ${cal}`)
+    db.close()
+  }
+  const db = new Database(st, { readonly: true })
+  const rows = (db.prepare('SELECT kind, id, name, icon, data FROM static_data ORDER BY kind, id').all() as any[]).map((r) => ({ ...r, data: JSON.parse(r.data) }))
+  if (rows.length < 30) fail('set data', `    only ${rows.length} rows stored`)
+  put('tools', 'set data: static_data', rows)
+  db.close()
 }
 
 // ---- Section 4: the API ----------------------------------------------------------------
@@ -1170,6 +1238,7 @@ try {
   const stats = await statsSection(ingested)
   await crawlSection()
   await apiSection(stats)
+  await toolsSection(ingested)
   finish()
 } finally {
   rmSync(dir, { recursive: true, force: true })

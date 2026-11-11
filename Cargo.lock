@@ -1399,6 +1399,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
+ "rusqlite",
  "serde_json",
  "tft-api",
  "tft-core",

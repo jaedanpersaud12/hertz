@@ -29,7 +29,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import Database from 'better-sqlite3'
-import { otherModeMatches, rankedMatches, startFakeRiot } from '../test/world'
+import { fakeSetData, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot } from '../test/world'
 
 const dir = mkdtempSync(join(tmpdir(), 'tft-parity-'))
 const root = join(import.meta.dirname, '..')
@@ -1177,6 +1177,78 @@ try {
   // ---- 4. API ----------------------------------------------------------------------------
   console.log('\nAPI: the same URLs against the TypeScript API and tft serve')
   await apiParity(tsStats, rsStats)
+
+  // ---- 6. Recluster and set data (temporary, until the TypeScript engine is deleted) -------------
+  console.log('\nRecluster and set data: npm run recluster against tft recluster, npm run static against tft refresh')
+  {
+    // Every board loses its label (and one database made before comps existed), then each engine labels them again.
+    const old = (path: string) => {
+      const db = new Database(path)
+      db.exec(`
+        CREATE TABLE participants (id INTEGER PRIMARY KEY, match_id TEXT NOT NULL, puuid TEXT NOT NULL, placement INTEGER NOT NULL, level INTEGER, last_round INTEGER, gold_left INTEGER, damage INTEGER);
+        CREATE TABLE units (participant_id INTEGER NOT NULL, character_id TEXT NOT NULL, star INTEGER NOT NULL, n_items INTEGER NOT NULL, build TEXT);
+        CREATE TABLE traits (participant_id INTEGER NOT NULL, name TEXT NOT NULL, num_units INTEGER NOT NULL, tier_current INTEGER NOT NULL, style INTEGER NOT NULL);
+        INSERT INTO participants VALUES (1, 'M1', 'p', 3, 8, 30, 0, 50), (2, 'M1', 'q', 4, 8, 30, 0, 50);
+        INSERT INTO units VALUES (1,'A',2,3,'x|y|z'), (1,'B',2,0,NULL), (1,'C',1,0,NULL), (1,'D',2,1,NULL), (2,'A',2,0,NULL);
+        INSERT INTO traits VALUES (1,'Big',6,3,4), (1,'Small',2,1,1);`)
+      db.close()
+    }
+    const pairs: [string, string, string][] = [['wiped', join(dir, 'rc-ts.db'), join(dir, 'rc-rs.db')], ['old database', join(dir, 'rc-old-ts.db'), join(dir, 'rc-old-rs.db')]]
+    for (const [, a, b] of pairs.slice(0, 1)) for (const path of [a, b]) {
+      copyFileSync(tsCrawl, path)
+      const db = new Database(path)
+      db.exec('UPDATE participants SET comp_key = NULL')
+      db.close()
+    }
+    for (const [, a, b] of pairs.slice(1)) { old(a); old(b) }
+    for (const [label, a, b] of pairs) {
+      const outA = await run(process.execPath, ['--import', 'tsx', 'src/stats/recluster.ts'], { DB_PATH: a })
+      const outB = await run(bin, ['--db', b, 'recluster'], {})
+      const x = new Database(a, { readonly: true })
+      const y = new Database(b, { readonly: true })
+      compareOrdered(x, y, 'participants')
+      const labelled = (x.prepare('SELECT COUNT(*) n FROM participants WHERE comp_key IS NOT NULL').get() as any).n
+      if (labelled > 0) ok(`recluster (${label}): ${labelled} boards labelled`)
+      else fail(`recluster (${label})`, '    no board got a label, so this proves nothing')
+      const schema = (db: Database.Database) => JSON.stringify(db.prepare("SELECT name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all())
+      if (schema(x) === schema(y)) ok(`recluster (${label}): schema identical after the upgrade`)
+      else fail(`recluster (${label}) schema`, '    sqlite_master differs')
+      if (outA.trim() === outB.trim()) ok(`recluster (${label}): same output`)
+      else fail(`recluster (${label}) output`, `    TS: ${outA.trim()}\n    Rust: ${outB.trim()}`)
+      x.close()
+      y.close()
+    }
+
+    // Set data: the TypeScript storeStatic on the fake set data, and tft refresh downloading it from a fake Community Dragon.
+    const [sa, sb] = [join(dir, 'static-ts.db'), join(dir, 'static-rs.db')]
+    copyFileSync(tsCrawl, sa)
+    copyFileSync(tsCrawl, sb)
+    const { storeStatic } = await import('../src/static/fetch')
+    const x = openDb(sa)
+    storeStatic(x as any, fakeSetData() as any)
+    x.close()
+    const cd = await startFakeCdragon()
+    try {
+      await run(bin, ['--db', sb, 'refresh'], { CDRAGON_BASE: cd.base })
+    } finally {
+      await cd.close()
+    }
+    const a = new Database(sa, { readonly: true })
+    const b = new Database(sb, { readonly: true })
+    // The data column is JSON the API reads parsed. Rust writes its keys sorted, TypeScript in insertion order,
+    // so it is compared parsed, keys sorted.
+    const sorted = (v: any): any => Array.isArray(v) ? v.map(sorted) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v
+    const rows = (db: Database.Database) => (db.prepare('SELECT kind, id, name, icon, data FROM static_data').all() as any[])
+      .map((r) => JSON.stringify({ ...r, data: sorted(JSON.parse(r.data)) })).sort()
+    const [ra, rb] = [rows(a), rows(b)]
+    if (ra.length > 30 && JSON.stringify(ra) === JSON.stringify(rb)) ok(`static_data: ${ra.length} rows identical (data compared parsed)`)
+    else fail('static_data', `    TS ${ra.length}, Rust ${rb.length}. First TS row not in Rust: ${ra.find((r) => !rb.includes(r))}`)
+    const cal = (db: Database.Database) => (db.prepare("SELECT value FROM kv WHERE key = 'patch_calendar'").get() as any)?.value
+    if (cal(b) === JSON.stringify([{ patch: '16.21', since: Date.parse('2026-10-21T07:15:23Z') }, { patch: '16.22', since: Date.parse('2026-11-04T07:47:21Z') }])) ok('tft refresh saved the patch calendar from the listing')
+    else fail('patch calendar', `    ${cal(b)}`)
+    a.close()
+    b.close()
+  }
 } finally {
   rmSync(dir, { recursive: true, force: true })
 }
