@@ -4,6 +4,7 @@ A local TFT stats app and overlay (repository: jaedanpersaud12/hertz).
 
 A local TFT stats app. A crawler collects ranked matches from the Riot API into a SQLite file on your disk,
 and the app reads from that file, so every page loads instantly and nothing depends on someone else's server.
+The engine (crawler, stats and the app's API) is one Rust program, `tft`; the app is React.
 
 ## What is in it
 
@@ -21,20 +22,28 @@ and the app reads from that file, so every page loads instantly and nothing depe
 
 Filters on every stats page: patch, rank (All, Platinum+, Diamond+, Master+), period (whole patch or last 3 days), minimum games.
 
-## Rust engine and the agent team
+## The engine and the agent team
 
-A Rust engine is replacing the TypeScript one piece by piece; see `crates/README.md`. Its crawler already matches
-the TypeScript crawler row for row (`npm run parity`). The work is planned in `docs/plan/` and tracked in Linear,
-and an agent team builds it: see `CLAUDE.md`. `npm run gate` is the check every change has to pass.
+The engine is written in Rust (`crates/`, see `crates/README.md`). It replaced a TypeScript engine that matched
+it answer for answer; what that engine gave is kept in `test/golden/`, and `npm run golden` checks the Rust
+engine still gives exactly that. The work is planned in `docs/plan/` and tracked in Linear, and an agent team
+builds it: see `CLAUDE.md`. `npm run gate` is the check every change has to pass.
 
 ## Setup
 
-Needs Node 20 or newer.
+Needs Node 20 or newer and Rust.
+
+1. Install Rust from https://rustup.rs. On Windows, run `rustup-init.exe` and accept when it offers the Visual
+   Studio C++ build tools. Open a new terminal afterwards so `cargo` is found.
+2. Then:
 
 ```
 npm install
 copy .env.example .env        (macOS/Linux: cp .env.example .env)
 ```
+
+The first `npm run dev` or `npm start` builds the engine, which takes a few minutes once. Later starts only
+rebuild what changed.
 
 Put your Riot API key in `.env`. Get one at https://developer.riotgames.com:
 
@@ -50,21 +59,35 @@ npm install
 npm run demo
 ```
 
-Builds a small database of made-up matches (about 30 seconds, once) and opens the app on
+Builds a small database of made-up matches (about 30 seconds, once, plus the first engine build) and opens the app on
 http://127.0.0.1:5174. Names and icons are placeholders. Your real database is not touched.
 
 ## Daily use
 
 ```
-npm run static     names, costs, abilities and icons for the current set (run again after each patch)
-npm run crawl      collect matches; leave it running, Ctrl+C to stop, resumes where it left off
-npm run stats      rebuild the numbers the app shows
-npm run dev        open http://127.0.0.1:5174
+npm run build      once, and after updating: builds the app into dist/
+npm start          serves the app on http://127.0.0.1:5174 and keeps collecting matches; Ctrl+C stops both
 ```
 
-`npm run build` then `npm start` runs the app as one small server instead of the dev setup.
+`npm start` also rebuilds the stats every 10 minutes when new matches arrived, downloads names, costs,
+abilities and icons for the current set at start and every 3 hours, and prunes old raw matches once a day.
+Without a Riot API key the app is still served and the crawl says what to do about the key.
 
-You can run `npm run stats` while the crawler is still going.
+To work on the app itself, `npm run dev` runs the same engine behind Vite instead (the app on
+http://127.0.0.1:5174, the engine's API on the next port, 5175), with the dev-only stress switch on.
+
+Single jobs, if you want them:
+
+```
+npm run crawl            collect matches only; leave it running, Ctrl+C to stop, resumes where it left off
+npm run stats            rebuild the numbers the app shows (safe while a crawl is running)
+npm run tft -- refresh   download the patch calendar and the set data now
+npm run tft -- health    matches per hour per server, matches waiting, the last problem, how old the stats are
+npm run tft -- --help    every engine command
+```
+
+`npm run tft -- <command>` builds the engine if needed and runs `target/release/tft <command>`
+(`tft.exe` on Windows). You can also run that file directly.
 
 ### Coming from the first version
 
@@ -72,7 +95,7 @@ Keep your `data` folder and `.env`, replace everything else, then:
 
 ```
 npm install
-npm run recluster     one-off: gives the boards you already stored their comp labels
+npm run recluster     one-off: gives the boards you already stored their comp labels (tft recluster)
 npm run stats
 ```
 
@@ -91,7 +114,8 @@ each group, so the four limits add up:
 These are arithmetic from the published limits, not a measured run. Disk use was about 7 KB per match in testing.
 
 `npm run stats` rebuilds 16 views (2 patches x 4 rank filters x 2 periods). On the small test database
-it takes a moment; on millions of boards expect minutes. Use `-- --patches 1` to halve it.
+it takes a moment; on millions of boards expect minutes. Use `-- --patches 1` to halve it, or
+`-- --incremental` to rebuild only the parts with new matches.
 
 ## How it works
 
@@ -104,13 +128,14 @@ ladders ──> players ──> match ids ──> match_queue ──> matches, p
                                                     local API ▼  React app
 ```
 
-- `src/crawler/riot.ts`: Riot client with a per-host rate limiter. It reads the real limits from Riot's
+- `crates/tft-riot`: Riot client with a per-region rate limiter. It reads the real limits from Riot's
   response headers, so a production key speeds up without code changes. If Riot is unreachable the crawler
-  pauses and retries; nothing is skipped.
-- `src/crawler/crawl.ts`: seeds players from the ladders, then loops per routing group.
-- `src/cluster.ts`: the rule that labels a board with a comp (biggest trait plus main carry).
-- `src/stats/build.ts`: the aggregation SQL, including the step that merges near-identical comps.
-- `src/server`: local API. Icons are downloaded from Community Dragon once and cached in `data/icons`.
+  pauses and retries; nothing is skipped. Also the crawler (seeds players from the ladders, then loops per
+  routing group) and Community Dragon (patch calendar, set data).
+- `crates/tft-core/src/cluster.rs`: the rule that labels a board with a comp (biggest trait plus main carry).
+- `crates/tft-stats`: the aggregation SQL, including the step that merges near-identical comps.
+- `crates/tft-api`: the local API. Icons are downloaded from Community Dragon once and cached in `data/icons`.
+- `crates/tft-cli`: the `tft` command that runs all of it.
 - `src/ui`: the app. `tiers.ts` holds the S/A/B/C/D cut-offs and the trait colour table.
 
 ### The interface
@@ -151,8 +176,9 @@ the library; `src/ui/styles.css` holds the theme tokens at the top.
 
 Under `npm run dev` or `npm run demo`, a plain switch at the bottom of the window swaps the data every page
 receives: Demo data, Worst case (long and non-Latin names, missing fields, extreme numbers, a ten-unit board),
-Empty, One, and 1,000 rows. The choice lives in the URL (`?data=worst`). The reshaping happens in
-`src/server/worstcase.ts`, so the real components render it. It does not exist under `npm start`.
+Empty, One, and 1,000 rows. The choice lives in the URL (`?data=worst`). The reshaping happens in the engine
+(`crates/tft-api/src/stress.rs`, on with `tft run --dev` or `tft serve --dev`), so the real components render
+it. It does not exist under `npm start`.
 
 ### Motion
 
@@ -180,7 +206,8 @@ Deliberately instant: the search palette, the main tabs and every bar or number 
 
 ## Tested and not tested
 
-`npm test` runs the whole pipeline against a fake Riot API on your machine and checks: ladder seeding,
+`npm test` runs the whole pipeline through the `tft` engine against a fake Riot API and a fake Community Dragon
+on your machine and checks: ladder seeding,
 staying under the announced rate limit, recovery from 429s and server errors, skipping non-ranked games,
 no duplicates on a second run, upgrading an older database, comp grouping, every stat against a straight
 recount, and each API route including the summoner card and match history.
@@ -188,7 +215,7 @@ recount, and each API route including the summoner card and match history.
 Not yet run against the real services (they were not reachable where this was built):
 
 - **The live Riot API.** Endpoint paths and field names follow Riot's documentation.
-- **Community Dragon.** `npm run static`, ability text clean-up and icon downloads follow its documented
+- **Community Dragon.** Set data downloads (`tft refresh`), ability text clean-up and icon downloads follow its documented
   layout but have only seen sample data. Ability text is the likeliest thing to need a tweak.
 - **Trait colours.** The mapping from Riot's trait "style" number to bronze/silver/gold is in
   `src/ui/tiers.ts`. If colours look one step off with live data, change it there.
