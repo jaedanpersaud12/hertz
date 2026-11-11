@@ -1,6 +1,6 @@
 //! `tft`: the Hertz engine without the app, in one program.
 //!
-//!   tft run [--port N]         serve the app and keep collecting matches, in one process (Ctrl+C stops both)
+//!   tft run [--port N] [--dev] serve the app and keep collecting matches, in one process (Ctrl+C stops both)
 //!   tft crawl                  collect matches until Ctrl+C, rebuilding the stats every 10 minutes when new ones arrive
 //!   tft crawl --once           stop when every known player is up to date, then build the stats once
 //!   tft crawl --no-supervisor  collect matches only: no stats builds, data refresh or pruning
@@ -8,7 +8,8 @@
 //!   tft patches                download the patch calendar and date matches stored without one
 //!   tft stats [--patches N]    rebuild the stat tables for the N most recent patches (same as `npm run stats`)
 //!   tft stats --incremental    rebuild only the parts with new matches, and list them
-//!   tft serve [--port N]       serve the app and its API on 127.0.0.1 (PORT from .env, then 5174)
+//!   tft serve [--port N] [--dev]  serve the app and its API on 127.0.0.1 (PORT from .env, then 5174)
+//!                              --dev: the API alone on PORT+1 for Vite, with the ?data= stress switch
 //!   tft health                 matches per hour per server, matches waiting, the last problem, how old the stats are
 //!   tft init                   create or upgrade the database and print where it is
 //!
@@ -48,12 +49,15 @@ enum Command {
     /// The stats are rebuilt every 10 minutes when new matches arrived. Without a Riot API key the app is still
     /// served; the crawl waits until you add the key and start again.
     Run {
-        /// Port to listen on. Defaults to PORT from .env, then 5174.
+        /// Port to listen on. Defaults to PORT from .env, then 5174 (one more with --dev).
         #[arg(long)]
         port: Option<u16>,
         /// Refresh the player list from the ladders first.
         #[arg(long)]
         reseed: bool,
+        /// For `npm run dev`: the API alone on PORT+1, behind Vite, with the `?data=` stress switch.
+        #[arg(long)]
+        dev: bool,
     },
     /// Collect ranked matches from the Riot API until Ctrl+C.
     ///
@@ -100,9 +104,12 @@ enum Command {
     },
     /// Serve the built app and its API on 127.0.0.1, like `npm start`.
     Serve {
-        /// Port to listen on. Defaults to PORT from .env, then 5174.
+        /// Port to listen on. Defaults to PORT from .env, then 5174 (one more with --dev).
         #[arg(long)]
         port: Option<u16>,
+        /// For `npm run dev`: the API alone on PORT+1, behind Vite, with the `?data=` stress switch.
+        #[arg(long)]
+        dev: bool,
     },
     /// Show how the crawl is doing: matches per hour per server, matches waiting, the last problem, stats age.
     Health,
@@ -135,9 +142,9 @@ async fn run(command: Command, config: Config) -> Result<()> {
             println!("Database ready at {}", config.db_path.display());
         }
 
-        Command::Serve { port } => {
-            let (port, db_path) = (port.unwrap_or(config.port), config.db_path.clone());
-            tft_api::serve(tft_api::Options { port, db_path, config }).await?;
+        Command::Serve { port, dev } => {
+            let (port, db_path) = (port.unwrap_or(default_port(&config, dev)), config.db_path.clone());
+            tft_api::serve(tft_api::Options { port, db_path, config, dev }).await?;
         }
 
         Command::Crawl { max, reseed, once, no_supervisor } => {
@@ -159,12 +166,17 @@ async fn run(command: Command, config: Config) -> Result<()> {
             }
         }
 
-        Command::Run { port, reseed } => {
+        Command::Run { port, reseed, dev } => {
             let stop = stop_on_ctrl_c();
             let db_path = config.db_path.clone();
             // Opened once before both halves start, so they never race to create or upgrade the tables.
             let conn = tft_store::open(&db_path)?;
-            let opts = tft_api::Options { port: port.unwrap_or(config.port), db_path: db_path.clone(), config: config.clone() };
+            let opts = tft_api::Options {
+                port: port.unwrap_or(default_port(&config, dev)),
+                db_path: db_path.clone(),
+                config: config.clone(),
+                dev,
+            };
             let mut server = tokio::spawn(tft_api::serve(opts));
             let key_missing = config.api_key.trim().is_empty();
             let crawler = Crawler::new(config, CrawlOptions { reseed, ..Default::default() }, conn, Arc::clone(&stop))?;
@@ -287,6 +299,11 @@ async fn run(command: Command, config: Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// PORT from .env (then 5174); with `--dev` the one after it, since Vite takes PORT and proxies `/api` there.
+fn default_port(config: &Config, dev: bool) -> u16 {
+    if dev { config.port.saturating_add(1) } else { config.port }
 }
 
 /// Sets the returned flag on the first Ctrl+C so the crawler finishes what is in flight; a second one exits at once.

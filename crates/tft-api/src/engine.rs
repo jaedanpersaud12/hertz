@@ -8,14 +8,14 @@
 //!
 //! The crawler reads the settings at the top of every round, so a saved change applies on the next round.
 //!
-//! In debug builds (`cargo build`, which is what development uses) the two GET routes also take the dev stress
-//! switch `?data=worst|empty|one|many`, like the TypeScript server's `--dev` mode. Release builds ignore it.
+//! With `--dev` (`npm run dev`) the two GET routes also take the dev stress switch `?data=worst|empty|one|many`,
+//! like every other GET route; their stress datasets are in `stress.rs`.
 
 use crate::routes::Obj;
 use anyhow::Result;
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use tft_core::config::{BUCKETS, Config, PLATFORMS, TIERS, platform_route};
+use tft_core::config::{Config, PLATFORMS, TIERS, platform_route};
 use tft_store::{CRAWL_SETTINGS, CrawlSettings, SettingsError};
 
 /// Riot's servers as the client names them (the same names as `SERVERS` in `src/ui/Account.tsx`).
@@ -37,7 +37,7 @@ pub const SERVER_LABELS: [(&str, &str); 15] = [
     ("vn2", "Vietnam"),
 ];
 
-fn server_label(p: &str) -> String {
+pub(crate) fn server_label(p: &str) -> String {
     SERVER_LABELS.iter().find(|(v, _)| *v == p).map_or_else(|| p.to_string(), |(_, l)| l.to_string())
 }
 
@@ -56,7 +56,7 @@ fn obj(v: Value) -> Obj {
 
 /// `GET /api/health`. Every server being crawled gets a row, plus any other server that stored a match in the
 /// last 24 hours or still has matches waiting.
-pub fn health(conn: &Connection, config: &Config, query: Option<&str>) -> Result<Obj> {
+pub fn health(conn: &Connection, config: &Config) -> Result<Obj> {
     let h = tft_store::health(conn)?;
     let acc = tft_store::rank_sample_accuracy(conn)?;
     let crawling = tft_store::get_crawl_settings(conn, config)?.platforms;
@@ -105,7 +105,7 @@ pub fn health(conn: &Connection, config: &Config, query: Option<&str>) -> Result
             })).collect::<Vec<_>>(),
         },
     });
-    Ok(stress_health(stress_mode(query).as_deref(), obj(body)))
+    Ok(obj(body))
 }
 
 /// The settings as the app shows them: what the crawler uses now, whether that was chosen in the app, the
@@ -133,9 +133,8 @@ fn settings_body(conn: &Connection, config: &Config) -> Result<Obj> {
 }
 
 /// `GET /api/settings/crawl`.
-pub fn get_settings(conn: &Connection, config: &Config, query: Option<&str>) -> Result<Obj> {
-    let body = settings_body(conn, config)?;
-    Ok(stress_settings(stress_mode(query).as_deref(), body))
+pub fn get_settings(conn: &Connection, config: &Config) -> Result<Obj> {
+    settings_body(conn, config)
 }
 
 fn bad_request(message: impl std::fmt::Display) -> (u16, Obj) {
@@ -173,148 +172,6 @@ pub fn reset_settings(conn: &Connection, config: &Config) -> Result<Obj> {
     settings_body(conn, config)
 }
 
-// ---- Dev stress switch (debug builds only) ---------------------------------------------------------------
-
-fn stress_mode(query: Option<&str>) -> Option<String> {
-    if !cfg!(debug_assertions) {
-        return None;
-    }
-    query?.split('&').find_map(|kv| kv.strip_prefix("data=")).map(str::to_string).filter(|m| !m.is_empty())
-}
-
-const HOUR: i64 = 3_600_000;
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
-}
-
-fn fake_region(name: &str, crawling: bool, last24h: Vec<i64>, queued: i64) -> Value {
-    json!({
-        "region": name, "label": server_label(name), "crawling": crawling,
-        "matchesLastHour": last24h[23], "last24h": last24h, "queued": queued,
-    })
-}
-
-fn fake_accuracy(per: &[(i64, [i64; 4])], rate: f64) -> Value {
-    let total: i64 = per.iter().map(|(_, r)| r.iter().sum::<i64>()).sum();
-    let right: i64 = per.iter().enumerate().map(|(i, (_, r))| r[i]).sum();
-    json!({
-        "sampledMatches": total,
-        "players": total * 8,
-        "share": (total > 0).then(|| right as f64 / total as f64),
-        "sampleRate": rate,
-        "perBucket": BUCKETS.iter().zip(per).map(|(b, (_, real))| json!({
-            "bucket": b.key,
-            "sampledMatches": real.iter().sum::<i64>(),
-            "inRightBucket": real[BUCKETS.iter().position(|x| x.key == b.key).unwrap()],
-            "real": BUCKETS.iter().zip(real).map(|(k, n)| json!({ "bucket": k.key, "matches": n })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-    })
-}
-
-/// Reshapes a health body into the stress datasets the UI is checked against.
-fn stress_health(mode: Option<&str>, mut body: Obj) -> Obj {
-    let now = now_ms();
-    let zero = [(0, [0; 4]); 4];
-    match mode {
-        Some("empty") => {
-            body.insert("regions".into(), json!([]));
-            body.insert("lastProblem".into(), Value::Null);
-            body.insert("statsBuiltAt".into(), Value::Null);
-            body.insert("statsAgeMinutes".into(), Value::Null);
-            body.insert("newestMatchAt".into(), Value::Null);
-            body.insert("rankAccuracy".into(), fake_accuracy(&zero, 0.0));
-        }
-        Some("one") => {
-            let mut h = vec![0; 24];
-            h[23] = 1;
-            body.insert("regions".into(), json!([fake_region("na1", true, h, 1)]));
-            body.insert("lastProblem".into(), Value::Null);
-            body.insert("statsBuiltAt".into(), json!(now - 60_000));
-            body.insert("statsAgeMinutes".into(), json!(1));
-            body.insert("newestMatchAt".into(), json!(now - 60_000));
-            body.insert(
-                "rankAccuracy".into(),
-                fake_accuracy(&[(0, [0; 4]), (0, [0; 4]), (0, [0, 0, 1, 0]), (0, [0; 4])], 0.02),
-            );
-        }
-        Some("worst") => {
-            // Every server, numbers far larger than a real crawl, one hour with a spike, and a long error.
-            let regions: Vec<Value> = PLATFORMS
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let mut h: Vec<i64> = (0..24).map(|k| if (k + i) % 7 == 0 { 0 } else { 9_999 }).collect();
-                    h[(i * 5) % 24] = 1_234_567;
-                    fake_region(p, i % 3 != 2, h, 987_654_321 / (i as i64 + 1))
-                })
-                .collect();
-            body.insert("regions".into(), json!(regions));
-            body.insert(
-                "lastProblem".into(),
-                json!({
-                    "at": now - 400 * 24 * HOUR,
-                    "region": "americas",
-                    "level": "error",
-                    "message": "Riot answered 503 Service Unavailable for https://americas.api.riotgames.com/tft/match/v1/matches/NA1_5123456789012345?with=a_very_long_query_string_that_does_not_break_anywhere_on_its_own_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and kept doing so after five retries, so this region is paused for ten minutes before it tries again.",
-                }),
-            );
-            body.insert("statsBuiltAt".into(), json!(now - 400 * 24 * HOUR));
-            body.insert("statsAgeMinutes".into(), json!(400 * 24 * 60));
-            body.insert("newestMatchAt".into(), json!(now - 3 * 24 * HOUR));
-            body.insert(
-                "rankAccuracy".into(),
-                fake_accuracy(&[(0, [1, 0, 0, 999_999]), (0, [0; 4]), (0, [123_456, 1, 0, 0]), (0, [0, 0, 1, 0])], 1.0),
-            );
-        }
-        Some("many") => {
-            let regions: Vec<Value> = PLATFORMS
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let h: Vec<i64> = (0..24).map(|k| ((k * 37 + i as i64 * 11) % 90) * (i as i64 + 1)).collect();
-                    fake_region(p, true, h, (i as i64 * 131) % 700)
-                })
-                .collect();
-            body.insert("regions".into(), json!(regions));
-            body.insert(
-                "lastProblem".into(),
-                json!({ "at": now - 12 * 60_000, "region": "europe", "level": "warn", "message": "Riot asked us to slow down. Waiting 20 seconds." }),
-            );
-            body.insert("statsBuiltAt".into(), json!(now - 35 * 60_000));
-            body.insert("statsAgeMinutes".into(), json!(35));
-            body.insert("newestMatchAt".into(), json!(now - 30_000));
-            body.insert(
-                "rankAccuracy".into(),
-                fake_accuracy(
-                    &[(0, [612, 140, 9, 0]), (0, [96, 581, 118, 4]), (0, [3, 101, 402, 77]), (0, [0, 6, 88, 311])],
-                    0.02,
-                ),
-            );
-        }
-        _ => {}
-    }
-    body
-}
-
-fn stress_settings(mode: Option<&str>, mut body: Obj) -> Obj {
-    match mode {
-        // Everything chosen: the longest the chips can get.
-        Some("worst") | Some("many") => {
-            body.insert("platforms".into(), json!(PLATFORMS));
-            body.insert("tiers".into(), json!(TIERS));
-            body.insert("saved".into(), json!(true));
-        }
-        Some("one") => {
-            body.insert("platforms".into(), json!(["na1"]));
-            body.insert("tiers".into(), json!(["CHALLENGER"]));
-            body.insert("saved".into(), json!(true));
-        }
-        _ => {}
-    }
-    body
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +184,14 @@ mod tests {
     use std::time::Duration;
     use tft_store::params;
 
+    use tft_core::config::BUCKETS;
+
+    const HOUR: i64 = 3_600_000;
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    }
+
     fn config() -> Config {
         Config::from_lookup(|k| match k {
             "PLATFORMS" => Some("na1,euw1".into()),
@@ -336,8 +201,12 @@ mod tests {
         })
     }
 
-    /// A fresh database file and the whole app around it, as `serve` builds it.
+    /// A fresh database file and the whole app around it, as `serve --dev` builds it.
     fn app(name: &str) -> (Arc<App>, PathBuf) {
+        dev_app(name, true)
+    }
+
+    fn dev_app(name: &str, dev: bool) -> (Arc<App>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("tft-api-engine-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -356,6 +225,7 @@ mod tests {
             write,
             me,
             config,
+            dev,
         });
         (app, db)
     }
@@ -552,7 +422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_stress_switch_reshapes_the_get_routes_in_debug_builds() {
+    async fn the_stress_switch_reshapes_the_get_routes_with_dev() {
         let (app, _) = app("stress");
         let (_, h) = call(&app, Method::GET, "/api/health?data=worst", "").await;
         assert_eq!(h["regions"].as_array().unwrap().len(), PLATFORMS.len());
@@ -569,6 +439,19 @@ mod tests {
         assert_eq!(acc["sampledMatches"].as_i64().unwrap(), sum);
         let (_, s) = call(&app, Method::GET, "/api/settings/crawl?data=worst", "").await;
         assert_eq!(s["platforms"].as_array().unwrap().len(), PLATFORMS.len());
-        assert_eq!(stress_mode(Some("x=1&data=")), None);
+        // An empty ?data= is no mode.
+        let (_, plain) = call(&app, Method::GET, "/api/settings/crawl", "").await;
+        let (_, blank) = call(&app, Method::GET, "/api/settings/crawl?x=1&data=", "").await;
+        assert_eq!(blank, plain);
+    }
+
+    #[tokio::test]
+    async fn without_dev_the_stress_switch_is_off() {
+        let (app, _) = dev_app("stress-off", false);
+        let (_, plain) = call(&app, Method::GET, "/api/health", "").await;
+        let (_, worst) = call(&app, Method::GET, "/api/health?data=worst", "").await;
+        assert_eq!(worst["regions"], plain["regions"]);
+        let (_, s) = call(&app, Method::GET, "/api/settings/crawl?data=worst", "").await;
+        assert_ne!(s["platforms"].as_array().unwrap().len(), PLATFORMS.len());
     }
 }

@@ -1,8 +1,8 @@
 //! The `/api` routes the React app calls, and the built app itself, served the way `src/server/index.ts` serves
 //! them (`tft serve`): the stats and lists, the routes that change your lists (POST `/api/lists/*`, POST and
 //! DELETE `/api/teams*`) and the summoner routes (`/api/me*`, which call Riot). Every answer, and every change to
-//! the database, matches the TypeScript API exactly; `npm run parity` checks it. The dev-only `?data=` stress
-//! switch stays in the TypeScript server.
+//! the database, matches the TypeScript API exactly; `npm run golden` checks it. With `--dev` the API sits behind
+//! Vite's dev server instead, and `?data=` reshapes answers into stress data (see `stress.rs`).
 
 mod describe;
 mod engine;
@@ -10,6 +10,7 @@ pub mod js;
 mod jsval;
 mod me;
 mod routes;
+mod stress;
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -54,6 +55,8 @@ struct App {
     me: Arc<me::Me>,
     /// `.env` settings: the crawl defaults the settings routes fall back to.
     config: Config,
+    /// `--dev`: the `?data=` stress switch is on.
+    dev: bool,
 }
 
 pub struct Options {
@@ -61,6 +64,8 @@ pub struct Options {
     pub port: u16,
     /// The Riot key and base URL, and your Riot ID and server from .env, for the summoner routes.
     pub config: Config,
+    /// `npm run dev`: no built app, and `?data=worst | empty | one | many` reshapes GET `/api/*` answers.
+    pub dev: bool,
 }
 
 /// Opens (or creates) the database, then serves the API and the built app on 127.0.0.1 until stopped.
@@ -79,18 +84,24 @@ pub async fn serve(opts: Options) -> Result<()> {
         pool: Pool { path: opts.db_path.clone(), idle: Mutex::new(Vec::new()) },
         comps: Mutex::default(),
         icons,
-        dist: Path::new("dist/index.html").exists().then(|| PathBuf::from("dist")),
+        // With --dev the API sits behind Vite's dev server, which serves the app.
+        dist: (!opts.dev && Path::new("dist/index.html").exists()).then(|| PathBuf::from("dist")),
         // Like Node's fetch: no proxy, 15 seconds.
         http: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build()?,
         write,
         me,
         config: opts.config.clone(),
+        dev: opts.dev,
     });
     let router = axum::Router::new().fallback(handle).with_state(app);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", opts.port))
         .await
         .with_context(|| format!("port {} is in use or not allowed", opts.port))?;
-    println!("Hertz running at http://127.0.0.1:{}", opts.port);
+    if opts.dev {
+        println!("API on http://127.0.0.1:{}", opts.port);
+    } else {
+        println!("Hertz running at http://127.0.0.1:{}", opts.port);
+    }
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -235,6 +246,30 @@ async fn act(app: &Arc<App>, a: Action, body: Body) -> Result<Response> {
 }
 
 async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
+    // Dev only: ?data=worst (and friends) reshapes a GET /api/* JSON answer into stress data. See stress.rs.
+    let mode = (app.dev && req.method() == Method::GET)
+        .then(|| js::query(req.uri().query(), "data"))
+        .flatten()
+        .filter(|m| !m.is_empty());
+    let path = js::hono_path(req.uri().path());
+    let res = answer(app, req).await;
+    let Some(mode) = mode else { return res };
+    let is_json = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.contains("json"));
+    if !(path == "/api" || path.starts_with("/api/")) || !is_json {
+        return res;
+    }
+    let Ok(bytes) = axum::body::to_bytes(res.into_body(), usize::MAX).await else {
+        return server_error(anyhow::anyhow!("reading an answer to reshape"));
+    };
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return server_error(anyhow::anyhow!("an answer to reshape is not JSON"));
+    };
+    stress::stress(&mode, &path, &mut body);
+    // Like `c.json(body)`: a fresh 200 answer.
+    respond(StatusCode::OK, "application/json", serde_json::to_vec(&body).unwrap())
+}
+
+async fn answer(app: Arc<App>, req: Request<Body>) -> Response {
     // Hono answers HEAD as GET (the body is dropped on the way out).
     let method = if req.method() == Method::HEAD { Method::GET } else { req.method().clone() };
     let path = js::hono_path(req.uri().path());
@@ -263,8 +298,8 @@ async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
                     Route::Traits => routes::traits(&conn, q),
                     Route::Explore => routes::explore(&conn, q),
                     Route::Lists => routes::lists(&conn),
-                    Route::Health => engine::health(&conn, &app2.config, q),
-                    Route::CrawlSettings => engine::get_settings(&conn, &app2.config, q),
+                    Route::Health => engine::health(&conn, &app2.config),
+                    Route::CrawlSettings => engine::get_settings(&conn, &app2.config),
                     Route::Icon(..) => unreachable!(),
                 };
                 app2.pool.give(conn);

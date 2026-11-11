@@ -631,7 +631,7 @@ function awkwardMyMatches(puuid: string) {
  * an unknown Riot ID, a real fake-world account, refresh, a stale card refreshed in the background, a change of
  * account clearing your matches, and the Riot ID read from .env.
  */
-async function writeParity(fromTs: string, fromRs: string, bare: string) {
+async function writeParity(fromTs: string, fromRs: string, bare: string): Promise<{ ts: string; rs: string }> {
   const comps = (() => {
     const db = new Database(fromTs, { readonly: true })
     const keys = (db.prepare("SELECT comp_key FROM stat_comps WHERE patch = '99.3' AND bucket = 'ALL' ORDER BY comp_key").all() as any[]).map((r) => r.comp_key as string)
@@ -809,6 +809,88 @@ async function writeParity(fromTs: string, fromRs: string, bare: string) {
       me((b) => b.riotId === 'Tester#NA1' && b.platform === 'na1' && loaded(b)),
       myMatches((b) => b.matches.length >= 10),
     ])
+  return w
+}
+
+/**
+ * Section 5 (temporary, until the TypeScript engine is deleted): the dev-only stress switch. The TypeScript API
+ * started with --dev and `tft serve --dev` answer the same URLs with ?data=worst | empty | one | many (and no mode,
+ * an unknown one, an empty one, a repeated one). Your account and lists are loaded, so every reshaped field is hit.
+ * Only the times the switch makes from Date.now() (meta totals.newest, team created) may differ, by under 2 minutes.
+ */
+async function stressParity(w: { ts: string; rs: string }, cwd: string) {
+  const [ts, rs] = [join(dir, 'stress-ts.db'), join(dir, 'stress-rs.db')]
+  copyFileSync(w.ts, ts)
+  copyFileSync(w.rs, rs)
+  const tsx = pathToFileURL(join(root, 'node_modules', 'tsx', 'dist', 'loader.mjs')).href
+  const [fakeTs, fakeRs] = [await startFakeRiot(), await startFakeRiot()]
+  const [tsPort, rsPort] = [await freePort(), await freePort()]
+  const env = (port: number) => ({ RIOT_API_KEY: 'TEST-KEY', RIOT_API_BASE: `http://127.0.0.1:${port}/{host}` })
+  // The TypeScript dev server listens on PORT + 1; `tft serve --dev` too, unless --port is given.
+  const a = await startServer('TypeScript dev', process.execPath, ['--import', tsx, join(root, 'src', 'server', 'index.ts'), '--dev'], cwd,
+    { DB_PATH: ts, PORT: String(tsPort - 1), ...env(fakeTs.port) }, tsPort)
+  let b: Awaited<ReturnType<typeof startServer>> | undefined
+  try {
+    b = await startServer('Rust dev', bin, ['--db', rs, 'serve', '--dev'], cwd, { PORT: String(rsPort - 1), ...env(fakeRs.port) }, rsPort)
+    const db = new Database(ts, { readonly: true })
+    const comp = (db.prepare("SELECT comp_key FROM stat_comps WHERE patch = '99.3' AND bucket = 'ALL' ORDER BY games DESC").all() as any[]).map((r) => r.comp_key as string)
+    db.close()
+    const enc = encodeURIComponent
+    const urls = [
+      '/api/meta', '/api/meta?patch=nope', '/api/static', '/api/comps', '/api/comps?patch=98.1&min=1', ...comp.slice(0, 4).map((c) => `/api/comps/${enc(c)}`),
+      `/api/comps/${enc('TFT98_Big|TFT98_U0')}?patch=98.1&min=1`, '/api/comps/nope', '/api/units', '/api/units/TFT99_Unit6', '/api/units/TFT98_U0?patch=98.1',
+      '/api/units/nope', '/api/items', '/api/items/TFT_Item_Thing1', '/api/items/nope', '/api/traits', '/api/explore?units=TFT99_Unit6',
+      '/api/explore?units=nope', '/api/explore', '/api/lists', '/api/me', '/api/me/matches', '/api/icon/unit/TFT99_Unit0', '/api/nothing',
+    ]
+    const modes = ['worst', 'empty', 'one', 'many', '', 'bogus', 'WORST', 'worst&data=empty']
+    const nearNow = (x: unknown, y: unknown) => typeof x === 'number' && typeof y === 'number' && x > 1e12 && Math.abs(x - y) < 120_000
+    const tally = new Map<string, { n: number; bad: number; changed: number }>()
+    for (const mode of modes) for (const base of [...urls, '/']) {
+      const url = mode ? `${base}${base.includes('?') ? '&' : '?'}data=${mode}` : base
+      const t = tally.get(mode || '(none)') ?? { n: 0, bad: 0, changed: 0 }
+      tally.set(mode || '(none)', t)
+      t.n++
+      const [ra, rb] = [await httpGet(tsPort, url), await httpGet(rsPort, url)]
+      const problem = (() => {
+        if (ra.status !== rb.status) return `status: TS ${ra.status}, Rust ${rb.status}`
+        if (ra.type !== rb.type) return `content type: TS "${ra.type}", Rust "${rb.type}"`
+        if (!ra.type.startsWith('application/json')) return ra.body.equals(rb.body) ? null : 'body differs'
+        const [ja, jb] = [JSON.parse(ra.body.toString()), JSON.parse(rb.body.toString())]
+        if ('ms' in ja && 'ms' in jb) ja.ms = jb.ms = 0
+        if (nearNow(ja.totals?.newest, jb.totals?.newest)) jb.totals.newest = ja.totals.newest
+        if (Array.isArray(ja.teams) && Array.isArray(jb.teams)) ja.teams.forEach((x: any, i: number) => { if (nearNow(x?.created, jb.teams[i]?.created)) jb.teams[i].created = x.created })
+        return jsonDiff(ja, jb)
+      })()
+      if (problem) {
+        t.bad++
+        if (t.bad <= 3) fail(`dev GET ${url}`, `    ${problem}`)
+      }
+      if (ra.type.startsWith('application/json') && mode && base !== '/') {
+        const plain = await httpGet(tsPort, base)
+        if (!plain.body.equals(ra.body)) t.changed++
+      }
+    }
+    for (const [mode, t] of tally) {
+      if (t.bad) fail(`?data=${mode}`, `    ${t.bad} of ${t.n} URLs differ`)
+      else if (['worst', 'empty', 'one', 'many', 'worst&data=empty'].includes(mode) && t.changed === 0) fail(`?data=${mode}`, '    no answer changed, so this proves nothing')
+      else ok(`dev ?data=${mode}: ${t.n} URLs identical${t.changed ? `, ${t.changed} reshaped` : ''}`)
+    }
+    // A POST is never reshaped.
+    const body = JSON.stringify({ key: comp[0], fav: true })
+    const [pa, pb] = [await httpSend(tsPort, 'POST', '/api/lists/mark?data=empty', body), await httpSend(rsPort, 'POST', '/api/lists/mark?data=empty', body)]
+    const pd = jsonDiff(JSON.parse(pa.body.toString()), JSON.parse(pb.body.toString()))
+    if (!pd && JSON.parse(pa.body.toString()).favs.length > 0) ok('dev POST with ?data=empty: not reshaped, identical')
+    else fail('dev POST', `    ${pd ?? 'TS reshaped a POST'}`)
+    if (b.log().includes(`API on http://127.0.0.1:${rsPort}`) && a.log().includes(`API on http://127.0.0.1:${tsPort}`)) ok('both dev servers print "API on http://127.0.0.1:PORT"')
+    else fail('dev startup line', `    TS: ${a.log().trim()}\n    Rust: ${b.log().trim()}`)
+  } catch (e) {
+    fail('dev servers', `    ${(e as Error).message.split('\n').slice(0, 3).join('\n    ')}`)
+  } finally {
+    await stop(a.child)
+    if (b) await stop(b.child)
+    await fakeTs.close()
+    await fakeRs.close()
+  }
 }
 
 /** Section 4: the read-only API routes, served from the stats databases of section 2. */
@@ -955,7 +1037,9 @@ async function apiParity(tsStats: string, rsStats: string) {
   else fail('icon cache', `    the icon origin saw ${originHits - hitsBefore} requests, expected 4`)
   await new Promise<void>((r) => origin.close(() => r()))
 
-  await writeParity(tsDb, rsDb, bare)
+  const w = await writeParity(tsDb, rsDb, bare)
+  console.log('  Dev stress switch (?data=), with a built app present:')
+  await stressParity(w, app)
 }
 
 try {

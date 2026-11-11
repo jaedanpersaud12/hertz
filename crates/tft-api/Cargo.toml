@@ -12,7 +12,8 @@ regex.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# Correctly rounded float parsing, as JSON.parse: the dev stress switch re-reads answers it reshapes.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha1.workspace = true
 tft-core.workspace = true
 tft-riot.workspace = true
