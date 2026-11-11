@@ -4,6 +4,7 @@
 //! the database, matches the TypeScript API exactly; `npm run golden` checks it. With `--dev` the API sits behind
 //! Vite's dev server instead, and `?data=` reshapes answers into stress data (see `stress.rs`).
 
+mod comp_admin;
 mod describe;
 mod engine;
 pub mod js;
@@ -275,6 +276,9 @@ async fn answer(app: Arc<App>, req: Request<Body>) -> Response {
     let method = if req.method() == Method::HEAD { Method::GET } else { req.method().clone() };
     let path = js::hono_path(req.uri().path());
     let query = req.uri().query().map(str::to_string);
+    if let Some(r) = comp_admin::route(&method, &path) {
+        return comp_admin::handle(&app, r, req.into_body(), query).await; // PRD 2: renames, merges, variants
+    }
     if let Some(a) = action(&method, &path) {
         return act(&app, a, req.into_body()).await.unwrap_or_else(server_error);
     }

@@ -111,7 +111,9 @@ CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime 
 /// 4. The comp page sections (PRD 2 C5, C6, C7, C9), written by `tft-stats` (`comp_detail.rs`) per scope like the
 ///    other stat tables. Kept out of [`STAT_TABLES`] so a stats-version bump never drops tables only a migration
 ///    makes; every rebuild of a scope deletes and rewrites its rows.
-pub const MIGRATIONS: [(u32, &str); 4] = [
+/// 5. Comps you renamed or merged (PRD 2 C14), never rebuilt, and which comp of last patch each comp continues
+///    (C13), rebuilt with the stats when the comp method is `clusters`. See `cluster.rs` in tft-stats.
+pub const MIGRATIONS: [(u32, &str); 5] = [
     (1, "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)"),
     (
         2,
@@ -158,6 +160,14 @@ CREATE TABLE IF NOT EXISTS stat_comp_special (
 ) WITHOUT ROWID;
 ",
     ),
+    (
+        5,
+        "
+CREATE TABLE IF NOT EXISTS comp_overrides (comp_id TEXT PRIMARY KEY, name TEXT, merge_into TEXT);
+CREATE TABLE IF NOT EXISTS comp_lineage (patch TEXT NOT NULL, comp_id TEXT NOT NULL, prev_patch TEXT NOT NULL,
+  prev_comp_id TEXT NOT NULL, overlap REAL NOT NULL, PRIMARY KEY (patch, comp_id));
+",
+    ),
 ];
 
 const RATES: &str = "games INTEGER NOT NULL, sum_place INTEGER NOT NULL, wins INTEGER NOT NULL, top4 INTEGER NOT NULL";
@@ -169,15 +179,16 @@ fn stat(name: &str, keys: &str, cols: &str) -> String {
 }
 
 /// Stat tables are rebuilt from scratch by the stats step, so they are safe to drop and recreate.
-pub const STAT_TABLES: [&str; 12] = [
+pub const STAT_TABLES: [&str; 13] = [
     "stat_meta", "stat_units", "stat_unit_dist", "stat_traits", "stat_items", "stat_unit_items", "stat_unit_builds",
-    "stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels",
+    "stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels", "stat_comp_variants",
 ];
 
 /// Bump when the stat table layout changes: old stat tables are dropped and rebuilt on the next stats run.
 /// 3: stat_comps gained score, tier, prev_place and d3_place (PRD 2 C3, C4).
 /// 4: the comp page tables (migration 4) are filled by a rebuild, so stats built before them are rebuilt in full.
-pub const STATS_VERSION: i64 = 4;
+/// 5: stat_comps gained core and flex, and stat_comp_variants was added (PRD 2 C1, C2).
+pub const STATS_VERSION: i64 = 5;
 
 pub fn stats_schema() -> String {
     let r = RATES;
@@ -198,6 +209,7 @@ CREATE INDEX IF NOT EXISTS stat_unit_items_item ON stat_unit_items(patch, bucket
 {}
 {}
 CREATE INDEX IF NOT EXISTS stat_comp_units_unit ON stat_comp_units(patch, bucket, character_id);
+{}
 {}
 {}
 {}
@@ -224,10 +236,11 @@ CREATE INDEX IF NOT EXISTS stat_comp_units_unit ON stat_comp_units(patch, bucket
             "character_id, build",
             &format!("character_id TEXT NOT NULL, build TEXT NOT NULL, {r}, place_change REAL"),
         ),
+        // core and flex: JSON lists of unit ids, filled by the clusters comp method only (NULL under baseline).
         stat(
             "stat_comps",
             "comp_key",
-            &format!("comp_key TEXT NOT NULL, {r}, sum_level INTEGER NOT NULL, score REAL, tier TEXT, prev_place REAL, d3_place REAL"),
+            &format!("comp_key TEXT NOT NULL, {r}, sum_level INTEGER NOT NULL, score REAL, tier TEXT, prev_place REAL, d3_place REAL, core TEXT, flex TEXT"),
         ),
         stat(
             "stat_comp_units",
@@ -248,6 +261,11 @@ CREATE INDEX IF NOT EXISTS stat_comp_units_unit ON stat_comp_units(patch, bucket
             "stat_comp_levels",
             "comp_key, level",
             "comp_key TEXT NOT NULL, level INTEGER NOT NULL, games INTEGER NOT NULL, sum_place INTEGER NOT NULL",
+        ),
+        stat(
+            "stat_comp_variants",
+            "comp_key, variant_id",
+            &format!("comp_key TEXT NOT NULL, variant_id TEXT NOT NULL, units TEXT NOT NULL, carries TEXT NOT NULL, {r}"),
         ),
     )
 }

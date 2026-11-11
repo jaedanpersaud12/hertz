@@ -169,7 +169,8 @@ pub fn finish_scope(db: &Connection, patch: &str, scope: &str) -> Result<()> {
     let d3_scope = if window.is_empty() { Some(tft_core::config::scope_key(bucket, "3d")) } else { None };
     let mut set = db.prepare_cached(
         "UPDATE stat_comps SET score = ?4, tier = ?5,
-           prev_place = (SELECT sum_place * 1.0 / games FROM stat_comps WHERE patch = ?6 AND bucket = ?7 AND comp_key = ?3),
+           prev_place = (SELECT sum_place * 1.0 / games FROM stat_comps WHERE patch = ?6 AND bucket = ?7 AND comp_key =
+             COALESCE((SELECT prev_comp_id FROM comp_lineage WHERE patch = ?1 AND comp_id = ?3 AND prev_patch = ?6), ?3)),
            d3_place = (SELECT sum_place * 1.0 / games FROM stat_comps WHERE patch = ?1 AND bucket = ?8 AND comp_key = ?3)
          WHERE patch = ?1 AND bucket = ?2 AND comp_key = ?3",
     )?;

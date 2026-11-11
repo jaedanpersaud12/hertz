@@ -14,6 +14,8 @@
 //!   tft recluster              label every stored board with its comp again, after the comp rules change
 //!   tft health                 matches per hour per server, matches waiting, the last problem, how old the stats are
 //!   tft init                   create or upgrade the database and print where it is
+//!   tft comps-report [--patch P] [--bucket B]  today's comp rule and the clusters method side by side (PRD 2 C1)
+//!   tft comp-method [baseline|clusters]        show or choose how boards are grouped into comps
 //!
 //! Settings come from `.env` in the current folder, the same file the TypeScript engine reads.
 
@@ -127,6 +129,27 @@ enum Command {
     Health,
     /// Create or upgrade the database.
     Init,
+    /// Today's comp rule and the clusters method side by side on one patch: top 30 of each, coverage and overlap.
+    ///
+    /// Nothing is changed. Read it to decide whether the clusters method should replace today's rule.
+    CompsReport {
+        /// Patch, e.g. 16.22. Defaults to the newest.
+        #[arg(long)]
+        patch: Option<String>,
+        /// Rank bucket: ALL, PLATINUM+, DIAMOND+ or MASTER+. Defaults to ALL.
+        #[arg(long)]
+        bucket: Option<String>,
+        /// How many comps of each to list.
+        #[arg(long, default_value_t = 30)]
+        top: usize,
+    },
+    /// Show or choose how boards are grouped into comps: baseline (today's rule) or clusters (PRD 2).
+    ///
+    /// A change takes effect at the next stats build (`tft stats`, or within 10 minutes while collecting).
+    CompMethod {
+        /// baseline or clusters. Leave out to show the current one.
+        method: Option<String>,
+    },
 }
 
 fn main() {
@@ -312,6 +335,27 @@ async fn run(command: Command, config: Config) -> Result<()> {
                 ),
                 (None, Some(e)) => bail!("Could not download the set data: {e}"),
                 (None, None) => println!("Set data is already up to date."),
+            }
+        }
+
+        Command::CompsReport { patch, bucket, top } => {
+            let mut conn = tft_store::open(&config.db_path)?;
+            let report = tft_stats::report::comps_report(&mut conn, patch.as_deref(), bucket.as_deref())?;
+            print!("{}", tft_stats::report::format_report(&report, top));
+        }
+
+        Command::CompMethod { method } => {
+            let conn = tft_store::open(&config.db_path)?;
+            match method {
+                None => println!("Comps are grouped by: {}", tft_stats::comp_method(&conn)?.as_str()),
+                Some(m) => {
+                    let Some(m) = tft_stats::Method::parse(&m) else { bail!("Choose baseline or clusters.") };
+                    if tft_stats::set_comp_method(&conn, m)? {
+                        println!("Comps will be grouped by {}. Run \"tft stats\" to rebuild them now.", m.as_str());
+                    } else {
+                        println!("Comps are already grouped by {}.", m.as_str());
+                    }
+                }
             }
         }
 

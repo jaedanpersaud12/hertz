@@ -279,6 +279,15 @@ try {
     assert.deepEqual(detail.special, [])
     ok('comp page: levelling by placement band, carry items, item holders, special items')
 
+    // Your name for a comp (PRD 2 C14): shown in the list at once, gone again when the override is deleted.
+    const path = `/api/comps/${encodeURIComponent(vanguard.id)}`
+    assert.equal((await post(`${path}/rename`, { name: 'My frontline' })).override.name, 'My frontline')
+    assert.equal((await get('/api/comps')).rows.find((r: any) => r.id === vanguard.id).name, 'My frontline')
+    assert.equal((await call(`${path}/override`, { method: 'DELETE' })).status, 200)
+    assert.equal((await get('/api/comps')).rows.find((r: any) => r.id === vanguard.id).name, vanguard.name)
+    assert.equal((await get('/api/settings/comps')).method, 'baseline')
+    ok('comps: rename shows in the list and can be undone; the comp method defaults to the baseline')
+
     // Tier list (PRD 2 C3): every comp graded by the formula in config/tier-list.json, worked out again here.
     const cfg = JSON.parse(readFileSync(join(root, 'config', 'tier-list.json'), 'utf8'))
     const all = (await get('/api/comps?min=1')).rows as any[]

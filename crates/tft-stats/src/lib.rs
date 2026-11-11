@@ -9,6 +9,14 @@ use tft_core::config::{BUCKETS, scope_key};
 
 pub mod tier;
 pub mod comp_detail;
+pub mod cluster;
+pub mod lineage;
+pub mod overrides;
+pub mod report;
+pub mod variants;
+#[cfg(test)]
+mod cluster_tests;
+pub use cluster::{Method, comp_method, set_comp_method};
 
 /// A comp needs this share of all boards (and at least this many) to get its own row.
 pub const COMP_MIN_SHARE: f64 = 0.002;
@@ -27,9 +35,9 @@ pub const WINDOWS: [Window; 2] = [
 ];
 
 /// The stat tables a rebuild writes, in the order `STAT_TABLES` in `src/db.ts` lists them.
-const STAT_TABLES: [&str; 12] = [
+const STAT_TABLES: [&str; 13] = [
     "stat_meta", "stat_units", "stat_unit_dist", "stat_traits", "stat_items", "stat_unit_items", "stat_unit_builds",
-    "stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels",
+    "stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels", "stat_comp_variants",
 ];
 
 /// SQL that keeps only ranked matches (E12): other game modes are stored but left out of every stat. `table` is
@@ -105,6 +113,9 @@ pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn F
         }
     }
     conn.execute_batch("DROP TABLE IF EXISTS p; DROP TABLE IF EXISTS topc")?;
+    if comp_method(conn)? == Method::Clusters {
+        lineage::update(conn)?; // PRD 2 C13; before the trends, which follow it to last patch's comp
+    }
     finish_trends(conn)?;
     conn.execute_batch("PRAGMA optimize")?;
     Ok(())
@@ -178,6 +189,9 @@ pub fn build_stats_incremental_with(
     }
     conn.execute_batch(INC_DROP)?;
     comp_detail::inc_drop(conn)?;
+    if !touched.is_empty() && comp_method(conn)? == Method::Clusters {
+        lineage::update(conn)?; // PRD 2 C13; before the trends, which follow it to last patch's comp
+    }
     if touched.is_empty() {
         log("Stats are up to date: no new matches.");
     } else {
@@ -448,7 +462,7 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         )?;
         db.execute("DELETE FROM stat_units WHERE patch = ? AND bucket = ?", k)?;
         db.execute("DELETE FROM stat_traits WHERE patch = ? AND bucket = ? AND tier_current = 0", k)?;
-        for table in ["stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels"] {
+        for table in ["stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels", "stat_comp_variants"] {
             db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), k)?;
         }
         comp_detail::clear(db, patch, &job.scope)?;
@@ -483,7 +497,9 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         )?;
     }
     build_derived(db, patch, &job.scope)?;
-    if job.comps > 0 {
+    if job.comps > 0 && comp_method(db)? == Method::Clusters {
+        cluster::comps_from_inc(db, patch, &job.scope, job.band, job.w, job.comps)?;
+    } else if job.comps > 0 {
         write_comps(db, patch, job)?;
     }
     Ok(())
@@ -496,6 +512,7 @@ fn write_comps(db: &Connection, patch: &str, job: &Job) -> Result<()> {
     let min_games = COMP_MIN_GAMES.max(((job.comps as f64) * COMP_MIN_SHARE).ceil() as i64);
     db.execute_batch("DELETE FROM inc_cand; DELETE FROM inc_map; DELETE FROM inc_top")?;
     merge_lookalike_sums(db, job, min_games)?;
+    overrides::apply_to_map(db)?; // PRD 2 C14, as apply_to_boards in a full rebuild
 
     // A label's sums, under the label it was merged into.
     let merged = |sums: &str, cols: &str| {
@@ -746,7 +763,14 @@ fn build_comps(db: &Connection, patch: &str, scope: &str, comps: i64) -> Result<
     let k = params![patch, scope];
     // ---- Comps ----
     let min_games = COMP_MIN_GAMES.max(((comps as f64) * COMP_MIN_SHARE).ceil() as i64);
-    merge_lookalikes(db, min_games)?;
+    // PRD 2 C1: the comp method in use labels the boards in p; then your merges (C14) are applied.
+    let labels = if comp_method(db)? == Method::Clusters {
+        Some(cluster::label(db, min_games, COMP_LIMIT)?)
+    } else {
+        merge_lookalikes(db, min_games)?;
+        None
+    };
+    overrides::apply_to_boards(db)?;
     db.execute(
         "INSERT INTO stat_comps (patch, bucket, comp_key, games, sum_place, wins, top4, sum_level)
          SELECT ?, ?, comp_key, COUNT(*), SUM(placement), SUM(placement = 1), SUM(placement <= 4), SUM(COALESCE(level, 0))
@@ -787,6 +811,9 @@ fn build_comps(db: &Connection, patch: &str, scope: &str, comps: i64) -> Result<
         k,
     )?;
     comp_detail::build_full(db, patch, scope)?;
+    if let Some(labels) = labels {
+        cluster::write_shape(db, patch, scope, &labels)?; // core, flex and variants (C1, C2)
+    }
     tier::finish_scope(db, patch, scope)
 }
 
@@ -1029,7 +1056,7 @@ mod incremental_tests {
     use tft_core::riot::{Info, Metadata, Participant, RiotMatch, Trait, Unit};
     use tft_store::Ingest;
 
-    const DAY: i64 = 86_400_000;
+    pub(crate) const DAY: i64 = 86_400_000;
 
     /// A small deterministic random source (xorshift), so every run sees the same matches.
     struct Rng(u64);
@@ -1112,13 +1139,13 @@ mod incremental_tests {
     }
 
     /// A match to store: id, rank of the player it was found through, time played.
-    type Game = (String, i64, i64);
+    pub(crate) type Game = (String, i64, i64);
 
-    fn store(conn: &mut Connection, cal: &Calendar, seed: u64, games: &[Game]) {
+    pub(crate) fn store(conn: &mut Connection, cal: &Calendar, seed: u64, games: &[Game]) {
         store_with(conn, cal, seed, games, 5);
     }
 
-    fn store_with(conn: &mut Connection, cal: &Calendar, seed: u64, games: &[Game], floor: i64) {
+    pub(crate) fn store_with(conn: &mut Connection, cal: &Calendar, seed: u64, games: &[Game], floor: i64) {
         let mut rng = Rng(seed);
         for (id, rank, at) in games {
             let ing = Ingest { platform: "na1", rank: *rank, tier: tft_core::config::tier_name(*rank), snowball: false };
@@ -1126,7 +1153,7 @@ mod incremental_tests {
         }
     }
 
-    fn fresh_db(name: &str) -> (std::path::PathBuf, Connection) {
+    pub(crate) fn fresh_db(name: &str) -> (std::path::PathBuf, Connection) {
         let dir = std::env::temp_dir().join(format!("tft-stats-inc-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let conn = tft_store::open(&dir.join("t.db")).unwrap();
@@ -1146,7 +1173,7 @@ mod incremental_tests {
 
     /// Every stat table in `a` equals the one in the database at `b`, row for row and value for value
     /// (stat_meta.built_at aside). Returns the number of rows compared.
-    fn assert_same_stats(a: &Connection, b: &std::path::Path) -> i64 {
+    pub(crate) fn assert_same_stats(a: &Connection, b: &std::path::Path) -> i64 {
         a.execute("ATTACH DATABASE ? AS fresh", [b.to_str().unwrap()]).unwrap();
         let mut rows = 0;
         for table in STAT_TABLES.into_iter().chain(comp_detail::TABLES) {
