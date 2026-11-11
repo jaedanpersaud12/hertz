@@ -39,13 +39,10 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { request, createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import Database from 'better-sqlite3'
-import { CDRAGON_LISTING, fakeSetData, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, WORLD_NOW } from '../test/world'
+import { CDRAGON_LISTING, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, WORLD_NOW } from '../test/world'
 
 const UPDATE = process.argv.includes('--update')
-// TEMPORARY, removed with the TypeScript engine: --from-ts runs the TypeScript engine instead, to record from it.
-const FROM_TS = process.argv.includes('--from-ts')
 const dir = mkdtempSync(join(tmpdir(), 'tft-golden-'))
 const root = join(import.meta.dirname, '..')
 const goldenDir = join(root, 'test', 'golden')
@@ -182,17 +179,8 @@ const freePort = () =>
 
 /** Starts `tft` with these arguments and waits until /api/meta answers on `port`. */
 async function startServer(args: string[], cwd: string, env: Record<string, string>, port: number) {
-  let [cmd, argv, extra] = [bin, args, {} as Record<string, string>]
-  if (FROM_TS) {
-    // TEMPORARY: the same server from src/server/index.ts. It reads DB_PATH and PORT only.
-    const at = (flag: string) => (args.includes(flag) ? args[args.indexOf(flag) + 1] : undefined)
-    const tsx = pathToFileURL(join(root, 'node_modules', 'tsx', 'dist', 'loader.mjs')).href
-    cmd = process.execPath
-    argv = ['--import', tsx, join(root, 'src', 'server', 'index.ts'), ...(args.includes('--dev') ? ['--dev'] : [])]
-    extra = { DB_PATH: at('--db')!, ...(at('--port') ? { PORT: at('--port')! } : {}) }
-  }
-  const child = spawn(cmd, argv, {
-    cwd, env: { ...process.env, NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost', RIOT_API_KEY: '', RIOT_ID: '', ...env, ...extra },
+  const child = spawn(bin, args, {
+    cwd, env: { ...process.env, NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost', RIOT_API_KEY: '', RIOT_ID: '', ...env },
   })
   let out = ''
   child.stdout.on('data', (d) => (out += d))
@@ -274,25 +262,11 @@ async function ingestSection() {
   const matchFile = join(dir, 'matches.json')
   writeFileSync(matchFile, JSON.stringify(files))
   const path = join(dir, 'ingest.db')
-  if (FROM_TS) {
-    // TEMPORARY: the TypeScript ingest, in this process, as parity ran it.
-    process.env.DB_PATH = path
-    const { openDb, kvSet } = await import('../src/db')
-    const { loadCalendar } = await import('../src/patches')
-    const { makeIngest } = await import('../src/crawler/ingest')
-    const ts = openDb(path)
-    kvSet(ts, 'patch_calendar', CALENDAR)
-    loadCalendar(ts)
-    const ingest = makeIngest(ts)
-    for (const m of files) ingest(m, 'na1', 8, 'GRANDMASTER', true)
-    ts.close()
-  } else {
-    await run(bin, ['--db', path, 'init'], {})
-    const pre = new Database(path)
-    pre.prepare('INSERT INTO kv (key, value) VALUES (?, ?)').run('patch_calendar', JSON.stringify(CALENDAR))
-    pre.close()
-    await run(bin, ['--db', path, 'ingest', matchFile, '--platform', 'na1', '--tier', 'GRANDMASTER'], {})
-  }
+  await run(bin, ['--db', path, 'init'], {})
+  const pre = new Database(path)
+  pre.prepare('INSERT INTO kv (key, value) VALUES (?, ?)').run('patch_calendar', JSON.stringify(CALENDAR))
+  pre.close()
+  await run(bin, ['--db', path, 'ingest', matchFile, '--platform', 'na1', '--tier', 'GRANDMASTER'], {})
   const db = new Database(path, { readonly: true })
   put('ingest', 'schema', db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all())
   put('ingest', 'user_version', db.pragma('user_version', { simple: true }))
@@ -316,14 +290,7 @@ async function statsSection(ingested: string) {
     game_datetime = CASE WHEN rowid % 3 = 0 THEN game_datetime - (4 + rowid % 7) * ? ELSE game_datetime END`).run(DAY)
   pre.close()
   const PATCHES = 4 // the fixture has three patches; one more checks that a short list is handled
-  if (FROM_TS) {
-    // TEMPORARY: the TypeScript stats rebuild.
-    const { openDb } = await import('../src/db')
-    const { buildStats } = await import('../src/stats/build')
-    const ts = openDb(path)
-    buildStats(ts, PATCHES, () => {})
-    ts.close()
-  } else await run(bin, ['--db', path, 'stats', '--patches', String(PATCHES)], {})
+  await run(bin, ['--db', path, 'stats', '--patches', String(PATCHES)], {})
   const db = new Database(path, { readonly: true })
   for (const table of STAT_TABLES) {
     const info = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string; pk: number }[]
@@ -353,8 +320,7 @@ async function crawlSection() {
     const fake = await startFakeRiot()
     const t0 = Date.now()
     try {
-      // TEMPORARY: --from-ts runs the TypeScript crawler.
-      await run(FROM_TS ? process.execPath : bin, FROM_TS ? ['--import', 'tsx', 'src/crawler/crawl.ts', '--once'] : ['crawl', '--once'], {
+      await run(bin, ['crawl', '--once'], {
         RIOT_API_KEY: 'TEST-KEY', RIOT_API_BASE: `http://127.0.0.1:${fake.port}/{host}`, DB_PATH: path,
         PLATFORMS: 'na1,euw1', TIERS: 'CHALLENGER,GRANDMASTER,MASTER,DIAMOND', PAGES_PER_DIVISION: '2', ...extra,
       })
@@ -394,8 +360,7 @@ async function crawlSection() {
 
 async function toolsSection(ingested: string) {
   console.log('\nRecluster and set data')
-  const recluster = async (path: string) =>
-    FROM_TS ? run(process.execPath, ['--import', 'tsx', 'src/stats/recluster.ts'], { DB_PATH: path }) : run(bin, ['--db', path, 'recluster'], {})
+  const recluster = (path: string) => run(bin, ['--db', path, 'recluster'], {})
   const wiped = join(dir, 'recluster.db')
   copyFileSync(ingested, wiped)
   const w = new Database(wiped)
@@ -428,28 +393,17 @@ async function toolsSection(ingested: string) {
   // Set data from (a fake) Community Dragon.
   const st = join(dir, 'static.db')
   copyFileSync(ingested, st)
-  if (FROM_TS) {
-    // TEMPORARY: the TypeScript storeStatic on the same data.
-    const { openDb } = await import('../src/db')
-    const { storeStatic } = await import('../src/static/fetch')
-    const db = openDb(st)
-    storeStatic(db as any, fakeSetData() as any)
-    db.close()
-  } else {
-    const cd = await startFakeCdragon()
-    try {
-      await run(bin, ['--db', st, 'refresh'], { CDRAGON_BASE: cd.base })
-    } finally {
-      await cd.close()
-    }
-    const db = new Database(st, { readonly: true })
-    const cal = (db.prepare("SELECT value FROM kv WHERE key = 'patch_calendar'").get() as any)?.value
-    const want = CDRAGON_LISTING.filter((e) => /^\d+\.\d+$/.test(e.name)).map((e) => ({ patch: e.name, since: Date.parse(e.mtime) }))
-    if (cal === JSON.stringify(want)) ok('tft refresh saved the patch calendar from the listing')
-    else fail('patch calendar', `    expected ${JSON.stringify(want)}, got ${cal}`)
-    db.close()
+  const cd = await startFakeCdragon()
+  try {
+    await run(bin, ['--db', st, 'refresh'], { CDRAGON_BASE: cd.base })
+  } finally {
+    await cd.close()
   }
   const db = new Database(st, { readonly: true })
+  const cal = (db.prepare("SELECT value FROM kv WHERE key = 'patch_calendar'").get() as any)?.value
+  const want = CDRAGON_LISTING.filter((e) => /^\d+\.\d+$/.test(e.name)).map((e) => ({ patch: e.name, since: Date.parse(e.mtime) }))
+  if (cal === JSON.stringify(want)) ok('tft refresh saved the patch calendar from the listing')
+  else fail('patch calendar', `    expected ${JSON.stringify(want)}, got ${cal}`)
   const rows = (db.prepare('SELECT kind, id, name, icon, data FROM static_data ORDER BY kind, id').all() as any[]).map((r) => ({ ...r, data: JSON.parse(r.data) }))
   if (rows.length < 30) fail('set data', `    only ${rows.length} rows stored`)
   put('tools', 'set data: static_data', rows)
