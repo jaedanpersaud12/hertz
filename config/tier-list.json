@@ -1,0 +1,13 @@
+{
+  "about": "How the comp tier list grades and trends comps (PRD 2 C3, C4). Opinion, not fact: change freely, then run npm run stats. Read by crates/tft-stats/src/tier.rs and shown in README.md.",
+  "weights": { "avgPlace": 0.55, "top4Rate": 0.25, "winRate": 0.2 },
+  "confidenceGames": 400,
+  "tiers": [
+    { "tier": "S", "percent": 8 },
+    { "tier": "A", "percent": 17 },
+    { "tier": "B", "percent": 30 },
+    { "tier": "C", "percent": 30 },
+    { "tier": "D", "percent": 15 }
+  ],
+  "risingPlaces": 0.15
+}

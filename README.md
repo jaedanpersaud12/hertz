@@ -10,7 +10,7 @@ The engine (crawler, stats and the app's API) is one Rust program, `tft`; the ap
 
 | Page | What it does |
 |---|---|
-| Comps | Tier list of comps grouped from real boards: traits, core units with stars and items, playstyle tag, avg place, pick rate, win rate. Open a row for final-level breakdown, carry items and flex units. Favourite, pin or hide any comp. |
+| Comps | Tier list of comps grouped from real boards: tier letter, traits, core units with stars and items, playstyle tag, avg place, pick rate, win rate, trend against last patch and the last 3 days. Filter by unit, trait, item, playstyle or "rising" (the filters live in the page URL, so a reload or a shared link keeps them). Open a row for final-level breakdown, carry items and flex units. Favourite, pin or hide any comp. |
 | Units | Every unit with tier, avg place, win rate, top 4, games. Unit page: ability, base stats, star-level and item-count breakdowns, builds, items, comps it appears in, and patch-by-patch trend. |
 | Items | Tier list with place change, type filter and most common holders. Item page: recipe, change since last patch, best holders. |
 | Traits | Overall, or one row per breakpoint ("6 Vanguard"). |
@@ -202,7 +202,42 @@ Deliberately instant: the search palette, the main tabs and every bar or number 
   Community Dragon's release calendar. Patch numbers are the client's (16.22), not TFT's set numbering.
 - **Rank filter**: a match counts as the rank of the player it was found through. Riot's match data does
   not include ranks, and ranked lobbies are close in rank, so this is an approximation.
-- **Tier letters**: our own cut-offs on avg place or place change, not MetaTFT's formula.
+- **Tier letters** (units, traits, items): our own cut-offs on avg place or place change, not MetaTFT's
+  formula. Comps have their own, below.
+
+### The comp tier list
+
+Comp tier letters weigh placement and popularity. Per patch, rank filter and time window, over the comps that
+scope lists (before the minimum-games filter in the app):
+
+```
+score      = 0.55 * z(avg place, inverted) + 0.25 * z(top 4 rate) + 0.20 * z(win rate)
+confidence = games / (games + 400)
+final      = score * confidence
+```
+
+`z` is how many standard deviations a comp is from the scope's average on that rate, so a comp is graded
+against the others, not against a fixed number. The confidence term pulls comps with few games towards the
+middle: at 400 games a comp keeps half its score, at 1,200 three quarters.
+
+Comps are ranked by final score (ties: more games first), and the letters take these shares of the ranking:
+
+| Tier | Share of listed comps |
+| --- | --- |
+| S | top 8% |
+| A | next 17% |
+| B | next 30% |
+| C | next 30% |
+| D | the rest (15%) |
+
+Shares are rounded to the nearest comp on the running total, so with only a few comps nobody gets S (one comp
+is a B). The weights, the 400 games, the shares and the "rising" line are opinion, not fact: they live in
+[`config/tier-list.json`](config/tier-list.json). Change them there and rebuild the stats (`npm run stats`).
+
+**Trend.** Each row shows an arrow and the change in average place since last patch (up and green is better;
+"New" when the comp was not listed last patch, same rank filter, whole patch), and under it, the last 3 days
+against the whole patch. **Rising** means the comp places at least 0.15 better than last patch, or at least
+0.15 better in the last 3 days than across the whole patch (`risingPlaces` in the same file).
 
 ## Tested and not tested
 

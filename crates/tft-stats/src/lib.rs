@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tft_core::config::{BUCKETS, scope_key};
 
+pub mod tier;
+
 /// A comp needs this share of all boards (and at least this many) to get its own row.
 pub const COMP_MIN_SHARE: f64 = 0.002;
 pub const COMP_MIN_GAMES: i64 = 5;
@@ -102,7 +104,18 @@ pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn F
         }
     }
     conn.execute_batch("DROP TABLE IF EXISTS p; DROP TABLE IF EXISTS topc")?;
+    finish_trends(conn)?;
     conn.execute_batch("PRAGMA optimize")?;
+    Ok(())
+}
+
+/// Tier letters and trends once every scope is written ([`tier::finish_all`]). Each scope already got them when
+/// it was written, from the other scopes as they stood then; trends read other scopes, so they are worked out
+/// again here, and a full and an incremental build end with the same values.
+fn finish_trends(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tier::finish_all(&tx)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -165,6 +178,8 @@ pub fn build_stats_incremental_with(
     conn.execute_batch(INC_DROP)?;
     if touched.is_empty() {
         log("Stats are up to date: no new matches.");
+    } else {
+        finish_trends(conn)?;
     }
     Ok(touched)
 }
@@ -487,7 +502,7 @@ fn write_comps(db: &Connection, patch: &str, job: &Job) -> Result<()> {
     let k4 = params![patch, job.scope, job.band, job.w];
     db.execute(
         &format!(
-            "INSERT INTO stat_comps
+            "INSERT INTO stat_comps (patch, bucket, comp_key, games, sum_place, wins, top4, sum_level)
              SELECT ?1, ?2, comp_key, SUM(n), SUM(sum_place), SUM(wins), SUM(top4), SUM(sum_level)
              FROM ({}) GROUP BY comp_key HAVING SUM(n) >= ?5 ORDER BY SUM(n) DESC LIMIT ?6",
             merged("inc_comps", "n, sum_place, wins, top4, sum_level")
@@ -531,7 +546,7 @@ fn write_comps(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         ),
         k4,
     )?;
-    Ok(())
+    tier::finish_scope(db, patch, &job.scope)
 }
 
 /// [`merge_lookalikes`] from the comp sums: the same candidates, core units and folding, written to inc_map
@@ -726,7 +741,7 @@ fn build_comps(db: &Connection, patch: &str, scope: &str, comps: i64) -> Result<
     let min_games = COMP_MIN_GAMES.max(((comps as f64) * COMP_MIN_SHARE).ceil() as i64);
     merge_lookalikes(db, min_games)?;
     db.execute(
-        "INSERT INTO stat_comps
+        "INSERT INTO stat_comps (patch, bucket, comp_key, games, sum_place, wins, top4, sum_level)
          SELECT ?, ?, comp_key, COUNT(*), SUM(placement), SUM(placement = 1), SUM(placement <= 4), SUM(COALESCE(level, 0))
          FROM p WHERE comp_key IS NOT NULL GROUP BY comp_key HAVING COUNT(*) >= ?
          ORDER BY COUNT(*) DESC LIMIT ?",
@@ -764,7 +779,7 @@ fn build_comps(db: &Connection, patch: &str, scope: &str, comps: i64) -> Result<
          FROM p JOIN topc USING (comp_key) GROUP BY p.comp_key, COALESCE(p.level, 0)",
         k,
     )?;
-    Ok(())
+    tier::finish_scope(db, patch, scope)
 }
 
 /// The comp label can split one real comp in two, for example when a comp has two carries and either can end
@@ -935,6 +950,54 @@ mod tests {
         let units_rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM stat_units WHERE bucket = 'MASTER+@3d'", [], |r| r.get(0)).unwrap();
         assert_eq!(units_rows, 0);
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PRD 2 C3, C4: tier letters, last patch's and the last 3 days' average place on each comp row.
+    #[test]
+    fn comps_get_a_tier_and_their_trend() {
+        let a: &[&str] = &["U1", "U2", "U3", "U4"];
+        let c: &[&str] = &["U6", "U7", "U8", "U9"];
+        let mut boards: Vec<(&str, i64, &[&str])> = Vec::new();
+        boards.extend((1..=8).map(|p| ("X|A", p, a))); // M0: last patch, avg 4.5
+        boards.extend([1, 1, 2, 2, 3, 3, 4, 4].map(|p| ("X|A", p, a))); // M1: this patch, 5 days ago
+        boards.extend([1, 1, 1, 1, 2, 2, 2, 2].map(|p| ("X|A", p, a))); // M2: this patch, an hour ago
+        boards.extend([5, 6, 7, 8, 5, 6, 7, 8].map(|p| ("Y|C", p, c))); // M3: this patch, an hour ago
+        let (dir, mut conn) = world("trend", &boards);
+        let now = now_ms();
+        conn.execute("UPDATE matches SET patch = '99.0', game_datetime = ? WHERE match_id = 'M0'", [now - 10 * 86_400_000]).unwrap();
+        conn.execute("UPDATE matches SET game_datetime = ? WHERE match_id = 'M1'", [now - 5 * 86_400_000]).unwrap();
+        build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
+
+        type Row = (String, String, Option<String>, Option<f64>, Option<f64>);
+        let rows = |patch: &str, scope: &str| -> Vec<Row> {
+            conn.prepare("SELECT comp_key, bucket, tier, prev_place, d3_place FROM stat_comps WHERE patch = ? AND bucket = ? ORDER BY comp_key")
+                .unwrap()
+                .query_map([patch, scope], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let row = |k: &str, sc: &str, t: &str, prev: Option<f64>, d3: Option<f64>| -> Row {
+            (k.into(), sc.into(), Some(t.into()), prev, d3)
+        };
+        // This patch, whole: X|A averages 2.0 (32 / 16), 4.5 last patch, 1.5 in the last 3 days. Y|C is new.
+        // Two comps: the better one is A, the other C (see tier::tests).
+        assert_eq!(rows("99.1", "ALL"), [row("X|A", "ALL", "A", Some(4.5), Some(1.5)), row("Y|C", "ALL", "C", None, Some(6.5))]);
+        // The 3-day rows compare with last patch only.
+        assert_eq!(rows("99.1", "ALL@3d"), [row("X|A", "ALL@3d", "A", Some(4.5), None), row("Y|C", "ALL@3d", "C", None, None)]);
+        // Last patch has nothing before it, and its one comp sits in the middle.
+        assert_eq!(rows("99.0", "ALL"), [row("X|A", "ALL", "B", None, None)]);
+        let scores: Vec<f64> = conn
+            .prepare("SELECT score FROM stat_comps WHERE patch = '99.1' AND bucket = 'ALL' ORDER BY comp_key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // Two comps: every z is +1 or -1, so score is +-1, times confidence 16/416 and 8/408.
+        assert!((scores[0] - 16.0 / 416.0).abs() < 1e-12 && (scores[1] + 8.0 / 408.0).abs() < 1e-12, "{scores:?}");
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1147,6 +1210,13 @@ mod incremental_tests {
         assert!(compared > 1000, "only {compared} rows compared");
         let comps: i64 = conn.query_row("SELECT COUNT(*) FROM stat_comps", [], |r| r.get(0)).unwrap();
         assert!(comps > 20, "the synthetic matches should make comps ({comps})");
+        // PRD 2 C3, C4: every comp row is graded, and the trend columns are filled where there is something to
+        // compare with, so the comparison above covers them.
+        let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(q("SELECT COUNT(*) FROM stat_comps WHERE tier IS NULL OR score IS NULL"), 0);
+        assert!(q("SELECT COUNT(*) FROM stat_comps WHERE patch = '90.2' AND prev_place IS NOT NULL") > 10);
+        assert!(q("SELECT COUNT(*) FROM stat_comps WHERE bucket NOT LIKE '%@3d' AND d3_place IS NOT NULL") > 10);
+        assert_eq!(q("SELECT COUNT(DISTINCT tier) FROM stat_comps"), 5, "every letter is used");
 
         // Nothing new: nothing touched.
         assert!(build_stats_incremental_with(&mut conn, 2, &mut |_| {}).unwrap().is_empty());

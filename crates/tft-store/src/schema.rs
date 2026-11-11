@@ -136,7 +136,8 @@ pub const STAT_TABLES: [&str; 12] = [
 ];
 
 /// Bump when the stat table layout changes: old stat tables are dropped and rebuilt on the next stats run.
-pub const STATS_VERSION: i64 = 2;
+/// 3: stat_comps gained score, tier, prev_place and d3_place (PRD 2 C3, C4).
+pub const STATS_VERSION: i64 = 3;
 
 pub fn stats_schema() -> String {
     let r = RATES;
@@ -183,7 +184,11 @@ CREATE INDEX IF NOT EXISTS stat_comp_units_unit ON stat_comp_units(patch, bucket
             "character_id, build",
             &format!("character_id TEXT NOT NULL, build TEXT NOT NULL, {r}, place_change REAL"),
         ),
-        stat("stat_comps", "comp_key", &format!("comp_key TEXT NOT NULL, {r}, sum_level INTEGER NOT NULL")),
+        stat(
+            "stat_comps",
+            "comp_key",
+            &format!("comp_key TEXT NOT NULL, {r}, sum_level INTEGER NOT NULL, score REAL, tier TEXT, prev_place REAL, d3_place REAL"),
+        ),
         stat(
             "stat_comp_units",
             "comp_key, character_id",

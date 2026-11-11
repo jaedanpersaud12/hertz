@@ -1,12 +1,13 @@
-import { CaretDown, EyeSlash, PushPin } from '@phosphor-icons/react'
+import { ArrowDown, ArrowUp, CaretDown, EyeSlash, PushPin } from '@phosphor-icons/react'
 import { motion, useReducedMotion } from 'motion/react'
 import { useEffect, useMemo, useState } from 'react'
-import { count, pct, useApi, useFilters, useMarks, type Comp, type Entity, type Marks, type Scope } from '../api'
+import { count, pct, useApi, useFilters, useMarks, type Comp, type CompOptions, type Entity, type Marks, type Scope } from '../api'
 import { useAccordion, useAutoHeight, type AccordionHeaderProps, type AccordionPanelProps } from '../interior/accordion'
 import { ContextMenu, type ContextMenuItem } from '../interior/context-menu'
 import { CopyButton } from '../interior/copy-button'
-import { Change, Dist, Empty, FavButton, GradeChip, Icon, IconButton, PlaceRail, Search, Select, Status, Tag, TraitChip, UnitChip } from '../parts'
-import { gradeComp } from '../tiers'
+import { Button, Change, Dist, Empty, FavButton, GradeChip, Icon, IconButton, PlaceRail, Search, Select, Status, Tag, TraitChip, UnitChip } from '../parts'
+import { anyFilter, filterQuery, NO_FILTERS, PLAYSTYLES, readFilters, writeFilters, type TierFilters } from '../tierFilters'
+import tierConfig from '../../../config/tier-list.json'
 
 type Detail = Scope & {
   comp: Comp | null
@@ -62,6 +63,28 @@ function CompDetail({ comp }: { comp: Comp }) {
   )
 }
 
+/**
+ * Trend on a row: an arrow and the change in average place since last patch (up and green is better), and
+ * underneath, the last 3 days against the whole patch. A dash when there is nothing to compare with.
+ */
+function Trend({ comp }: { comp: Comp }) {
+  const arrow = (d: number | null) => {
+    if (d == null) return null
+    const r = Math.round(d * 100) / 100
+    return r <= -0.05 ? <ArrowUp size={12} weight="bold" aria-label="better" /> : r >= 0.05 ? <ArrowDown size={12} weight="bold" aria-label="worse" /> : null
+  }
+  const lastPatch = comp.patchDelta == null ? 'New this patch, nothing to compare with' : `${comp.prevPlace?.toFixed(2)} last patch`
+  const days = comp.d3Delta == null ? null : `${comp.d3Place?.toFixed(2)} in the last 3 days`
+  return (
+    <span className="trend" title={[lastPatch, days].filter(Boolean).join('. ')}>
+      <span className="trend-main">
+        {comp.patchDelta == null ? <span className="muted">New</span> : <>{arrow(comp.patchDelta)}<Change value={comp.patchDelta} /></>}
+      </span>
+      {comp.d3Delta != null ? <span className="trend-sub"><span className="muted">3d</span> <Change value={comp.d3Delta} /></span> : null}
+    </span>
+  )
+}
+
 /** One comp. Pass header, panel and onToggle (from the accordion) to make it expandable. */
 export function CompRow({ comp, open = false, onToggle, header, panel, exitOnHide }: {
   comp: Comp; open?: boolean; onToggle?: () => void; header?: AccordionHeaderProps; panel?: AccordionPanelProps
@@ -102,11 +125,14 @@ export function CompRow({ comp, open = false, onToggle, header, panel, exitOnHid
     <li className={`comp${leaving ? ' leaving' : ''}`} id={`comp-${comp.id}`}>
       <ContextMenu items={menu} onSelect={onMenu} label={`Actions for ${comp.name}`}>
         <div className="comp-row" onClick={onToggle} style={onToggle ? undefined : { cursor: 'default' }}>
-          <GradeChip grade={gradeComp(comp.avgPlace)} />
+          <span className="comp-grade">
+            {comp.tier ? <GradeChip grade={comp.tier} /> : <span className="grade grade-none" title="Not graded yet. Rebuild the stats with npm run stats.">–</span>}
+          </span>
           <div className="comp-id">
             <span className="comp-name">{comp.name}</span>
             <span className="comp-tags">
               <Tag kind={comp.play.kind}>{comp.play.label}</Tag>
+              {comp.rising ? <Tag kind="rising">Rising</Tag> : null}
               {comp.frequency < 0.01 ? <Tag kind="rare">Rare</Tag> : null}
             </span>
           </div>
@@ -118,6 +144,7 @@ export function CompRow({ comp, open = false, onToggle, header, panel, exitOnHid
             <div><dt>Avg place</dt><dd><PlaceRail value={comp.avgPlace} /></dd></div>
             <div><dt>Pick rate</dt><dd>{comp.pickRate.toFixed(2)}</dd></div>
             <div><dt>Win rate</dt><dd>{pct(comp.winRate)}</dd></div>
+            <div><dt>Trend</dt><dd><Trend comp={comp} /></dd></div>
           </dl>
           <div className="comp-actions">
             {/* key: remount if the favourite changes somewhere else, e.g. from the right-click menu */}
@@ -145,18 +172,55 @@ export function CompRow({ comp, open = false, onToggle, header, panel, exitOnHid
 }
 
 const SORTS = [
+  { value: 'tier', label: 'Tier', get: (c: Comp) => (c.score == null ? Infinity : -c.score) },
   { value: 'place', label: 'Avg place', get: (c: Comp) => c.avgPlace },
+  { value: 'trend', label: 'Trend', get: (c: Comp) => c.patchDelta ?? c.d3Delta ?? Infinity },
   { value: 'pick', label: 'Pick rate', get: (c: Comp) => -c.pickRate },
   { value: 'win', label: 'Win rate', get: (c: Comp) => -c.winRate },
 ]
 const OPEN_KEY = 'tft-local-open-comp'
+const RISING_HINT = `Placing at least ${tierConfig.risingPlaces} better than last patch, or in the last 3 days than across the patch`
+
+/** The tier list's filters, kept in the page URL (see ../tierFilters.ts). */
+function useTierFilters(): [TierFilters, (f: TierFilters) => void] {
+  const [f, setF] = useState(() => readFilters(location.search))
+  const set = (next: TierFilters) => {
+    history.replaceState(history.state, '', `${location.pathname}${writeFilters(location.search, next)}${location.hash}`)
+    setF(next)
+  }
+  return [f, set]
+}
+
+/** Choices for one filter: "any" first, and the current pick even when this scope no longer lists it. */
+function choices(any: string, list: Entity[], current: string) {
+  const opts = [{ value: '', label: any }, ...list.map((e) => ({ value: e.id, label: e.name }))]
+  return current && !list.some((e) => e.id === current) ? [...opts, { value: current, label: current }] : opts
+}
+
+function FilterBar({ options, f, set }: { options: CompOptions | undefined; f: TierFilters; set: (f: TierFilters) => void }) {
+  const o = options ?? { units: [], traits: [], items: [], playstyles: [] }
+  const plays = o.playstyles.map((k) => ({ id: k, name: PLAYSTYLES[k] ?? k, icon: null }))
+  const label = (prefix: string, v: string) => (v ? prefix : undefined)
+  return (
+    <div className="toolbar filters" role="group" aria-label="Filter comps">
+      <Select label="Any unit" prefix={label('Unit:', f.unit)} value={f.unit} onChange={(unit) => set({ ...f, unit })} options={choices('Any unit', o.units, f.unit)} />
+      <Select label="Any trait" prefix={label('Trait:', f.trait)} value={f.trait} onChange={(trait) => set({ ...f, trait })} options={choices('Any trait', o.traits, f.trait)} />
+      <Select label="Any item" prefix={label('Item:', f.item)} value={f.item} onChange={(item) => set({ ...f, item })} options={choices('Any item', o.items, f.item)} />
+      <Select label="Any playstyle" value={f.playstyle} onChange={(playstyle) => set({ ...f, playstyle })} options={choices('Any playstyle', plays, f.playstyle)} />
+      <label className="check" title={RISING_HINT}><input type="checkbox" checked={f.rising} onChange={(e) => set({ ...f, rising: e.target.checked })} /> Rising only</label>
+      {anyFilter(f) ? <Button size="sm" variant="ghost" onClick={() => set(NO_FILTERS)}>Clear filters</Button> : null}
+    </div>
+  )
+}
 
 export function Comps() {
   const f = useFilters()
   const marks = useMarks()
-  const { data, error, loading } = useApi<Scope & Marks & { rows: Comp[] }>('/api/comps', f)
+  const [tf, setTf] = useTierFilters()
+  const fq = filterQuery(tf)
+  const { data, error, loading } = useApi<Scope & Marks & { rows: Comp[]; options: CompOptions }>(`/api/comps${fq ? `?${fq}` : ''}`, f)
   const [search, setSearch] = useState('')
-  const [sort, setSort] = useState('place')
+  const [sort, setSort] = useState('tier')
   const [favOnly, setFavOnly] = useState(false)
   const [showHidden, setShowHidden] = useState(false)
   const [open, setOpen] = useState<string[]>([])
@@ -180,7 +244,7 @@ export function Comps() {
       const id = sessionStorage.getItem(OPEN_KEY)
       if (!id || !data) return
       sessionStorage.removeItem(OPEN_KEY)
-      setSearch(''); setFavOnly(false); setOpen([id])
+      setSearch(''); setFavOnly(false); setTf(NO_FILTERS); setOpen([id])
       setTimeout(() => document.getElementById(`comp-${id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 60)
     }
     show()
@@ -198,12 +262,19 @@ export function Comps() {
         <label className="check"><input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} /> Show hidden{marks.hidden.length ? ` (${marks.hidden.length})` : ''}</label>
         <span className="toolbar-note">{count(rows.length, 'comp')} from {count(data.comps, 'board')}</span>
       </div>
+      {data.patches.length ? <FilterBar options={data.options} f={tf} set={setTf} /> : null}
       {rows.length ? (
         <ul className="comps">
           {rows.map((c) => (
             <CompRow key={c.id} comp={c} open={acc.isOpen(c.id)} onToggle={() => acc.toggle(c.id)} header={acc.headerProps(c.id)} panel={acc.panelProps(c.id)} exitOnHide={!showHidden} />
           ))}
         </ul>
+      ) : anyFilter(tf) && !data.rows.length && data.patches.length ? (
+        <div className="empty">
+          <h2>No comps match these filters</h2>
+          <p>Each filter you add must hold for a comp to show. Remove one, or clear them all to see every comp.</p>
+          <div className="mt-4"><Button onClick={() => setTf(NO_FILTERS)}>Clear filters</Button></div>
+        </div>
       ) : <Empty scope={data} what="No comp" />}
     </>
   )

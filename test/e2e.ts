@@ -6,11 +6,12 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 
+import { filterQuery, NO_FILTERS, readFilters, writeFilters } from '../src/ui/tierFilters'
 import { ARCHETYPES, idsByPlayer, ITEMS, matches, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, UNITS, archetypeOf } from './world'
 
 const root = join(import.meta.dirname, '..')
@@ -236,6 +237,81 @@ try {
     const detail = await get(`/api/comps/${encodeURIComponent(vanguard.id)}`)
     assert.equal(detail.levels.length, 1); assert.equal(detail.levels[0].level, 8); assert.ok(detail.builds[0].items.length > 3)
     ok('comps: names, core units, carry items, traits, playstyle tags, levels')
+
+    // Tier list (PRD 2 C3): every comp graded by the formula in config/tier-list.json, worked out again here.
+    const cfg = JSON.parse(readFileSync(join(root, 'config', 'tier-list.json'), 'utf8'))
+    const all = (await get('/api/comps?min=1')).rows as any[]
+    const z = (xs: number[]) => {
+      const m = xs.reduce((a, b) => a + b, 0) / xs.length
+      const sd = Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / xs.length)
+      return xs.map((x) => (sd > 1e-12 ? (x - m) / sd : 0))
+    }
+    const [zp, zt, zw] = [z(all.map((r) => r.avgPlace)), z(all.map((r) => r.top4Rate)), z(all.map((r) => r.winRate))]
+    const finals = all.map((r, i) => (cfg.weights.avgPlace * -zp[i] + cfg.weights.top4Rate * zt[i] + cfg.weights.winRate * zw[i]) * (r.games / (r.games + cfg.confidenceGames)))
+    all.forEach((r, i) => near(r.score, finals[i], `score of ${r.id}`))
+    const ranked = all.map((r, i) => ({ r, s: finals[i] })).sort((a, b) => b.s - a.s || b.r.games - a.r.games || (a.r.id < b.r.id ? -1 : 1))
+    let run = 0
+    const lines = cfg.tiers.map((t: any, i: number) => ({ tier: t.tier, line: i === cfg.tiers.length - 1 ? ranked.length : Math.floor((ranked.length * (run += t.percent) + 50) / 100) }))
+    ranked.forEach(({ r }, rank) => assert.equal(r.tier, lines.find((l: any) => rank < l.line).tier, `tier of ${r.id} at rank ${rank}`))
+    assert.deepEqual(ranked.map(({ r }) => r.tier), ['A', 'B', 'B', 'C', 'D'], 'five comps: 0.4, 1.25, 2.75, 4.25 round to 0, 1, 3, 4')
+    ok(`tier letters: score from avg place, top 4 and win rate with a games confidence term, cut-offs from config (${ranked.map(({ r }) => r.tier).join('')})`)
+
+    // Trends (C4): the last 3 days against the 3-day rows; this world has one patch, so nothing to compare with last patch.
+    const days = (await get('/api/comps?min=1&window=3d')).rows as any[]
+    for (const r of all) {
+      const d = days.find((x) => x.id === r.id)
+      near(r.d3Place, d.avgPlace, `last 3 days of ${r.id}`); near(r.d3Delta, d.avgPlace - r.avgPlace, `3-day delta of ${r.id}`)
+      assert.equal(r.prevPlace, null); assert.equal(r.patchDelta, null)
+      assert.equal(r.rising, r.d3Delta <= -cfg.risingPlaces + 1e-9)
+      assert.equal(d.d3Place, null, 'the 3-day rows do not compare with themselves')
+    }
+    ok('trend: last patch and last 3 days on each row, rising as defined in config')
+
+    // Filters (C11): each one narrows to the comps that have it, and they combine.
+    const { options } = await get('/api/comps?min=1')
+    const has = (r: any, q: Record<string, string>) =>
+      (!q.unit || [...r.units, ...r.carries].some((u: any) => u.id === q.unit)) &&
+      (!q.trait || r.trait?.id === q.trait || r.traits.some((t: any) => t.id === q.trait)) &&
+      (!q.item || r.units.some((u: any) => u.items.some((i: any) => i.id === q.item))) &&
+      (!q.playstyle || r.play.kind === q.playstyle) && (!q.rising || r.rising)
+    const ids = (rows: any[]) => rows.map((r) => r.id).sort()
+    const asks: Record<string, string>[] = [
+      { unit: options.units[0].id }, { trait: options.traits[0].id }, { item: options.items[0].id }, { playstyle: options.playstyles[0] },
+      { rising: '1' }, { unit: vanguard.carries[0].id, playstyle: vanguard.play.kind }, { unit: vanguard.carries[0].id, playstyle: 'nope' },
+      { trait: vanguard.trait.id, item: vanguard.units.find((u: any) => u.items.length).items[0].id, unit: vanguard.units[0].id },
+    ]
+    let narrowed = 0
+    for (const q of asks) {
+      const got = await get(`/api/comps?min=1&${new URLSearchParams(q)}`)
+      assert.deepEqual(ids(got.rows), ids(all.filter((r) => has(r, q))), JSON.stringify(q))
+      assert.deepEqual(got.options, options, 'the choices do not shrink with the filters')
+      if (got.rows.length < all.length) narrowed++
+    }
+    assert.ok(narrowed >= 5, `the filters should narrow the list (${narrowed})`)
+    assert.equal((await get(`/api/comps?min=1&unit=${vanguard.carries[0].id}&playstyle=nope`)).rows.length, 0)
+    assert.deepEqual(ids((await get('/api/comps?min=1&unit=&trait=&rising=0')).rows), ids(all), 'empty filters filter nothing')
+    assert.ok(options.units.length >= 5 && options.traits.length >= 5 && options.items.length > 0 && options.playstyles.length >= 2)
+    ok('filters by unit, trait, item, playstyle and rising narrow the list, and combine')
+
+    // The URL holds the filters (src/ui/tierFilters.ts), next to anything else in it.
+    const picked = { ...NO_FILTERS, unit: 'TFT99_Unit1', trait: 'TFT99_Sniper', rising: true }
+    const search = writeFilters('?data=worst', picked)
+    assert.equal(search, '?data=worst&unit=TFT99_Unit1&trait=TFT99_Sniper&rising=1')
+    assert.deepEqual(readFilters(search), picked)
+    assert.equal(writeFilters(search, NO_FILTERS), '?data=worst')
+    assert.equal(writeFilters('', NO_FILTERS), '')
+    assert.equal(filterQuery({ ...NO_FILTERS, item: 'A|B', playstyle: 'fast' }), 'item=A%7CB&playstyle=fast')
+    assert.deepEqual(readFilters('?unit=a&rising=yes'), { ...NO_FILTERS, unit: 'a' })
+    ok('filter state round-trips through the page URL')
+
+    // The dev stress switch covers the new fields.
+    const worst = await get('/api/comps?data=worst')
+    assert.deepEqual(worst.rows.slice(0, 3).map((r: any) => [r.tier, r.patchDelta]), [['S', -3.21], ['D', 3.4], [null, null]])
+    assert.deepEqual((await get('/api/comps?data=empty')).rows, [])
+    assert.ok((await get('/api/comps?data=empty')).options.units.length > 0)
+    assert.equal((await get('/api/comps?data=one')).rows.length, 1)
+    assert.equal((await get('/api/comps?data=many&unit=' + vanguard.carries[0].id)).rows.length, 1000)
+    ok('stress modes cover tier letters, trends and filters')
 
     const units = await get('/api/units')
     assert.equal(units.rows.length, 20)

@@ -117,12 +117,22 @@ fn extremes() -> [Vec<(&'static str, Value)>; 3] {
         vec![
             ("games", json!(12_345_678)), ("avgPlace", json!(1)), ("winRate", json!(1)), ("top4Rate", json!(1)),
             ("frequency", json!(1)), ("pickRate", json!(8)), ("placeChange", json!(-3.21)),
+            // The tier list (PRD 2 C3, C4): top tier, rising fast on both trends.
+            ("tier", json!("S")), ("score", json!(12.345_678)), ("prevPlace", json!(4.21)), ("d3Place", json!(1)),
+            ("patchDelta", json!(-3.21)), ("d3Delta", json!(-3.456)), ("rising", json!(true)),
         ],
         vec![
             ("games", json!(1)), ("avgPlace", json!(8)), ("winRate", json!(0)), ("top4Rate", json!(0)),
             ("frequency", json!(0.00004)), ("pickRate", json!(0.0003)), ("placeChange", json!(3.4)),
+            ("tier", json!("D")), ("score", json!(-12.345_678)), ("prevPlace", json!(4.6)), ("d3Place", json!(8)),
+            ("patchDelta", json!(3.4)), ("d3Delta", json!(3.456)), ("rising", json!(false)),
         ],
-        vec![("placeChange", Value::Null), ("avgStar", json!(3))],
+        // Not graded yet, and new this patch: nothing to compare with.
+        vec![
+            ("placeChange", Value::Null), ("avgStar", json!(3)), ("tier", Value::Null), ("score", Value::Null),
+            ("prevPlace", Value::Null), ("d3Place", Value::Null), ("patchDelta", Value::Null), ("d3Delta", Value::Null),
+            ("rising", json!(false)),
+        ],
     ]
 }
 
@@ -505,6 +515,28 @@ mod tests {
         assert_eq!(hash("a"), 7 * 31 + 97);
         // An astral character counts once, by its high surrogate.
         assert_eq!(hash("😀"), 7 * 31 + 0xD83D);
+    }
+
+    /// The tier list's fields get the same treatment as the other numbers on a row, so every stress mode covers
+    /// the tier letter, both trends and the rising mark, and the filter choices stay for the empty lists.
+    #[test]
+    fn covers_the_tier_list_fields() {
+        let row = |id: &str| json!({ "id": id, "games": 50, "avgPlace": 4.4, "tier": "B", "score": 0.1, "prevPlace": 4.5,
+            "d3Place": 4.3, "patchDelta": -0.1, "d3Delta": -0.1, "rising": false });
+        let body = json!({ "rows": [row("a"), row("b"), row("c"), row("d")], "options": { "units": [{ "id": "u", "name": "U", "icon": null, "cost": 1 }] } });
+        let mut b = body.clone();
+        stress("worst", "/api/comps", &mut b);
+        assert_eq!((b["rows"][0]["tier"].clone(), b["rows"][0]["patchDelta"].clone(), b["rows"][0]["rising"].clone()), (json!("S"), json!(-3.21), json!(true)));
+        assert_eq!((b["rows"][1]["tier"].clone(), b["rows"][1]["d3Delta"].clone()), (json!("D"), json!(3.456)));
+        assert_eq!((b["rows"][2]["tier"].clone(), b["rows"][2]["prevPlace"].clone(), b["rows"][2]["patchDelta"].clone()), (Value::Null, Value::Null, Value::Null));
+        assert_eq!(b["rows"][3], row("d"), "a fourth row keeps its real values");
+        assert_ne!(b["options"]["units"][0]["name"], json!("U"), "filter choices get the awkward names too");
+        let mut b = body.clone();
+        stress("empty", "/api/comps", &mut b);
+        assert_eq!((b["rows"].clone(), b["options"]["units"].as_array().unwrap().len()), (json!([]), 1));
+        let mut b = body.clone();
+        stress("many", "/api/comps", &mut b);
+        assert_eq!((b["rows"].as_array().unwrap().len(), b["rows"][999]["tier"].clone()), (1000, json!("B")));
     }
 
     #[test]
