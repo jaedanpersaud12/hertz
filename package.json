@@ -14,6 +14,7 @@
     "start": "tsx src/server/index.ts",
     "test": "tsx test/e2e.ts",
     "parity": "tsx scripts/parity.ts",
+    "golden": "tsx scripts/golden.ts",
     "resume": "tsx scripts/resume.ts",
     "cli": "tsx scripts/cli.ts",
     "test:rust": "cargo test -q && cargo clippy -q --all-targets -- -D warnings",

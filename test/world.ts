@@ -5,6 +5,8 @@
 import { createServer } from 'node:http'
 
 // ---- A small fake world ----------------------------------------------------
+/** When the world was made. Every ranked match ends an hour before it; the golden files record times against it. */
+export const WORLD_NOW = Date.now()
 let seed = 42
 const rand = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296)
 const pick = <T,>(xs: T[]) => xs[Math.floor(rand() * xs.length)]
@@ -56,7 +58,7 @@ for (const platform of Object.keys(PLATFORMS)) {
     matches.set(id, {
       metadata: { match_id: id, participants: lobby },
       info: {
-        game_datetime: Date.now() - 3600_000, game_length: 2100,
+        game_datetime: WORLD_NOW - 3600_000, game_length: 2100,
         game_version: 'Linux Version 99.3.123.4567 (Nov 01 2026/10:00:00) [PUBLIC] <Releases/99.3>',
         queue_id: ranked ? 1100 : 1090, tft_set_number: 99,
         participants: boards.map((b) => ({
