@@ -61,6 +61,9 @@ pub struct Config {
     pub my_platform: String,
     /// Fraction of the published rate limit we allow ourselves.
     pub rate_margin: f64,
+    /// Share of stored matches (0 to 1) whose 8 players get their real rank looked up, to check how well the
+    /// seed player's rank stands in for the lobby (E7). Each sampled match costs 8 requests. 0 turns it off.
+    pub rank_sample_rate: f64,
 }
 
 impl Config {
@@ -96,6 +99,7 @@ impl Config {
             riot_id: get("RIOT_ID").unwrap_or_default(),
             my_platform: get("MY_PLATFORM").unwrap_or_default().to_lowercase(),
             rate_margin: num("RATE_MARGIN", 1.0),
+            rank_sample_rate: num("RANK_SAMPLE_RATE", 0.01).clamp(0.0, 1.0),
         }
     }
 }
@@ -123,6 +127,9 @@ mod tests {
         assert_eq!(c.tiers.len(), 6);
         assert_eq!((c.pages_per_division, c.days, c.snowball, c.ranked_queue_id), (5, 7, true, 1100));
         assert_eq!(c.db_path, PathBuf::from("data/tft.db"));
+        assert_eq!(c.rank_sample_rate, 0.01);
+        let rate = |v: &str| Config::from_lookup(|k| (k == "RANK_SAMPLE_RATE").then(|| v.into())).rank_sample_rate;
+        assert_eq!((rate("0"), rate("0.05"), rate("7"), rate("junk")), (0.0, 0.05, 1.0, 0.01));
         let c = Config::from_lookup(|k| (k == "SNOWBALL").then(|| "false".into()));
         assert!(!c.snowball);
     }

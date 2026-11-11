@@ -107,6 +107,20 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime INTEGER NOT NULL, json TEXT NOT NULL);
 `
 
+/**
+ * Numbered additions to SCHEMA, applied in order every time the database is opened. Each one is idempotent
+ * (IF NOT EXISTS). Kept byte-for-byte identical to `MIGRATIONS` in crates/tft-store/src/schema.rs, which documents
+ * each one. New ones take the next number.
+ */
+const MIGRATIONS: [number, string][] = [[
+  1,
+  `
+CREATE TABLE IF NOT EXISTS rank_samples (match_id TEXT, puuid TEXT, tier TEXT, division TEXT, PRIMARY KEY (match_id, puuid));
+CREATE TABLE IF NOT EXISTS rank_sample_queue (match_id TEXT PRIMARY KEY, platform TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS rank_sample_pending ON rank_sample_queue(done, platform);
+`,
+]]
+
 const STATS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS stat_meta (
   patch TEXT NOT NULL, bucket TEXT NOT NULL,
@@ -136,6 +150,7 @@ function migrate(db: DB) {
     (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === col)
   if (!has('participants', 'comp_key')) db.exec('ALTER TABLE participants ADD COLUMN comp_key TEXT')
   if (!has('units', 'rarity')) db.exec('ALTER TABLE units ADD COLUMN rarity INTEGER')
+  for (const [, sql] of MIGRATIONS) db.exec(sql)
 
   if (db.pragma('user_version', { simple: true }) !== STATS_VERSION) {
     for (const t of STAT_TABLES) db.exec(`DROP TABLE IF EXISTS ${t}`)

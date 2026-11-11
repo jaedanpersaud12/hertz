@@ -89,6 +89,24 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime INTEGER NOT NULL, json TEXT NOT NULL);
 ";
 
+/// Numbered additions to [`SCHEMA`], applied in order every time the database is opened. Each one is idempotent
+/// (`IF NOT EXISTS`), so applying it again changes nothing. Kept byte-for-byte identical to `MIGRATIONS` in
+/// `src/db.ts`. New ones take the next number.
+///
+/// 1. Real ranks for a sample of lobbies (E7). `rank_samples` holds one row per looked-up player: `tier` is
+///    Riot's tier, or `UNRANKED` when the player has no ranked TFT entry; `division` is I to IV (empty for apex
+///    tiers' single division as Riot sends it, and for unranked players). `rank_sample_queue` holds every match
+///    chosen for sampling; `done` turns 1 once all its players are in `rank_samples`. Rows are never removed, so
+///    choosing a match again after a restart is a no-op.
+pub const MIGRATIONS: [(u32, &str); 1] = [(
+    1,
+    "
+CREATE TABLE IF NOT EXISTS rank_samples (match_id TEXT, puuid TEXT, tier TEXT, division TEXT, PRIMARY KEY (match_id, puuid));
+CREATE TABLE IF NOT EXISTS rank_sample_queue (match_id TEXT PRIMARY KEY, platform TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS rank_sample_pending ON rank_sample_queue(done, platform);
+",
+)];
+
 const RATES: &str = "games INTEGER NOT NULL, sum_place INTEGER NOT NULL, wins INTEGER NOT NULL, top4 INTEGER NOT NULL";
 
 fn stat(name: &str, keys: &str, cols: &str) -> String {

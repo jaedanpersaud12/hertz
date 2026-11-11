@@ -9,6 +9,9 @@
 //!
 //! It is safe to stop and restart at any time: the queue and progress live in the database.
 //!
+//! Rust only (E7): a fixed share of stored matches (`RANK_SAMPLE_RATE`, 1% by default) gets every player's real
+//! rank looked up, beside the crawl. See [`Crawler::sample_ranks`].
+//!
 //! Test only: `TFT_DIE_AT=<point>:<n>` aborts the process at an exact point between database writes, for
 //! `scripts/resume.ts`. See [`die_at`]. It does nothing unless that variable is set.
 
@@ -23,7 +26,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tft_core::config::{Config, TIERS, platform_route, tier_name, tier_rank};
 use tft_core::patches::Calendar;
 use tft_core::riot::LeagueEntry;
-use tft_store::{Connection, Ingest, kv_get, kv_set, load_calendar, params, save_calendar};
+use tft_store::{
+    Connection, Ingest, complete_sample, is_sampled, kv_get, kv_set, load_calendar, params, pending_samples,
+    queue_sample, save_calendar, save_rank,
+};
 
 /// Look at the same player again after this long.
 const RECRAWL_MS: i64 = 6 * 3600 * 1000;
@@ -38,6 +44,12 @@ const SEED_PENDING: &str = "seed_pending";
 
 /// A match whose answer is cut off this many times in one run is left queued for the next run.
 const CUT_OFF_LIMIT: u32 = 3;
+
+/// Sampled matches looked up together (8 lookups each).
+const SAMPLE_BATCH: i64 = 2;
+
+/// A sampled match whose lookups failed is left alone this long before it is tried again.
+const SAMPLE_RETRY: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Default)]
 pub struct CrawlOptions {
@@ -215,7 +227,7 @@ impl Crawler {
 
         let results = join_all(routes.into_iter().map(|(route, platforms)| {
             let me = Arc::clone(self);
-            async move { me.crawl_route(route, platforms).await }
+            async move { me.crawl_and_sample(route, platforms).await }
         }))
         .await;
         report_task.abort();
@@ -356,6 +368,85 @@ impl Crawler {
             }
         }
         Ok(())
+    }
+
+    /// Crawls one routing group and, beside it, looks up real ranks for its sampled matches. With `--once` the
+    /// lookups still waiting when the crawl ends are finished before this returns.
+    async fn crawl_and_sample(&self, route: &str, platforms: Vec<String>) -> Result<()> {
+        let crawled = AtomicBool::new(false);
+        let crawl = async {
+            let r = self.crawl_route(route, platforms.clone()).await;
+            crawled.store(true, Ordering::Relaxed);
+            r
+        };
+        let (c, s) = tokio::join!(crawl, self.sample_ranks(route, &platforms, &crawled));
+        c.and(s)
+    }
+
+    /// Looks up the real rank of every player in this group's sampled matches (E7), until the crawl has ended
+    /// and nothing is left that can be done now.
+    ///
+    /// - The lookups go to each server's own host (na1, euw1) through that host's limiter. Riot limits each
+    ///   host separately, so they do not hold up the group's match downloads, which go to the routing host.
+    /// - Every answer is saved at once, and a match is marked done only when all its players are in. A stop or
+    ///   kill loses at most the lookups in flight; the next run looks up only the players still missing.
+    /// - A lookup Riot does not answer leaves its match waiting: it is tried again after [`SAMPLE_RETRY`], or
+    ///   on the next run, never dropped.
+    async fn sample_ranks(&self, route: &str, platforms: &[String], crawled: &AtomicBool) -> Result<()> {
+        let mut failed: HashMap<String, tokio::time::Instant> = HashMap::new();
+        loop {
+            if self.stopping() {
+                return Ok(());
+            }
+            failed.retain(|_, at| at.elapsed() < SAMPLE_RETRY);
+            let skip: Vec<String> = failed.keys().cloned().collect();
+            let batch = pending_samples(&self.db.lock().unwrap(), platforms, &skip, SAMPLE_BATCH)?;
+            if batch.is_empty() {
+                if crawled.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                self.pause(1).await;
+                continue;
+            }
+            let lookups = batch.iter().flat_map(|(id, platform, puuids)| puuids.iter().map(move |p| (id, platform, p)));
+            let answers = join_all(lookups.map(|(id, platform, puuid)| async move {
+                (id, puuid, self.riot.rank(platform, puuid).await)
+            }))
+            .await;
+            let mut unavailable = None;
+            {
+                let db = self.db.lock().unwrap();
+                for (id, puuid, got) in answers {
+                    match got {
+                        Ok(entries) => {
+                            let e = entries.iter().find(|e| e.queue_type == "RANKED_TFT");
+                            let tier = e.map_or(tft_store::UNRANKED, |e| e.tier.as_str());
+                            save_rank(&db, id, puuid, tier, e.map_or("", |e| e.rank.as_str()))?;
+                        }
+                        Err(RiotError::Key(k)) => {
+                            self.key_failed.store(true, Ordering::Relaxed);
+                            return Err(RiotError::Key(k).into());
+                        }
+                        Err(e) => {
+                            failed.insert(id.clone(), tokio::time::Instant::now());
+                            if let RiotError::Unavailable(msg) = e {
+                                unavailable.get_or_insert(msg);
+                            }
+                        }
+                    }
+                }
+                for (id, _, _) in &batch {
+                    complete_sample(&db, id)?;
+                }
+            }
+            self.remember_key()?;
+            if let Some(msg) = unavailable
+                && !crawled.load(Ordering::Relaxed)
+            {
+                println!("[{route}] {msg} Rank lookups wait a minute; the matches are kept for later.");
+                self.pause(60).await;
+            }
+        }
     }
 
     /// Queued matches this run still has to fetch (the ones held back after repeated cut-offs are left out).
@@ -500,7 +591,13 @@ impl Crawler {
             let added = {
                 let cal = self.calendar.read().unwrap();
                 die_at("before_store", id);
-                ingest.store(&mut self.db.lock().unwrap(), &m, &cal)?
+                let mut db = self.db.lock().unwrap();
+                let added = ingest.store(&mut db, &m, &cal)?;
+                // Queued even when it was stored before (a kill before its status was set), so none is missed.
+                if is_sampled(id, self.config.rank_sample_rate) {
+                    queue_sample(&db, id, platform)?;
+                }
+                added
             };
             die_at("after_store", id);
             if added {
@@ -863,5 +960,235 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_answer_is_skipped() {
         assert!(riot_sent_garbage(&answer_once("not json", 8).await));
+    }
+
+    // ---- Rank samples (E7) ----------------------------------------------------------------------
+
+    /// A ranked eight-player match; player `i` is `{id}-{i}`.
+    fn lobby_body(id: &str) -> String {
+        let players: Vec<serde_json::Value> = (0..8)
+            .map(|i| serde_json::json!({ "puuid": format!("{id}-{i}"), "placement": i + 1, "traits": [], "units": [] }))
+            .collect();
+        serde_json::json!({
+            "metadata": { "match_id": id, "participants": [] },
+            "info": { "game_datetime": 1_000, "game_version": "TFT Unreal Version ?.?.?.?", "queue_id": 1100,
+                      "tft_set_number": 16, "participants": players }
+        })
+        .to_string()
+    }
+
+    /// The real tier the fake Riot gives player `i` of a lobby. Player 3 has no ranked entry.
+    const REAL: [&str; 8] = ["GOLD", "PLATINUM", "EMERALD", "", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"];
+
+    fn rank_body(puuid: &str) -> String {
+        let i: usize = puuid.rsplit('-').next().unwrap().parse().unwrap();
+        if REAL[i].is_empty() {
+            return "[]".into();
+        }
+        serde_json::json!([
+            { "queueType": "RANKED_TFT_TURBO", "tier": "ORANGE", "rank": "I", "leaguePoints": 0, "wins": 0, "losses": 0 },
+            { "queueType": "RANKED_TFT", "tier": REAL[i], "rank": "II", "leaguePoints": 10, "wins": 1, "losses": 2 }
+        ])
+        .to_string()
+    }
+
+    fn lobbies(path: &str, _: usize) -> (u16, &'static str, String) {
+        let last = path.rsplit('/').next().unwrap_or_default();
+        if path.contains("/tft/league/v1/by-puuid/") {
+            return (200, "", rank_body(last));
+        }
+        (200, "", lobby_body(last))
+    }
+
+    /// Player 7's lookups fail six times in a row (Riot unavailable), then answer.
+    fn player_seven_flaky(path: &str, before: usize) -> (u16, &'static str, String) {
+        if path.ends_with("-7") && before < 6 {
+            return (500, "", String::new());
+        }
+        lobbies(path, before)
+    }
+
+    /// One answer per second on na1, so lookups are in flight long enough to be cut short.
+    fn slow_ranks(path: &str, before: usize) -> (u16, &'static str, String) {
+        let (status, _, body) = lobbies(path, before);
+        (status, "x-app-rate-limit: 1:1,1000:1000\r\n", body)
+    }
+
+    fn sample_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(tft_store::schema::SCHEMA).unwrap();
+        tft_store::apply_migrations(&conn).unwrap();
+        conn
+    }
+
+    fn sampler_on(conn: Connection, base: &str, rate: f64) -> Arc<Crawler> {
+        let mut config = test_config(base, KEY);
+        config.rank_sample_rate = rate;
+        let opts = CrawlOptions { once: true, ..Default::default() };
+        let mut crawler = Crawler::new(config, opts, conn, Arc::default()).unwrap();
+        crate::client::init_tls();
+        let http = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
+        let me = Arc::get_mut(&mut crawler).unwrap();
+        let riot = std::mem::replace(&mut me.riot, RiotClient::new(KEY, base, 1.0));
+        me.riot = riot.with_http(http);
+        me.riot.set_key_worked();
+        crawler
+    }
+
+    fn rows(c: &Crawler, sql: &str) -> Vec<(String, String)> {
+        let db = c.db.lock().unwrap();
+        let mut q = db.prepare(sql).unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+    }
+
+    fn count(c: &Crawler, sql: &str) -> i64 {
+        c.db.lock().unwrap().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// Stores lobbies `NA1_0..n` directly and queues the sampled ones, as `step` does.
+    fn stored_lobbies(n: usize, rate: f64) -> (Connection, Vec<String>) {
+        let mut conn = sample_db();
+        let mut sampled = Vec::new();
+        for i in 0..n {
+            let id = format!("NA1_{i}");
+            let m: tft_core::riot::RiotMatch = serde_json::from_str(&lobby_body(&id)).unwrap();
+            let ingest = Ingest { platform: "na1", rank: 7, tier: "MASTER", snowball: false };
+            ingest.store(&mut conn, &m, &Calendar::default()).unwrap();
+            if is_sampled(&id, rate) {
+                queue_sample(&conn, &id, "na1").unwrap();
+                sampled.push(id);
+            }
+        }
+        (conn, sampled)
+    }
+
+    /// E7: the crawl queues exactly the matches the hash picks, and each gets all 8 real ranks stored (the
+    /// ranked TFT entry, not another queue's; a player with no entry is stored as unranked).
+    #[tokio::test(start_paused = true)]
+    async fn sampled_matches_get_all_eight_ranks_looked_up() {
+        let (base, hits) = serve(lobbies).await;
+        let conn = sample_db();
+        let ids: Vec<String> = (0..60).map(|i| format!("NA1_{i}")).collect();
+        for id in &ids {
+            queue(&conn, id, "americas", "na1");
+        }
+        let rate = 0.25;
+        let expected: Vec<String> = ids.iter().filter(|id| is_sampled(id, rate)).cloned().collect();
+        assert!(expected.len() > 5 && expected.len() < 30, "{} of 60 picked", expected.len());
+
+        let crawler = sampler_on(conn, &base, rate);
+        crawler.crawl_and_sample("americas", vec!["na1".into()]).await.unwrap();
+
+        assert_eq!(count(&crawler, "SELECT COUNT(*) FROM matches"), 60, "every match is stored");
+        let mut queued: Vec<String> =
+            rows(&crawler, "SELECT match_id, platform FROM rank_sample_queue WHERE done = 1").into_iter().map(|r| r.0).collect();
+        queued.sort();
+        let mut want = expected.clone();
+        want.sort();
+        assert_eq!(queued, want, "the sampled matches are the hash's picks, and all are done");
+        assert_eq!(count(&crawler, "SELECT COUNT(*) FROM rank_sample_queue WHERE done = 0"), 0);
+        for id in &expected {
+            let got = rows(&crawler, &format!("SELECT puuid, tier FROM rank_samples WHERE match_id = '{id}' ORDER BY puuid"));
+            let want: Vec<(String, String)> = (0..8)
+                .map(|i| (format!("{id}-{i}"), if REAL[i].is_empty() { "UNRANKED" } else { REAL[i] }.to_string()))
+                .collect();
+            assert_eq!(got, want, "{id}");
+        }
+        let divisions = rows(&crawler, "SELECT DISTINCT division, '' FROM rank_samples ORDER BY 1");
+        assert_eq!(divisions, [("".to_string(), "".to_string()), ("II".to_string(), "".to_string())]);
+        let lookups = hits.lock().unwrap().iter().filter(|(_, p)| p.starts_with("/na1/tft/league/v1/by-puuid/")).count();
+        assert_eq!(lookups, expected.len() * 8, "one lookup per player, on the server's own host");
+
+        let a = tft_store::rank_sample_accuracy(&crawler.db.lock().unwrap()).unwrap();
+        // Stored as Master; 3 of 8 reach Master, so the lobby is really Diamond+ by the upper-median rule.
+        assert_eq!((a.sampled_matches, a.players, a.share_in_right_bucket), (expected.len() as i64, expected.len() as i64 * 8, Some(0.0)));
+    }
+
+    /// With the rate at 0 nothing is sampled and no lookups are sent, so the crawl is the same as before E7.
+    #[tokio::test(start_paused = true)]
+    async fn rate_zero_samples_nothing() {
+        let (base, hits) = serve(lobbies).await;
+        let conn = sample_db();
+        for i in 0..60 {
+            queue(&conn, &format!("NA1_{i}"), "americas", "na1");
+        }
+        let crawler = sampler_on(conn, &base, 0.0);
+        crawler.crawl_and_sample("americas", vec!["na1".into()]).await.unwrap();
+        assert_eq!(count(&crawler, "SELECT COUNT(*) FROM matches"), 60);
+        assert_eq!(count(&crawler, "SELECT COUNT(*) FROM rank_sample_queue"), 0);
+        assert!(!hits.lock().unwrap().iter().any(|(_, p)| p.contains("/by-puuid/")));
+    }
+
+    /// A lookup Riot does not answer leaves its match waiting, not dropped and not marked done; after a restart
+    /// only the missing player is looked up and the match is finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_is_kept_and_finished_after_a_restart() {
+        let (base, hits) = serve(player_seven_flaky).await;
+        let (conn, sampled) = stored_lobbies(1, 1.0);
+        let crawler = sampler_on(conn, &base, 1.0);
+        crawler.sample_ranks("americas", &["na1".into()], &AtomicBool::new(true)).await.unwrap();
+        assert_eq!(count(&crawler, "SELECT COUNT(*) FROM rank_samples"), 7, "seven answers saved");
+        assert_eq!(count(&crawler, "SELECT done FROM rank_sample_queue"), 0, "the match is still waiting");
+        assert_eq!(tft_store::rank_sample_accuracy(&crawler.db.lock().unwrap()).unwrap().sampled_matches, 0);
+
+        let restarted = sampler_on(take_db(crawler), &base, 1.0);
+        restarted.sample_ranks("americas", &["na1".into()], &AtomicBool::new(true)).await.unwrap();
+        assert_eq!(count(&restarted, "SELECT COUNT(*) FROM rank_samples"), 8);
+        assert_eq!(count(&restarted, "SELECT done FROM rank_sample_queue"), 1);
+        let hits = hits.lock().unwrap().clone();
+        for i in 0..7 {
+            let path = format!("/na1/tft/league/v1/by-puuid/{}-{i}", sampled[0]);
+            assert_eq!(hits.iter().filter(|(_, p)| *p == path).count(), 1, "{path} looked up again");
+        }
+    }
+
+    /// While the crawl is still running, a failed match is tried again after a pause in the same run.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_is_tried_again_while_the_crawl_runs() {
+        let (base, _) = serve(player_seven_flaky).await;
+        let (conn, _) = stored_lobbies(1, 1.0);
+        let crawler = sampler_on(conn, &base, 1.0);
+        let crawled = AtomicBool::new(false);
+        let platforms = ["na1".to_string()];
+        let sampler = crawler.sample_ranks("americas", &platforms, &crawled);
+        let finish = async {
+            while count(&crawler, "SELECT COUNT(*) FROM rank_sample_queue WHERE done = 1") == 0 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            crawled.store(true, Ordering::Relaxed);
+        };
+        let (r, ()) = tokio::time::timeout(SAMPLE_RETRY * 2, async { tokio::join!(sampler, finish) }).await.unwrap();
+        r.unwrap();
+        assert_eq!(count(&crawler, "SELECT COUNT(*) FROM rank_samples"), 8);
+    }
+
+    /// Killed mid-lookups (the task is dropped, so nothing after that point runs): every answer already in is
+    /// kept, and the restart looks up only what is missing and finishes every sampled match.
+    #[tokio::test(start_paused = true)]
+    async fn lookups_cut_short_by_a_kill_resume_without_losing_or_repeating_work() {
+        let (base, hits) = serve(slow_ranks).await;
+        let (conn, sampled) = stored_lobbies(40, 0.2);
+        assert!(sampled.len() >= 4, "{} sampled", sampled.len());
+        let crawler = sampler_on(conn, &base, 0.2);
+        let me = Arc::clone(&crawler);
+        let task = tokio::spawn(async move { me.sample_ranks("americas", &["na1".into()], &AtomicBool::new(true)).await });
+        while count(&crawler, "SELECT COUNT(*) FROM rank_samples") < 20 {
+            assert!(!task.is_finished(), "the lookups ended before 20 answers were in");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        let saved = count(&crawler, "SELECT COUNT(*) FROM rank_samples");
+        let total = sampled.len() as i64 * 8;
+        assert!(saved < total, "the kill landed before the end ({saved} of {total})");
+        let asked_before = hits.lock().unwrap().len();
+
+        let restarted = sampler_on(take_db(crawler), &base, 0.2);
+        restarted.sample_ranks("americas", &["na1".into()], &AtomicBool::new(true)).await.unwrap();
+        assert_eq!(count(&restarted, "SELECT COUNT(*) FROM rank_samples"), total);
+        assert_eq!(count(&restarted, "SELECT COUNT(*) FROM rank_sample_queue WHERE done = 1"), sampled.len() as i64);
+        let asked_after = hits.lock().unwrap().len() - asked_before;
+        // Only the missing players are asked for (in-flight lookups at the kill were never answered).
+        assert_eq!(asked_after as i64, total - saved, "the restart asks only for the players still missing");
     }
 }

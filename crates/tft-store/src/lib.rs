@@ -1,9 +1,15 @@
 //! The SQLite database: opening and upgrading it, small key-value settings, and storing matches.
 
 mod ingest;
+mod rank_sample;
 pub mod schema;
 
 pub use ingest::{Ingest, relabel_unknown};
+pub use rank_sample::{
+    UNRANKED,
+    BucketAccuracy, RankSampleAccuracy, bucket_of, complete_sample, is_sampled, pending_samples, queue_sample,
+    rank_sample_accuracy, sample_done, save_rank,
+};
 pub use rusqlite::{Connection, Error, params};
 
 use anyhow::{Context, Result};
@@ -51,12 +57,21 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has("units", "rarity")? {
         conn.execute_batch("ALTER TABLE units ADD COLUMN rarity INTEGER")?;
     }
+    apply_migrations(conn)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != schema::STATS_VERSION {
         for t in schema::STAT_TABLES {
             conn.execute_batch(&format!("DROP TABLE IF EXISTS {t}"))?;
         }
         conn.pragma_update(None, "user_version", schema::STATS_VERSION)?;
+    }
+    Ok(())
+}
+
+/// Applies the numbered [`schema::MIGRATIONS`] in order. Safe to call any number of times.
+pub fn apply_migrations(conn: &Connection) -> Result<()> {
+    for (n, sql) in schema::MIGRATIONS {
+        conn.execute_batch(sql).with_context(|| format!("applying migration {n}"))?;
     }
     Ok(())
 }
