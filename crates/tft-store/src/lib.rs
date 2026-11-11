@@ -25,6 +25,9 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch(schema::SCHEMA)?;
     migrate(&conn)?; // adds columns to databases made by an older version, drops outdated stat tables
     conn.execute_batch(&schema::stats_schema())?;
+    for step in schema::MIGRATIONS {
+        conn.execute_batch(step)?;
+    }
     Ok(conn)
 }
 
