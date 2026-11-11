@@ -127,6 +127,10 @@ pub fn build_stats_incremental(conn: &mut Connection) -> Result<Vec<String>> {
 ///   and the comp tables are recomputed from every board in the scope (they depend on the whole scope);
 /// - last 3 days: recomputed from raw rows, because matches fall out of it.
 ///
+/// The raw rows are read once per patch, not once per scope: every board is tagged with its rank band, time
+/// window and watermark segment, the sums are taken per tag (and, for comps, per stored label), and each scope
+/// adds up the tags it covers. The scopes are nested by rank and time, so this gives the same sums.
+///
 /// The result equals a full rebuild ([`build_stats`]) row for row.
 pub fn build_stats_incremental_with(
     conn: &mut Connection,
@@ -144,45 +148,12 @@ pub fn build_stats_incremental_with(
         return Ok(Vec::new());
     }
 
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS p (id INTEGER PRIMARY KEY, placement INTEGER NOT NULL, level INTEGER, comp_key TEXT);
-         CREATE TEMP TABLE IF NOT EXISTS topc (comp_key TEXT PRIMARY KEY) WITHOUT ROWID;",
-    )?;
+    conn.execute_batch(INC_TEMP)?;
     let mut touched = Vec::new();
     for patch in &patches {
-        for bucket in &BUCKETS {
-            for window in &WINDOWS {
-                let scope = scope_key(bucket.key, window.key);
-                let since = window.days.map_or(0, |d| now_ms() - d * 86_400_000);
-                let t0 = Instant::now();
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let how = match plan_scope(&tx, patch, &scope, bucket.min, since)? {
-                    Plan::Skip => continue, // dropping tx writes nothing
-                    Plan::Full => {
-                        build_scope(&tx, patch, &scope, bucket.min, since)?;
-                        "full"
-                    }
-                    Plan::Add(after) => {
-                        add_to_scope(&tx, patch, &scope, bucket.min, after)?;
-                        "added"
-                    }
-                };
-                set_watermark(&tx, patch, &scope)?;
-                tx.commit()?;
-                let matches: i64 = conn.query_row(
-                    "SELECT matches FROM stat_meta WHERE patch = ? AND bucket = ?",
-                    params![patch, scope],
-                    |r| r.get(0),
-                )?;
-                log(&format!(
-                    "patch {patch}  {scope:<13} {matches:>8} matches  {how:<5}  {:.1} s",
-                    t0.elapsed().as_secs_f64()
-                ));
-                touched.push(watermark_key(patch, &scope));
-            }
-        }
+        update_patch(conn, patch, log, &mut touched)?;
     }
-    conn.execute_batch("DROP TABLE IF EXISTS p; DROP TABLE IF EXISTS topc")?;
+    conn.execute_batch(INC_DROP)?;
     if touched.is_empty() {
         log("Stats are up to date: no new matches.");
     }
@@ -223,79 +194,382 @@ fn plan_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: i
     })
 }
 
-/// The rate tables [`build_rates`] writes, with the columns that are not summed: their key, and for traits the
-/// smallest unit count. Everything else (games, sum_place, wins, top4) adds up.
-const SUM_TABLES: [(&str, &str); 5] = [
-    ("stat_unit_dist", "character_id, star, n_items"),
-    ("stat_traits", "name, tier_current, num_units"),
-    ("stat_unit_items", "character_id, item"),
-    ("stat_items", "item"),
-    ("stat_unit_builds", "character_id, build"),
+/// Scratch tables for an incremental build. Every board of the patch the build needs goes in inc_b, tagged:
+/// - band: how many bucket minimums its match's rank reaches (bucket i, counting from 1, is band >= i);
+/// - w: how many window starts its match is at or after (a window is w >= its position, oldest start first);
+/// - seg: how many watermarks its match is above (a scope adds the boards above its own watermark).
+///
+/// inc_r is the boards whose rate sums are needed. The other tables hold sums per tag: rates per band, window
+/// and segment; comps per band, window and stored label, before look-alikes are merged.
+const INC_TEMP: &str = "
+CREATE TEMP TABLE IF NOT EXISTS inc_b (id INTEGER PRIMARY KEY, placement INTEGER NOT NULL, level INTEGER, comp_key TEXT,
+  band INTEGER NOT NULL, w INTEGER NOT NULL, seg INTEGER NOT NULL);
+CREATE TEMP TABLE IF NOT EXISTS inc_r (id INTEGER PRIMARY KEY, placement INTEGER NOT NULL,
+  band INTEGER NOT NULL, w INTEGER NOT NULL, seg INTEGER NOT NULL);
+CREATE TEMP TABLE IF NOT EXISTS inc_unit_dist (band, w, seg, character_id, star, n_items, games, sum_place, wins, top4);
+CREATE TEMP TABLE IF NOT EXISTS inc_traits (band, w, seg, name, tier_current, num_units, games, sum_place, wins, top4);
+CREATE TEMP TABLE IF NOT EXISTS inc_unit_items (band, w, seg, character_id, item, games, sum_place, wins, top4);
+CREATE TEMP TABLE IF NOT EXISTS inc_items (band, w, seg, item, games, sum_place, wins, top4);
+CREATE TEMP TABLE IF NOT EXISTS inc_unit_builds (band, w, seg, character_id, build, games, sum_place, wins, top4);
+CREATE TEMP TABLE IF NOT EXISTS inc_comps (band, w, comp_key, n, sum_place, wins, top4, sum_level);
+CREATE TEMP TABLE IF NOT EXISTS inc_comp_units (band, w, comp_key, character_id, games, sum_star, sum_items, full_items, sum_place);
+CREATE TEMP TABLE IF NOT EXISTS inc_comp_items (band, w, comp_key, character_id, item, games, sum_place);
+CREATE TEMP TABLE IF NOT EXISTS inc_comp_traits (band, w, comp_key, name, tier_current, num_units, style, games);
+CREATE TEMP TABLE IF NOT EXISTS inc_comp_levels (band, w, comp_key, level, games, sum_place);
+CREATE TEMP TABLE IF NOT EXISTS inc_cand (comp_key TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS inc_map (src TEXT PRIMARY KEY, dst TEXT NOT NULL) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS inc_top (comp_key TEXT PRIMARY KEY) WITHOUT ROWID;
+";
+const INC_TABLES: [&str; 15] = [
+    "inc_b", "inc_r", "inc_unit_dist", "inc_traits", "inc_unit_items", "inc_items", "inc_unit_builds", "inc_comps",
+    "inc_comp_units", "inc_comp_items", "inc_comp_traits", "inc_comp_levels", "inc_cand", "inc_map", "inc_top",
+];
+const INC_DROP: &str = "
+DROP TABLE IF EXISTS inc_b; DROP TABLE IF EXISTS inc_r; DROP TABLE IF EXISTS inc_unit_dist; DROP TABLE IF EXISTS inc_traits;
+DROP TABLE IF EXISTS inc_unit_items; DROP TABLE IF EXISTS inc_items; DROP TABLE IF EXISTS inc_unit_builds;
+DROP TABLE IF EXISTS inc_comps; DROP TABLE IF EXISTS inc_comp_units; DROP TABLE IF EXISTS inc_comp_items;
+DROP TABLE IF EXISTS inc_comp_traits; DROP TABLE IF EXISTS inc_comp_levels; DROP TABLE IF EXISTS inc_cand;
+DROP TABLE IF EXISTS inc_map; DROP TABLE IF EXISTS inc_top;
+";
+
+/// The rate sums per tag, as [`build_rates`] takes them per scope (the same groups, with the tag added).
+const INC_RATES: [&str; 5] = [
+    "INSERT INTO inc_unit_dist
+     SELECT band, w, seg, character_id, star, n_items, COUNT(*), SUM(placement), SUM(placement = 1), SUM(placement <= 4)
+     FROM (SELECT r.band, r.w, r.seg, u.character_id, MAX(u.star) star, MAX(u.n_items) n_items, r.placement
+           FROM inc_r r CROSS JOIN units u ON u.participant_id = r.id GROUP BY u.participant_id, u.character_id)
+     GROUP BY band, w, seg, character_id, star, n_items",
+    "INSERT INTO inc_traits
+     SELECT r.band, r.w, r.seg, t.name, t.tier_current, MIN(t.num_units), COUNT(*), SUM(r.placement), SUM(r.placement = 1),
+       SUM(r.placement <= 4)
+     FROM inc_r r CROSS JOIN traits t ON t.participant_id = r.id GROUP BY r.band, r.w, r.seg, t.name, t.tier_current",
+    "INSERT INTO inc_unit_items
+     SELECT band, w, seg, character_id, item, COUNT(*), SUM(placement), SUM(placement = 1), SUM(placement <= 4)
+     FROM (SELECT DISTINCT ui.participant_id, ui.character_id, ui.item, r.placement, r.band, r.w, r.seg
+           FROM inc_r r CROSS JOIN unit_items ui ON ui.participant_id = r.id)
+     GROUP BY band, w, seg, character_id, item",
+    "INSERT INTO inc_items
+     SELECT band, w, seg, item, COUNT(*), SUM(placement), SUM(placement = 1), SUM(placement <= 4)
+     FROM (SELECT DISTINCT ui.participant_id, ui.item, r.placement, r.band, r.w, r.seg
+           FROM inc_r r CROSS JOIN unit_items ui ON ui.participant_id = r.id)
+     GROUP BY band, w, seg, item",
+    "INSERT INTO inc_unit_builds
+     SELECT r.band, r.w, r.seg, u.character_id, u.build, COUNT(*), SUM(r.placement), SUM(r.placement = 1), SUM(r.placement <= 4)
+     FROM inc_r r CROSS JOIN units u ON u.participant_id = r.id WHERE u.build IS NOT NULL
+     GROUP BY r.band, r.w, r.seg, u.character_id, u.build",
 ];
 
-/// Adds the boards from matches with a rowid above `after` to a whole-patch scope, inside the caller's transaction.
-fn add_to_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, after: i64) -> Result<()> {
-    let k = params![patch, scope];
-    // The new boards' sums are written by the same SQL a full rebuild uses, under a scratch bucket that only
-    // exists inside this transaction, then folded into the scope.
-    let scratch = format!("{scope}#new");
-    let ks = params![patch, scratch];
-    db.execute_batch("DELETE FROM p; DELETE FROM topc")?;
-    db.execute(
-        "INSERT INTO p SELECT pa.id, pa.placement, pa.level, pa.comp_key FROM participants pa
-         JOIN matches m ON m.match_id = pa.match_id
-         WHERE m.patch = ? AND m.rank >= ? AND m.rowid > ?",
-        params![patch, min_rank, after],
-    )?;
-    let new_comps: i64 = db.query_row("SELECT COUNT(*) n FROM p", [], |r| r.get(0))?;
-    let new_matches: i64 = db.query_row(
-        "SELECT COUNT(*) n FROM matches WHERE patch = ? AND rank >= ? AND rowid > ?",
-        params![patch, min_rank, after],
-        |r| r.get(0),
-    )?;
-    db.execute(
-        "UPDATE stat_meta SET matches = matches + ?, comps = comps + ?, built_at = ? WHERE patch = ? AND bucket = ?",
-        params![new_matches, new_comps, now_ms(), patch, scope],
-    )?;
-    for table in STAT_TABLES {
-        db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), ks)?;
+/// The comp sums per band, window and stored label, as [`build_comps`] and [`merge_lookalikes`] take them per
+/// scope and merged label. Each board has one stored label, so a merged label's sums are its labels' sums added.
+const INC_COMPS: [&str; 5] = [
+    "INSERT INTO inc_comps
+     SELECT band, w, comp_key, COUNT(*), SUM(placement), SUM(placement = 1), SUM(placement <= 4), SUM(COALESCE(level, 0))
+     FROM inc_b WHERE comp_key IS NOT NULL GROUP BY band, w, comp_key",
+    "INSERT INTO inc_comp_units
+     SELECT band, w, comp_key, character_id, COUNT(*), SUM(star), SUM(n_items), SUM(n_items = 3), SUM(placement)
+     FROM (SELECT b.band, b.w, b.comp_key, u.character_id, MAX(u.star) star, MAX(u.n_items) n_items, b.placement
+           FROM inc_b b CROSS JOIN units u ON u.participant_id = b.id WHERE b.comp_key IS NOT NULL
+           GROUP BY b.id, u.character_id)
+     GROUP BY band, w, comp_key, character_id",
+    "INSERT INTO inc_comp_items
+     SELECT band, w, comp_key, character_id, item, COUNT(*), SUM(placement)
+     FROM (SELECT DISTINCT b.id, b.band, b.w, b.comp_key, ui.character_id, ui.item, b.placement
+           FROM inc_b b CROSS JOIN unit_items ui ON ui.participant_id = b.id WHERE b.comp_key IS NOT NULL)
+     GROUP BY band, w, comp_key, character_id, item",
+    "INSERT INTO inc_comp_traits
+     SELECT b.band, b.w, b.comp_key, t.name, t.tier_current, MIN(t.num_units), MAX(t.style), COUNT(*)
+     FROM inc_b b CROSS JOIN traits t ON t.participant_id = b.id WHERE b.comp_key IS NOT NULL
+     GROUP BY b.band, b.w, b.comp_key, t.name, t.tier_current",
+    "INSERT INTO inc_comp_levels
+     SELECT band, w, comp_key, COALESCE(level, 0), COUNT(*), SUM(placement)
+     FROM inc_b WHERE comp_key IS NOT NULL GROUP BY band, w, comp_key, COALESCE(level, 0)",
+];
+
+/// The rate tables: stat table, its sums per tag, its key columns. stat_traits also keeps the smallest unit count.
+const RATE_SUMS: [(&str, &str, &str); 5] = [
+    ("stat_unit_dist", "inc_unit_dist", "character_id, star, n_items"),
+    ("stat_traits", "inc_traits", "name, tier_current"),
+    ("stat_unit_items", "inc_unit_items", "character_id, item"),
+    ("stat_items", "inc_items", "item"),
+    ("stat_unit_builds", "inc_unit_builds", "character_id, build"),
+];
+
+/// One scope an incremental build rewrites, with the tags it covers.
+struct Job {
+    scope: String,
+    /// Boards with band >= this, w >= this and (rate sums only) seg >= this.
+    band: i64,
+    w: i64,
+    seg: i64,
+    /// Adding to stored sums (true) or rebuilding the scope (false).
+    add: bool,
+    matches: i64,
+    comps: i64,
+}
+
+/// Brings one patch's scopes up to date. The raw rows are read in one snapshot (a read transaction, so the
+/// crawler keeps writing meanwhile); then each scope is written in its own short write transaction, from the
+/// sums, with the watermark of that snapshot.
+fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), touched: &mut Vec<String>) -> Result<()> {
+    let t0 = Instant::now();
+    let now = now_ms();
+    let since: Vec<i64> = WINDOWS.iter().map(|w| w.days.map_or(0, |d| now - d * 86_400_000)).collect();
+    debug_assert!(BUCKETS.windows(2).all(|b| b[0].min < b[1].min), "buckets are nested, lowest first");
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let top: i64 = tx.query_row("SELECT COALESCE(MAX(rowid), 0) FROM matches", [], |r| r.get(0))?;
+    // (job, rank minimum, window start, watermark if adding)
+    let mut planned: Vec<(Job, i64, i64, Option<i64>)> = Vec::new();
+    for (bi, bucket) in BUCKETS.iter().enumerate() {
+        for (wi, window) in WINDOWS.iter().enumerate() {
+            let scope = scope_key(bucket.key, window.key);
+            let mark = match plan_scope(&tx, patch, &scope, bucket.min, since[wi])? {
+                Plan::Skip => continue,
+                Plan::Full => None,
+                Plan::Add(after) => Some(after),
+            };
+            let matches: i64 = tx.query_row(
+                "SELECT COUNT(*) n FROM matches WHERE patch = ? AND rank >= ? AND game_datetime >= ?",
+                params![patch, bucket.min, since[wi]],
+                |r| r.get(0),
+            )?;
+            let w = since.iter().filter(|s| **s <= since[wi]).count() as i64;
+            let job = Job { scope, band: bi as i64 + 1, w, seg: 0, add: mark.is_some(), matches, comps: 0 };
+            planned.push((job, bucket.min, since[wi], mark));
+        }
     }
-    build_rates(db, patch, &scratch)?;
-    for (table, keys) in SUM_TABLES {
-        let cols = format!("{keys}, games, sum_place, wins, top4");
-        let min = if table == "stat_traits" { ", num_units = MIN(num_units, excluded.num_units)" } else { "" };
+    if planned.is_empty() {
+        return Ok(()); // read only: dropping tx ends it
+    }
+    let mut marks: Vec<i64> = planned.iter().filter_map(|j| j.3).collect();
+    marks.sort_unstable();
+    marks.dedup();
+    for (job, _, _, mark) in &mut planned {
+        if let Some(m) = mark {
+            job.seg = marks.iter().position(|x| x == m).unwrap() as i64 + 1;
+        }
+    }
+
+    // Tag the boards. Values are integers from the database or from this function, so they go in as text.
+    let sum_of = |terms: Vec<String>| if terms.is_empty() { "0".to_string() } else { terms.join(" + ") };
+    let band = sum_of(BUCKETS.iter().map(|b| format!("(m.rank >= {})", b.min)).collect());
+    let w = sum_of(since.iter().map(|s| format!("(m.game_datetime >= {s})")).collect());
+    let seg = sum_of(marks.iter().map(|m| format!("(m.rowid > {m})")).collect());
+    let min_rank = planned.iter().map(|j| j.1).min().unwrap();
+    let min_since = planned.iter().map(|j| j.2).min().unwrap();
+    for table in INC_TABLES {
+        tx.execute(&format!("DELETE FROM {table}"), [])?;
+    }
+    tx.execute(
+        &format!(
+            "INSERT INTO inc_b SELECT pa.id, pa.placement, pa.level, pa.comp_key, {band}, {w}, {seg}
+             FROM participants pa JOIN matches m ON m.match_id = pa.match_id
+             WHERE m.patch = ? AND m.rank >= ? AND m.game_datetime >= ?"
+        ),
+        params![patch, min_rank, min_since],
+    )?;
+    let need: Vec<String> =
+        planned.iter().map(|(j, ..)| format!("(band >= {} AND w >= {} AND seg >= {})", j.band, j.w, j.seg)).collect();
+    tx.execute(
+        &format!("INSERT INTO inc_r SELECT id, placement, band, w, seg FROM inc_b WHERE {}", need.join(" OR ")),
+        [],
+    )?;
+    for sql in INC_RATES.iter().chain(INC_COMPS.iter()) {
+        tx.execute(sql, [])?;
+    }
+    for (job, ..) in &mut planned {
+        job.comps =
+            tx.query_row("SELECT COUNT(*) FROM inc_b WHERE band >= ? AND w >= ?", params![job.band, job.w], |r| r.get(0))?;
+    }
+    tx.commit()?;
+
+    for (i, (job, ..)) in planned.iter().enumerate() {
+        let t = if i == 0 { t0 } else { Instant::now() };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        write_scope(&tx, patch, job)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO stat_watermark (scope, last_rowid, built_at) VALUES (?, ?, ?)",
+            params![watermark_key(patch, &job.scope), top, now_ms()],
+        )?;
+        tx.commit()?;
+        log(&format!(
+            "patch {patch}  {:<13} {:>8} matches  {:<5}  {:.1} s",
+            job.scope,
+            job.matches,
+            if job.add { "added" } else { "full" },
+            t.elapsed().as_secs_f64()
+        ));
+        touched.push(watermark_key(patch, &job.scope));
+    }
+    Ok(())
+}
+
+/// Writes one scope from the sums per tag, inside the caller's transaction.
+fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
+    let k = params![patch, job.scope];
+    if job.add {
+        db.execute(
+            "UPDATE stat_meta SET matches = ?, comps = ?, built_at = ? WHERE patch = ? AND bucket = ?",
+            params![job.matches, job.comps, now_ms(), patch, job.scope],
+        )?;
+        db.execute("DELETE FROM stat_units WHERE patch = ? AND bucket = ?", k)?;
+        db.execute("DELETE FROM stat_traits WHERE patch = ? AND bucket = ? AND tier_current = 0", k)?;
+        for table in ["stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels"] {
+            db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), k)?;
+        }
+    } else {
+        for table in STAT_TABLES {
+            db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), k)?;
+        }
+        db.execute("INSERT INTO stat_meta VALUES (?,?,?,?,?)", params![patch, job.scope, job.matches, job.comps, now_ms()])?;
+        if job.comps == 0 {
+            return Ok(());
+        }
+    }
+
+    // Rates: the covered tags added up, and added to what is stored (nothing, for a rebuilt scope).
+    for (table, sums, keys) in RATE_SUMS {
+        let traits = table == "stat_traits";
+        let (col, sel, upd) = if traits {
+            (", num_units", ", MIN(num_units)", ", num_units = MIN(num_units, excluded.num_units)")
+        } else {
+            ("", "", "")
+        };
         db.execute(
             &format!(
-                "INSERT INTO {table} (patch, bucket, {cols}) SELECT patch, ?3, {cols} FROM {table} WHERE patch = ?1 AND bucket = ?2
+                "INSERT INTO {table} (patch, bucket, {keys}{col}, games, sum_place, wins, top4)
+                 SELECT ?1, ?2, {keys}{sel}, SUM(games), SUM(sum_place), SUM(wins), SUM(top4) FROM {sums}
+                 WHERE band >= ?3 AND w >= ?4 AND seg >= ?5 GROUP BY {keys}
                  ON CONFLICT DO UPDATE SET games = games + excluded.games, sum_place = sum_place + excluded.sum_place,
-                   wins = wins + excluded.wins, top4 = top4 + excluded.top4{min}"
+                   wins = wins + excluded.wins, top4 = top4 + excluded.top4{upd}"
             ),
-            params![patch, scratch, scope],
+            params![patch, job.scope, job.band, job.w, job.seg],
         )?;
     }
-    for table in STAT_TABLES {
-        db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), ks)?;
+    build_derived(db, patch, &job.scope)?;
+    if job.comps > 0 {
+        write_comps(db, patch, job)?;
     }
+    Ok(())
+}
 
-    // Derived rows and columns, from the new sums.
-    db.execute("DELETE FROM stat_units WHERE patch = ? AND bucket = ?", k)?;
-    db.execute("DELETE FROM stat_traits WHERE patch = ? AND bucket = ? AND tier_current = 0", k)?;
-    build_derived(db, patch, scope)?;
+/// [`build_comps`] for one scope, from the comp sums per stored label instead of from the boards. The queries
+/// keep the same shape (group by label, then order by games, then limit), so labels with the same number of
+/// games come out in the same order as in a full rebuild.
+fn write_comps(db: &Connection, patch: &str, job: &Job) -> Result<()> {
+    let min_games = COMP_MIN_GAMES.max(((job.comps as f64) * COMP_MIN_SHARE).ceil() as i64);
+    db.execute_batch("DELETE FROM inc_cand; DELETE FROM inc_map; DELETE FROM inc_top")?;
+    merge_lookalike_sums(db, job, min_games)?;
 
-    // Comps, from every board in the scope.
-    for table in ["stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels"] {
-        db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), k)?;
-    }
-    db.execute_batch("DELETE FROM p")?;
+    // A label's sums, under the label it was merged into.
+    let merged = |sums: &str, cols: &str| {
+        format!(
+            "SELECT COALESCE(m.dst, c.comp_key) comp_key, {cols} FROM {sums} c LEFT JOIN inc_map m ON m.src = c.comp_key
+             WHERE c.band >= ?3 AND c.w >= ?4"
+        )
+    };
+    let k4 = params![patch, job.scope, job.band, job.w];
     db.execute(
-        "INSERT INTO p SELECT pa.id, pa.placement, pa.level, pa.comp_key FROM participants pa
-         JOIN matches m ON m.match_id = pa.match_id
-         WHERE m.patch = ? AND m.rank >= ? AND m.game_datetime >= 0",
-        params![patch, min_rank],
+        &format!(
+            "INSERT INTO stat_comps
+             SELECT ?1, ?2, comp_key, SUM(n), SUM(sum_place), SUM(wins), SUM(top4), SUM(sum_level)
+             FROM ({}) GROUP BY comp_key HAVING SUM(n) >= ?5 ORDER BY SUM(n) DESC LIMIT ?6",
+            merged("inc_comps", "n, sum_place, wins, top4, sum_level")
+        ),
+        params![patch, job.scope, job.band, job.w, min_games, COMP_LIMIT],
     )?;
-    let comps: i64 = db.query_row("SELECT comps FROM stat_meta WHERE patch = ? AND bucket = ?", k, |r| r.get(0))?;
-    if comps > 0 {
-        build_comps(db, patch, scope, comps)?;
+    db.execute("INSERT INTO inc_top SELECT comp_key FROM stat_comps WHERE patch = ? AND bucket = ?", params![patch, job.scope])?;
+    db.execute(
+        &format!(
+            "INSERT INTO stat_comp_units
+             SELECT ?1, ?2, comp_key, character_id, SUM(games), SUM(sum_star), SUM(sum_items), SUM(full_items), SUM(sum_place)
+             FROM ({}) JOIN inc_top USING (comp_key) GROUP BY comp_key, character_id",
+            merged("inc_comp_units", "character_id, games, sum_star, sum_items, full_items, sum_place")
+        ),
+        k4,
+    )?;
+    db.execute(
+        &format!(
+            "INSERT INTO stat_comp_items
+             SELECT ?1, ?2, comp_key, character_id, item, SUM(games), SUM(sum_place)
+             FROM ({}) JOIN inc_top USING (comp_key) GROUP BY comp_key, character_id, item",
+            merged("inc_comp_items", "character_id, item, games, sum_place")
+        ),
+        k4,
+    )?;
+    db.execute(
+        &format!(
+            "INSERT INTO stat_comp_traits
+             SELECT ?1, ?2, comp_key, name, tier_current, MIN(num_units), MAX(style), SUM(games)
+             FROM ({}) JOIN inc_top USING (comp_key) GROUP BY comp_key, name, tier_current",
+            merged("inc_comp_traits", "name, tier_current, num_units, style, games")
+        ),
+        k4,
+    )?;
+    db.execute(
+        &format!(
+            "INSERT INTO stat_comp_levels
+             SELECT ?1, ?2, comp_key, level, SUM(games), SUM(sum_place)
+             FROM ({}) JOIN inc_top USING (comp_key) GROUP BY comp_key, level",
+            merged("inc_comp_levels", "level, games, sum_place")
+        ),
+        k4,
+    )?;
+    Ok(())
+}
+
+/// [`merge_lookalikes`] from the comp sums: the same candidates, core units and folding, written to inc_map
+/// (stored label to the label it folds into) instead of relabelling boards.
+fn merge_lookalike_sums(db: &Connection, job: &Job, min_games: i64) -> Result<()> {
+    let keys: Vec<(String, i64)> = db
+        .prepare(
+            "SELECT comp_key, SUM(n) games FROM inc_comps WHERE band >= ?1 AND w >= ?2
+             GROUP BY comp_key HAVING SUM(n) >= ?3 ORDER BY games DESC LIMIT 400",
+        )?
+        .query_map(params![job.band, job.w, 3.max(min_games / 4)], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if keys.len() < 2 {
+        return Ok(());
+    }
+    {
+        let mut add = db.prepare("INSERT INTO inc_cand VALUES (?)")?;
+        for (key, _) in &keys {
+            add.execute([key])?;
+        }
+    }
+    let games: HashMap<&str, i64> = keys.iter().map(|(k, g)| (k.as_str(), *g)).collect();
+    let mut core: HashMap<String, HashSet<String>> = HashMap::new();
+    {
+        let mut freq = db.prepare(
+            "SELECT comp_key, character_id, SUM(games) FROM inc_comp_units JOIN inc_cand USING (comp_key)
+             WHERE band >= ?1 AND w >= ?2 GROUP BY comp_key, character_id",
+        )?;
+        let mut rows = freq.query(params![job.band, job.w])?;
+        while let Some(r) = rows.next()? {
+            let (key, unit, n): (String, String, i64) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            if (n as f64) / (games[key.as_str()] as f64) < 0.5 {
+                continue;
+            }
+            core.entry(key).or_default().insert(unit);
+        }
+    }
+
+    let empty = HashSet::new();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut remap = db.prepare("INSERT INTO inc_map VALUES (?, ?)")?;
+    for (key, _) in &keys {
+        let mine = core.get(key).unwrap_or(&empty);
+        let twin = kept.iter().find(|other| {
+            let theirs = &core[**other];
+            let shared = mine.intersection(theirs).count();
+            let union = mine.union(theirs).count();
+            union > 0 && (shared as f64) / (union as f64) >= 0.75
+        });
+        if let Some(twin) = twin {
+            remap.execute([key.as_str(), *twin])?;
+        } else if !mine.is_empty() {
+            kept.push(key);
+        }
     }
     Ok(())
 }
@@ -885,6 +1159,87 @@ mod incremental_tests {
         build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
         drop(fresh);
         assert_same_stats(&conn, &fresh_dir.join("t.db"));
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&fresh_dir).unwrap();
+    }
+
+    /// Boards straight into the tables, eight to a match (rank 8, an hour ago): (comp label, units) each.
+    fn add_boards(conn: &Connection, first_match: usize, boards: &[(String, Vec<String>)]) {
+        let now = now_ms();
+        for (i, (comp, units)) in boards.iter().enumerate() {
+            let m = format!("T{}", first_match + i / 8);
+            conn.execute("INSERT OR IGNORE INTO matches VALUES (?, 'na1', '91.1', 99, ?, 2000, 8)", params![m, now - 3_600_000])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO participants (match_id, puuid, placement, level, comp_key) VALUES (?, ?, ?, ?, ?)",
+                params![m, format!("{m}-{i}"), 1 + (i % 8) as i64, 7 + (i % 3) as i64, comp],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            for u in units {
+                conn.execute("INSERT INTO units VALUES (?, ?, 2, 3, NULL, 1)", params![id, u]).unwrap();
+                conn.execute("INSERT INTO unit_items VALUES (?, ?, 'I1')", params![id, u]).unwrap();
+            }
+            conn.execute("INSERT INTO traits VALUES (?, 'T', 3, 1, 1)", [id]).unwrap();
+        }
+    }
+
+    /// Comps with the same number of games: which labels make the 400 merge candidates, which label of a
+    /// look-alike pair the other folds into, and which make the top 120, all depend on the order of ties. The
+    /// incremental build must break them the way a full rebuild does.
+    #[test]
+    fn tied_comp_counts_come_out_as_in_a_full_rebuild() {
+        // 60 look-alike pairs (P|A and P|B share their units), 4 boards per label, and 300 single labels with
+        // 5 boards. Candidates need 3 boards: 420 labels, so 20 of the tied pairs' labels miss the cut of 400 and
+        // their pairs are not merged. The merged pairs (8 boards) get rows; the singles (5) tie for the rest of
+        // the top 120.
+        let mut labels: Vec<(String, Vec<String>, usize)> = Vec::new();
+        for j in 0..60 {
+            let units: Vec<String> = (0..4).map(|u| format!("P{j:03}u{u}")).collect();
+            labels.push((format!("P{j:03}|A"), units.clone(), 4));
+            labels.push((format!("P{j:03}|B"), units, 4));
+        }
+        for k in 0..300 {
+            labels.push((format!("L{k:03}"), (0..4).map(|u| format!("L{k:03}u{u}")).collect(), 5));
+        }
+        // Not in label order, so the order boards are stored in differs from the order labels sort in.
+        let n = labels.len();
+        let shuffled: Vec<_> = (0..n).map(|i| &labels[(i * 11) % n]).collect(); // 11 and 420 share no factor
+        let first: Vec<(String, Vec<String>)> =
+            shuffled.iter().flat_map(|(c, u, _)| std::iter::repeat_n((c.clone(), u.clone()), 2)).collect();
+        let more: Vec<(String, Vec<String>)> =
+            shuffled.iter().rev().flat_map(|(c, u, g)| std::iter::repeat_n((c.clone(), u.clone()), g - 2)).collect();
+
+        let (dir, mut conn) = fresh_db("ties");
+        add_boards(&conn, 0, &first);
+        build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
+        let next = first.len().div_ceil(8);
+        add_boards(&conn, next, &more);
+        let mut lines = Vec::new();
+        build_stats_incremental_with(&mut conn, 2, &mut |s| lines.push(s.to_string())).unwrap();
+        assert!(lines.iter().any(|l| l.contains(" ALL ") && l.contains("added")), "{lines:?}");
+
+        let (fresh_dir, mut fresh) = fresh_db("ties-fresh");
+        add_boards(&fresh, 0, &first);
+        add_boards(&fresh, next, &more);
+        build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
+        drop(fresh);
+        assert_same_stats(&conn, &fresh_dir.join("t.db"));
+
+        // The ties were real: some pairs were split by the cut, and the singles were picked from more than fit.
+        let top: Vec<(String, i64)> = conn
+            .prepare("SELECT comp_key, games FROM stat_comps WHERE bucket = 'ALL'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(top.len(), 120);
+        let pairs = top.iter().filter(|(k, g)| k.starts_with('P') && *g == 8).count();
+        let singles = top.iter().filter(|(k, g)| k.starts_with('L') && *g == 5).count();
+        assert_eq!(pairs + singles, 120, "{top:?}");
+        assert!(pairs > 0 && pairs < 60, "{pairs} merged pairs: the cut of 400 should split some");
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&fresh_dir).unwrap();
