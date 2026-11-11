@@ -1,14 +1,24 @@
-//! Collects ranked TFT matches into the local database. Same behaviour as `src/crawler/crawl.ts`.
+//! Collects ranked TFT matches into the local database. Stores what `src/crawler/crawl.ts` stores, with two
+//! deliberate differences, both about stopping and starting again:
+//!
+//! - A server whose ladders were not read to the end (killed mid-seed) has its ladders read again on the next run
+//!   (`seed_pending`). The TypeScript crawler reads ladders only when it knows no players for that server
+//!   or is given `--reseed`.
+//! - A match answer that was cut off on the way is fetched again, up to 3 times per run, then left queued for the
+//!   next run. The TypeScript crawler stops on it.
 //!
 //! It is safe to stop and restart at any time: the queue and progress live in the database.
+//!
+//! Test only: `TFT_DIE_AT=<point>:<n>` aborts the process at an exact point between database writes, for
+//! `scripts/resume.ts`. See [`die_at`]. It does nothing unless that variable is set.
 
 use crate::cdragon::fetch_calendar;
 use crate::client::{RiotClient, RiotError, http_client};
 use anyhow::{Result, bail};
 use futures::future::join_all;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tft_core::config::{Config, TIERS, platform_route, tier_name, tier_rank};
 use tft_core::patches::Calendar;
@@ -22,6 +32,12 @@ const RECRAWL_MS: i64 = 6 * 3600 * 1000;
 /// a rejection of that same key means it has expired, so it is reported at once instead of after the
 /// 2-minute activation wait.
 const KEY_OK: &str = "riot_key_ok";
+
+/// Settings key: servers whose ladders were not read to the end (the crawler was stopped or killed).
+const SEED_PENDING: &str = "seed_pending";
+
+/// A match whose answer is cut off this many times in one run is left queued for the next run.
+const CUT_OFF_LIMIT: u32 = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct CrawlOptions {
@@ -45,6 +61,31 @@ pub struct Crawler {
     key_failed: AtomicBool,
     /// The key's fingerprint is in `kv` already.
     key_saved: AtomicBool,
+    /// How often each match's answer was cut off in this run.
+    cut_off: Mutex<HashMap<String, u32>>,
+}
+
+/// Test only, for `scripts/resume.ts`. With `TFT_DIE_AT=<point>:<n>` set, the nth time this run reaches `point`
+/// it prints `TFT_DIE_AT <point>:<n> <what>` to stderr and aborts, so a kill lands exactly between two database
+/// writes. Points: `after_ladder` (a ladder page is saved), `after_seed` (a server's ladders are all saved, before
+/// it leaves `seed_pending`), `after_enqueue` (one player's match list is queued), `before_store` (a match is
+/// downloaded, before its store), `after_store` (its store is committed, before its queue status is set).
+/// Does nothing when the variable is not set.
+fn die_at(point: &str, what: &str) {
+    static PLAN: OnceLock<Option<(String, u64)>> = OnceLock::new();
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    let plan = PLAN.get_or_init(|| {
+        let v = std::env::var("TFT_DIE_AT").ok()?;
+        let (p, n) = v.rsplit_once(':')?;
+        Some((p.to_string(), n.parse().ok()?))
+    });
+    if let Some((p, n)) = plan
+        && p == point
+        && HITS.fetch_add(1, Ordering::SeqCst) + 1 == *n
+    {
+        eprintln!("TFT_DIE_AT {point}:{n} {what}");
+        std::process::abort();
+    }
 }
 
 fn now_ms() -> i64 {
@@ -74,6 +115,7 @@ impl Crawler {
             stop,
             key_failed: AtomicBool::new(false),
             key_saved: AtomicBool::new(known),
+            cut_off: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -137,11 +179,18 @@ impl Crawler {
                 [platform],
                 |r| r.get(0),
             )?;
-            if have == 0 || self.opts.reseed {
+            // A kill while reading the ladders leaves the platform in SEED_PENDING, so the next run reads them again.
+            let pending: Vec<String> = kv_get(&self.db.lock().unwrap(), SEED_PENDING)?.unwrap_or_default();
+            if have == 0 || self.opts.reseed || pending.contains(platform) {
+                self.set_seed_pending(platform, true)?;
                 println!("[{platform}] reading ladders...");
                 let seeded = self.seed(platform).await;
                 self.remember_key()?;
                 seeded?;
+                if !self.stopping() {
+                    die_at("after_seed", platform);
+                    self.set_seed_pending(platform, false)?;
+                }
             }
         }
 
@@ -211,6 +260,22 @@ impl Crawler {
         }
     }
 
+    /// Adds or removes a platform from the list of servers whose ladders were not read to the end.
+    fn set_seed_pending(&self, platform: &str, unfinished: bool) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        let mut pending: Vec<String> = kv_get(&db, SEED_PENDING)?.unwrap_or_default();
+        pending.retain(|p| p != platform);
+        if unfinished {
+            pending.push(platform.to_string());
+        }
+        if pending.is_empty() {
+            db.execute("DELETE FROM kv WHERE key = ?1", [SEED_PENDING])?;
+        } else {
+            kv_set(&db, SEED_PENDING, &pending)?;
+        }
+        Ok(())
+    }
+
     /// Fills the player list for one server from its ranked ladders.
     async fn seed(&self, platform: &str) -> Result<()> {
         let save = |entries: &[LeagueEntry], tier: &str| -> Result<usize> {
@@ -230,6 +295,7 @@ impl Crawler {
                 }
             }
             tx.commit()?;
+            die_at("after_ladder", &format!("{platform}/{tier}"));
             Ok(n)
         };
 
@@ -292,12 +358,21 @@ impl Crawler {
         Ok(())
     }
 
+    /// Queued matches this run still has to fetch (the ones held back after repeated cut-offs are left out).
     fn pending(&self, route: &str) -> Result<i64> {
         Ok(self.db.lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM match_queue WHERE route = ?1 AND status = 0",
-            [route],
+            "SELECT COUNT(*) FROM match_queue WHERE route = ?1 AND status = 0
+             AND match_id NOT IN (SELECT value FROM json_each(?2))",
+            params![route, self.held_back()?],
             |r| r.get(0),
         )?)
+    }
+
+    /// Matches whose answer was cut off too often in this run, as a JSON list. They stay queued for the next run.
+    fn held_back(&self) -> Result<String> {
+        let cut_off = self.cut_off.lock().unwrap();
+        let ids: Vec<&String> = cut_off.iter().filter(|(_, n)| **n >= CUT_OFF_LIMIT).map(|(id, _)| id).collect();
+        Ok(serde_json::to_string(&ids)?)
     }
 
     /// One round: top up the queue, then fetch a batch of matches. Returns true when `--once` is satisfied.
@@ -347,6 +422,7 @@ impl Crawler {
                                 tx.execute("UPDATE players SET last_crawled = ?1 WHERE puuid = ?2", params![now_ms(), puuid])?;
                             }
                             tx.commit()?;
+                            die_at("after_enqueue", puuid);
                         }
                         Err(e) => {
                             first_err.get_or_insert(e);
@@ -362,9 +438,10 @@ impl Crawler {
         let batch: Vec<(String, String, i64)> = {
             let db = self.db.lock().unwrap();
             let mut q = db.prepare_cached(
-                "SELECT match_id, platform, seed_rank FROM match_queue WHERE route = ?1 AND status = 0 LIMIT ?2",
+                "SELECT match_id, platform, seed_rank FROM match_queue WHERE route = ?1 AND status = 0
+                 AND match_id NOT IN (SELECT value FROM json_each(?2)) LIMIT ?3",
             )?;
-            q.query_map(params![route, 20], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            q.query_map(params![route, self.held_back()?, 20], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite_result::Result<_>>()?
         };
 
@@ -385,6 +462,20 @@ impl Crawler {
             let m = match got {
                 None => continue,
                 Some(Ok(m)) => m,
+                // The answer was cut off (laptop asleep, connection dropped): leave it queued to fetch again.
+                Some(Err(RiotError::BadBody { source, .. })) if !riot_sent_garbage(&source) => {
+                    let mut cut_off = self.cut_off.lock().unwrap();
+                    let n = cut_off.entry(id.clone()).or_default();
+                    *n += 1;
+                    if *n < CUT_OFF_LIMIT {
+                        println!("[{route}] the answer for {id} was cut off. It will be fetched again.");
+                    } else {
+                        println!(
+                            "[{route}] the answer for {id} was cut off {n} times. Leaving it queued for the next run."
+                        );
+                    }
+                    continue;
+                }
                 Some(Err(RiotError::BadBody { url, source })) => {
                     println!("[{route}] skipped {id}: Riot sent an unreadable answer ({source}) for {url}");
                     set_status(id, 2)?;
@@ -408,8 +499,10 @@ impl Crawler {
             let ingest = Ingest { platform, rank: *seed_rank, tier: tier_name(*seed_rank), snowball: self.config.snowball };
             let added = {
                 let cal = self.calendar.read().unwrap();
+                die_at("before_store", id);
                 ingest.store(&mut self.db.lock().unwrap(), &m, &cal)?
             };
+            die_at("after_store", id);
             if added {
                 self.stored.fetch_add(1, Ordering::Relaxed);
             }
@@ -420,6 +513,12 @@ impl Crawler {
         }
         Ok(false)
     }
+}
+
+/// True when Riot's whole answer arrived but was not readable JSON, so fetching it again gives the same.
+/// False when the answer was cut off on the way, which is worth another try.
+fn riot_sent_garbage(e: &reqwest::Error) -> bool {
+    std::error::Error::source(e).is_some_and(|s| s.is::<serde_json::Error>())
 }
 
 mod rusqlite_result {
@@ -549,6 +648,7 @@ mod tests {
             stop: Arc::default(),
             key_failed: AtomicBool::new(false),
             key_saved: AtomicBool::new(false),
+            cut_off: Mutex::new(HashMap::new()),
         });
         let status = |c: &Crawler| -> i64 {
             let db = c.db.lock().unwrap();
@@ -736,5 +836,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM match_queue WHERE route = 'europe' AND status = 0", [], |r| r.get(0))
             .unwrap();
         assert!(europe_left >= 80, "europe kept crawling: only {europe_left} matches left in its queue");
+    }
+
+    /// Serves one answer whose body is `body`, announced as `length` bytes long, then hangs up.
+    async fn answer_once(body: &'static str, length: usize) -> reqwest::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {length}\r\n\r\n");
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body.as_bytes()).await.unwrap();
+            sock.shutdown().await.unwrap();
+        });
+        let res = crate::client::http_client().get(format!("http://127.0.0.1:{port}/")).send().await.unwrap();
+        res.json::<serde_json::Value>().await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_answer_is_fetched_again() {
+        assert!(!riot_sent_garbage(&answer_once("{\"metadata\":", 500).await));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_answer_is_skipped() {
+        assert!(riot_sent_garbage(&answer_once("not json", 8).await));
     }
 }
