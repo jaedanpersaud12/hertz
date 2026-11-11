@@ -18,6 +18,8 @@
  *    body. Then the routes that change things, step by step, with the answers and every table they write after
  *    each step, and the number of requests sent to the fake Riot API.
  * 5. Dev stress switch: `tft serve --dev` with ?data=worst | empty | one | many and odd values.
+ *    The Data page's engine routes (/api/health, /api/settings/crawl and its reset) have no TypeScript twin;
+ *    they were recorded from the Rust engine when they were added to these files.
  * 6. Tools: `tft recluster` on boards that lost their labels and on a database made before comps existed, and
  *    `tft refresh` storing the fake set data from a fake Community Dragon (data compared parsed).
  *
@@ -25,7 +27,9 @@
  * during the run; stat_meta.built_at (set to one fixed time before serving, where parity copied it across).
  * New because a recording outlives the run that made it: times made from this run's clock. The fake world's
  * match times are written relative to WORLD_NOW (an hour before it is -3600000), and the times the stress
- * switch makes from Date.now() are written as "now-400d" and "now-1d".
+ * switch makes from Date.now() are written as "now-400d" or "now-12m". /api/health's statsAgeMinutes, which grows
+ * with the clock, is written as "statsBuiltAt" when it is the minutes since statsBuiltAt, and its newestMatchAt (when
+ * a match was stored) as "during this run".
  *
  * Updating the golden files changes what the engine is checked against. Per hard rule 2 in CLAUDE.md, that is
  * its own explicit story ("change what X means"), never a way to make a failing gate pass: run --update only in
@@ -48,6 +52,7 @@ const root = join(import.meta.dirname, '..')
 const goldenDir = join(root, 'test', 'golden')
 const bin = join(root, 'target', 'debug', process.platform === 'win32' ? 'tft.exe' : 'tft')
 const DAY = 86_400_000
+const RUN_START = Date.now()
 const STAT_TABLES = [
   'stat_meta', 'stat_units', 'stat_unit_dist', 'stat_traits', 'stat_items', 'stat_unit_items', 'stat_unit_builds',
   'stat_comps', 'stat_comp_units', 'stat_comp_items', 'stat_comp_traits', 'stat_comp_levels',
@@ -203,6 +208,28 @@ const stop = (child: ChildProcess) =>
     child.on('exit', () => resolve())
     child.kill()
   })
+
+/** Times the stress switch makes from Date.now(), written relative to now: whole days, else whole minutes. */
+function fromNow(x: unknown) {
+  if (typeof x !== 'number' || x < 1e12) return x
+  const diff = x - Date.now()
+  const days = Math.round(diff / DAY)
+  if (Math.abs(diff - days * DAY) < 120_000) return `now${days < 0 ? '' : '+'}${days}d`
+  const mins = Math.round(diff / 60_000)
+  return Math.abs(diff - mins * 60_000) < 5_000 && Math.abs(mins) < 24 * 60 ? `now${mins < 0 ? '' : '+'}${mins}m` : x
+}
+
+/**
+ * /api/health: statsAgeMinutes grows with the clock, recorded as "statsBuiltAt" when it is the minutes since then.
+ * newestMatchAt is when a match was stored, recorded as "during this run" when it falls inside this run.
+ */
+function settleHealth(j: any) {
+  if (typeof j?.newestMatchAt === 'number' && j.newestMatchAt >= RUN_START && j.newestMatchAt <= Date.now()) j.newestMatchAt = 'during this run'
+  if (typeof j?.statsAgeMinutes === 'number' && typeof j.statsBuiltAt === 'number') {
+    const age = Math.floor((Date.now() - j.statsBuiltAt) / 60_000)
+    if (Math.abs(j.statsAgeMinutes - age) <= 1) j.statsAgeMinutes = 'statsBuiltAt'
+  }
+}
 
 /** An answer as recorded: JSON bodies parsed, other bodies as text (or base64 when they are not UTF-8). */
 function reply(r: Reply, edit?: (j: any) => void) {
@@ -518,6 +545,8 @@ function apiChecks(db: Database.Database, phase: 'bare' | 'full', icons: { ok: s
     add('/api/explore', '/api/explore?units=TFT99_Unit6', (b) => b.summary.games > 0)
     add('/api/lists', '/api/lists')
     add('/api/icon/:kind/:id', '/api/icon/unit/TFT99_Unit1')
+    add('/api/health', '/api/health', (b) => Array.isArray(b.regions))
+    add('/api/settings/crawl', '/api/settings/crawl', (b) => b.saved === false)
     for (const url of ['/', '/comps', '/api/nothing', '/api/comps/', '/api/comps/a/b']) add('no built app: 404', url)
     return checks
   }
@@ -597,6 +626,12 @@ function apiChecks(db: Database.Database, phase: 'bare' | 'full', icons: { ok: s
   add('cut-offs', '/api/explore?units=TFT98_U0,TFT98_W3&patch=98.1&bucket=MASTER%2B', (b) => b.summary.games === 3)
 
   add('/api/static', '/api/static', (b) => b.loaded === true && b.units.length > 0 && b.items.length > 0)
+  // The Data page's engine routes. Queries are ignored.
+  add('/api/health', '/api/health', (b) => b.regions.length > 0 && b.rankAccuracy.perBucket.length === 4 && typeof b.statsBuiltAt === 'number')
+  add('/api/health', '/api/health?patch=nope&data=worst')
+  add('/api/settings/crawl', '/api/settings/crawl', (b) => b.platforms.length > 0 && b.serverOptions.length > 0 && b.tierOptions.length > 0)
+  add('/api/settings/crawl', '/api/settings/crawl?data=worst')
+  add('/api/settings/crawl', '/api/settings/crawl/reset') // a GET: no such route
   add('/api/lists', '/api/lists', (b) => b.favs.length > 0 && b.hidden.length > 0 && b.pinned && b.teams.length > 0)
 
   // Icons: downloaded, served from the cache on the second request, origin 404, origin unreachable, already cached
@@ -626,6 +661,7 @@ async function recordUrls(section: string, port: number, checks: Check[]) {
     const r = reply(await httpGet(port, c.url), (j) => {
       // The Explorer reports how long its query took; only its presence is comparable.
       if ('ms' in j) j.ms = typeof j.ms === 'number' && j.ms >= 0 ? 0 : j.ms
+      settleHealth(j)
     })
     if (c.has) {
       if (mustHave(`GET ${c.url}`, (r as any).json, c.has)) t.withData++
@@ -690,7 +726,7 @@ async function recordSteps(section: string, prefix: string, port: number, dbPath
       await new Promise((res) => setTimeout(res, 100))
       r = await httpSend(port, s.method, s.url, s.body)
     }
-    const answer = reply({ ...r, body: Buffer.from(settle(r.body.toString(), since)) })
+    const answer = reply({ ...r, body: Buffer.from(settle(r.body.toString(), since)) }, settleHealth)
     const json = (answer as any).json
     if (s.status !== undefined && r.status !== s.status) { bad.add(s.route); fail(label, `    answered ${r.status}, expected ${s.status}, so this step proves nothing`) }
     if (s.until && json !== undefined && !s.until(json)) { bad.add(s.route); fail(label, `    still waiting after 30 s: ${JSON.stringify(json).slice(0, 120)}`) }
@@ -801,6 +837,8 @@ async function writeSection(from: string, bare: string) {
   const me = (has?: (b: any) => boolean) => get('GET /api/me', '/api/me', has)
   const myMatches = (has?: (b: any) => boolean) => get('GET /api/me/matches', '/api/me/matches', has)
   const refresh = (has?: (b: any) => boolean) => post('POST /api/me/refresh', '/api/me/refresh', '', 200, has)
+  const settings = (has?: (b: any) => boolean) => get('GET /api/settings/crawl', '/api/settings/crawl', has)
+  const setSettings = (body: unknown, status: number, has?: (b: any) => boolean) => post('POST /api/settings/crawl', '/api/settings/crawl', body, status, has)
   // Teams saved within the same millisecond would tie on `created`; a short pause keeps the order meaningful.
   const pause: Step = { route: 'pause', db: () => { const end = Date.now() + 3; while (Date.now() < end); } }
   const typo = (b: any) => b.ok === false && typeof b.error === 'string'
@@ -847,6 +885,19 @@ async function writeSection(from: string, bare: string) {
     del('/api/teams/', 404), { route: 'DELETE /api/teams/:id', method: 'DELETE', url: '/api/teams', status: 404 },
     lists((b) => b.teams.length === 7),
     get('POST to a GET route', '/api/lists'), post('POST to a GET route', '/api/lists', {}, 404), post('POST to a GET route', '/api/me', {}, 404),
+
+    // What to crawl (Data page): saved in kv, refused changes are a 400 and save nothing, reset forgets them.
+    settings((b) => b.saved === false && b.platforms.length > 0),
+    setSettings({ platforms: ['kr', 'na1', 'kr'], tiers: ['master', 'CHALLENGER'] }, 200, (b) => b.saved === true), settings((b) => b.saved === true),
+    setSettings({ platforms: [], tiers: ['MASTER'] }, 400), setSettings({ tiers: ['MASTER'] }, 400), setSettings({ platforms: ['na1'], tiers: [] }, 400),
+    setSettings({ platforms: ['na1', 'mars1'], tiers: ['MASTER'] }, 400), setSettings({ platforms: ['na1'], tiers: ['WOOD'] }, 400),
+    setSettings({ platforms: 'na1', tiers: ['MASTER'] }, 400), setSettings({ platforms: ['na1', 3], tiers: ['MASTER'] }, 400),
+    setSettings('not json', 400), setSettings('[]', 400), setSettings({ platforms: null, tiers: null }, 400),
+    settings((b) => b.saved === true),
+    post('POST /api/settings/crawl/reset', '/api/settings/crawl/reset', '', 200, (b) => b.saved === false), settings((b) => b.saved === false),
+    post('POST /api/settings/crawl/reset', '/api/settings/crawl/reset', '', 200, (b) => b.saved === false),
+    { route: 'GET /api/settings/crawl', method: 'DELETE', url: '/api/settings/crawl', status: 404 },
+    get('GET /api/health', '/api/health', (b) => b.regions.length > 0),
 
     me((b) => b.configured === false && b.riotId === '' && b.platform === 'na1'),
     myMatches((b) => b.configured === false),
@@ -955,13 +1006,9 @@ async function stressSection(from: string, cwd: string) {
       `/api/comps/${enc('TFT98_Big|TFT98_U0')}?patch=98.1&min=1`, '/api/comps/nope', '/api/units', '/api/units/TFT99_Unit6', '/api/units/TFT98_U0?patch=98.1',
       '/api/units/nope', '/api/items', '/api/items/TFT_Item_Thing1', '/api/items/nope', '/api/traits', '/api/explore?units=TFT99_Unit6',
       '/api/explore?units=nope', '/api/explore', '/api/lists', '/api/me', '/api/me/matches', '/api/icon/unit/TFT99_Unit0', '/api/nothing', '/',
+      '/api/health', '/api/settings/crawl',
     ]
     const modes = ['worst', 'empty', 'one', 'many', '', 'bogus', 'WORST', 'worst&data=empty']
-    const fromNow = (x: unknown) => {
-      if (typeof x !== 'number' || x < 1e12) return x
-      const days = Math.round((x - Date.now()) / DAY)
-      return Math.abs(x - Date.now() - days * DAY) < 120_000 ? `now${days < 0 ? '' : '+'}${days}d` : x
-    }
     const plain = new Map<string, string>()
     for (const mode of modes) {
       let reshaped = 0
@@ -972,6 +1019,9 @@ async function stressSection(from: string, cwd: string) {
           if ('ms' in j) j.ms = 0
           if (j.totals && 'newest' in j.totals) j.totals.newest = fromNow(j.totals.newest)
           if (Array.isArray(j.teams)) for (const t of j.teams) if (t && 'created' in t) t.created = fromNow(t.created)
+          settleHealth(j)
+          for (const k of ['statsBuiltAt', 'newestMatchAt']) if (k in j) j[k] = fromNow(j[k])
+          if (j.lastProblem && 'at' in j.lastProblem) j.lastProblem.at = fromNow(j.lastProblem.at)
         })
         const text = JSON.stringify(entry)
         if (!mode) plain.set(base, text)
@@ -1142,9 +1192,12 @@ const fileText = (entries: Record<string, unknown>) => {
 function clockLeaks(section: string, entries: Record<string, unknown>) {
   const fixed = new Set([...CALENDAR.map((c) => c.since), Date.parse('2026-11-03T12:00:00Z'), Date.parse('2026-11-08T12:00:00Z')])
   const from = WORLD_NOW - 11 * DAY - 3_600_000 - 60_000
-  const leaks = [...fileText(entries).matchAll(/(?<![\d.])\d{13}(?![\d.])/g)].map((m) => Number(m[0]))
-    .filter((n) => n >= from && n <= Date.now() + 60_000 && !fixed.has(n) && !(n > Date.parse('2026-11-08T12:00:00Z') && n <= Date.parse('2026-11-08T12:00:05Z')))
-  if (leaks.length) fail(`${section}: run clock`, `    ${leaks.length} times from this run are not written relative to it, e.g. ${leaks[0]}`)
+  const text = fileText(entries)
+  const leaks = [...text.matchAll(/(?<![\d.])\d{13}(?![\d.])/g)].filter((m) => {
+    const n = Number(m[0])
+    return n >= from && n <= Date.now() + 60_000 && !fixed.has(n) && !(n > Date.parse('2026-11-08T12:00:00Z') && n <= Date.parse('2026-11-08T12:00:05Z'))
+  })
+  if (leaks.length) fail(`${section}: run clock`, `    ${leaks.length} times from this run are not written relative to it, e.g. ...${text.slice(Math.max(0, leaks[0].index! - 120), leaks[0].index! + 20)}`)
 }
 
 function finish() {
