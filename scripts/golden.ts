@@ -1018,6 +1018,7 @@ async function stressSection(from: string, cwd: string) {
       '/api/health', '/api/settings/crawl',
     ]
     const modes = ['worst', 'empty', 'one', 'many', '', 'bogus', 'WORST', 'worst&data=empty']
+    const SYNTHETIC = ['worst', 'empty', 'one', 'many', 'worst&data=empty']
     const plain = new Map<string, string>()
     for (const mode of modes) {
       let reshaped = 0
@@ -1028,6 +1029,10 @@ async function stressSection(from: string, cwd: string) {
           if ('ms' in j) j.ms = 0
           if (j.totals && 'newest' in j.totals) j.totals.newest = fromNow(j.totals.newest)
           if (Array.isArray(j.teams)) for (const t of j.teams) if (t && 'created' in t) t.created = fromNow(t.created)
+          // In the modes the stress switch reshapes, its times are synthetic (now minus a fixed gap), so they are
+          // written relative to now before settleHealth runs; otherwise newestMatchAt ("now - 30 s" in many) flipped
+          // to "during this run" whenever the run had lasted over 30 seconds. Plain answers keep the old order.
+          if (SYNTHETIC.includes(mode) && 'newestMatchAt' in j) j.newestMatchAt = fromNow(j.newestMatchAt)
           settleHealth(j)
           for (const k of ['statsBuiltAt', 'newestMatchAt']) if (k in j) j[k] = fromNow(j[k])
           if (j.lastProblem && 'at' in j.lastProblem) j.lastProblem.at = fromNow(j.lastProblem.at)
@@ -1037,7 +1042,7 @@ async function stressSection(from: string, cwd: string) {
         else if (plain.has(base) ? plain.get(base) !== text : true) reshaped++
         put('stress', `GET ${url}`, entry)
       }
-      if (mode && ['worst', 'empty', 'one', 'many', 'worst&data=empty'].includes(mode) && reshaped === 0) fail(`?data=${mode}`, '    no answer changed, so this proves nothing')
+      if (SYNTHETIC.includes(mode) && reshaped === 0) fail(`?data=${mode}`, '    no answer changed, so this proves nothing')
       else ok(`dev ?data=${mode || '(none)'}: ${urls.length} URLs`)
     }
     // A POST is never reshaped.
