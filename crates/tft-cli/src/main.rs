@@ -19,6 +19,8 @@
 //!
 //! Settings come from `.env` in the current folder, the same file the TypeScript engine reads.
 
+mod synth;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -97,6 +99,15 @@ enum Command {
     },
     /// Download the patch calendar and date matches stored before it was known.
     Patches,
+    /// Fill the database with synthetic matches at real-data scale, for timing the stats build. Developer use.
+    #[command(hide = true)]
+    Synth {
+        /// How many matches (8 boards each).
+        #[arg(long, default_value_t = 125_000)]
+        matches: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Rebuild the stat tables the app reads.
     Stats {
         /// How many of the most recent patches to rebuild.
@@ -172,6 +183,13 @@ fn main() {
 
 async fn run(command: Command, config: Config) -> Result<()> {
     match command {
+        Command::Synth { matches, seed } => {
+            let mut conn = tft_store::open(&config.db_path)?;
+            let t = std::time::Instant::now();
+            let n = synth::synth(&mut conn, matches, seed)?;
+            println!("Stored {n} synthetic matches in {:.1} s at {}", t.elapsed().as_secs_f64(), config.db_path.display());
+        }
+
         Command::Init => {
             tft_store::open(&config.db_path)?;
             println!("Database ready at {}", config.db_path.display());
