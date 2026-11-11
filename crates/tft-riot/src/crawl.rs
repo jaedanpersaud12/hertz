@@ -27,8 +27,8 @@ use tft_core::config::{Config, ROUTES, TIERS, platform_route, tier_name, tier_ra
 use tft_core::patches::Calendar;
 use tft_core::riot::LeagueEntry;
 use tft_store::{
-    Connection, CrawlSettings, Ingest, complete_sample, get_crawl_settings, is_sampled, kv_get, kv_set, load_calendar,
-    params, pending_samples, queue_sample, save_calendar, save_rank,
+    Connection, CrawlSettings, ERROR, Ingest, WARN, complete_sample, get_crawl_settings, is_sampled, kv_get, kv_set,
+    load_calendar, log_event, params, pending_samples, queue_sample, save_calendar, save_rank,
 };
 
 /// Look at the same player again after this long.
@@ -138,6 +138,12 @@ impl Crawler {
         }))
     }
 
+    /// Notes a warning or error in the engine log (E10) for the app's health view. A row that cannot be written is
+    /// only lost; it never stops the crawl. Must not be called while holding the database lock.
+    fn log(&self, region: &str, level: &str, message: &str) {
+        let _ = log_event(&self.db.lock().unwrap(), region, level, message);
+    }
+
     fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed) || self.key_failed.load(Ordering::Relaxed)
     }
@@ -203,7 +209,10 @@ impl Crawler {
         let settings = self.settings()?;
         let mut seeded = Seeded::new();
         for platform in &settings.platforms {
-            self.ensure_seeded(platform, &settings.tiers, self.opts.reseed, &mut seeded).await?;
+            if let Err(e) = self.ensure_seeded(platform, &settings.tiers, self.opts.reseed, &mut seeded).await {
+                self.log(platform, ERROR, &format!("Reading the ladders failed: {e:#}"));
+                return Err(e);
+            }
         }
 
         let mut routes: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
@@ -229,8 +238,11 @@ impl Crawler {
         // with no server chosen only checks the settings now and then.
         let results = join_all(ROUTES.into_iter().map(|route| {
             let me = Arc::clone(self);
-            let mine: Seeded =
-                seeded.iter().filter(|(p, _)| platform_route(p) == Some(route)).map(|(p, t)| (p.clone(), t.clone())).collect();
+            let mine: Seeded = seeded
+                .iter()
+                .filter(|(p, _)| platform_route(p) == Some(route))
+                .map(|(p, t)| (p.clone(), t.clone()))
+                .collect();
             async move { me.crawl_and_sample_with(route, None, mine).await }
         }))
         .await;
@@ -309,7 +321,8 @@ impl Crawler {
                     [platform],
                     |r| r.get(0),
                 )?;
-                // A kill while reading the ladders leaves the platform in SEED_PENDING, so the next run reads them again.
+                // A kill while reading the ladders leaves the platform in SEED_PENDING, so the next run reads them
+                // again.
                 let pending: Vec<String> = kv_get(&self.db.lock().unwrap(), SEED_PENDING)?.unwrap_or_default();
                 if have == 0 || reseed || pending.iter().any(|p| p == platform) {
                     tiers.to_vec()
@@ -411,14 +424,19 @@ impl Crawler {
                     // A key problem affects every group, so all of them stop, not only this one.
                     Some(RiotError::Key(_)) => {
                         self.key_failed.store(true, Ordering::Relaxed);
+                        self.log(route, ERROR, &e.to_string());
                         return Err(e);
                     }
                     // Nothing was marked as done, so the same players and matches are retried after the pause.
                     Some(RiotError::Unavailable(msg)) => {
                         println!("[{route}] {msg} Pausing this region for a minute.");
+                        self.log(route, WARN, &format!("{msg} Paused this region for a minute."));
                         self.pause(60).await;
                     }
-                    _ => return Err(e),
+                    _ => {
+                        self.log(route, ERROR, &format!("The crawl stopped: {e:#}"));
+                        return Err(e);
+                    }
                 },
             }
         }
@@ -524,7 +542,9 @@ impl Crawler {
                         }
                         Err(RiotError::Key(k)) => {
                             self.key_failed.store(true, Ordering::Relaxed);
-                            return Err(RiotError::Key(k).into());
+                            let e = RiotError::Key(k);
+                            let _ = log_event(&db, route, ERROR, &e.to_string());
+                            return Err(e.into());
                         }
                         Err(e) => {
                             failed.insert(id.clone(), tokio::time::Instant::now());
@@ -543,6 +563,7 @@ impl Crawler {
                 && !crawled.load(Ordering::Relaxed)
             {
                 println!("[{route}] {msg} Rank lookups wait a minute; the matches are kept for later.");
+                self.log(route, WARN, &format!("{msg} Rank lookups paused for a minute."));
                 self.pause(60).await;
             }
         }
@@ -635,7 +656,9 @@ impl Crawler {
                  AND match_id NOT IN (SELECT value FROM json_each(?2)) AND platform IN (SELECT value FROM json_each(?4))
                  LIMIT ?3",
             )?;
-            q.query_map(params![route, self.held_back()?, 20, platforms_json], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            q.query_map(params![route, self.held_back()?, 20, platforms_json], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
                 .collect::<rusqlite_result::Result<_>>()?
         };
 
@@ -658,20 +681,23 @@ impl Crawler {
                 Some(Ok(m)) => m,
                 // The answer was cut off (laptop asleep, connection dropped): leave it queued to fetch again.
                 Some(Err(RiotError::BadBody { source, .. })) if !riot_sent_garbage(&source) => {
-                    let mut cut_off = self.cut_off.lock().unwrap();
-                    let n = cut_off.entry(id.clone()).or_default();
-                    *n += 1;
-                    if *n < CUT_OFF_LIMIT {
-                        println!("[{route}] the answer for {id} was cut off. It will be fetched again.");
-                    } else {
-                        println!(
-                            "[{route}] the answer for {id} was cut off {n} times. Leaving it queued for the next run."
-                        );
-                    }
+                    let note = {
+                        let mut cut_off = self.cut_off.lock().unwrap();
+                        let n = cut_off.entry(id.clone()).or_default();
+                        *n += 1;
+                        if *n < CUT_OFF_LIMIT {
+                            format!("The answer for {id} was cut off. It will be fetched again.")
+                        } else {
+                            format!("The answer for {id} was cut off {n} times. Leaving it queued for the next run.")
+                        }
+                    };
+                    println!("[{route}] {}{}", note[..1].to_lowercase(), &note[1..]);
+                    self.log(route, WARN, &note);
                     continue;
                 }
                 Some(Err(RiotError::BadBody { url, source })) => {
                     println!("[{route}] skipped {id}: Riot sent an unreadable answer ({source}) for {url}");
+                    self.log(route, WARN, &format!("Skipped {id}: Riot sent an unreadable answer ({source})."));
                     set_status(id, 2)?;
                     continue;
                 }
@@ -1063,6 +1089,79 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_answer_is_skipped() {
         assert!(riot_sent_garbage(&answer_once("not json", 8).await));
+    }
+
+    // ---- The engine log (E10) -------------------------------------------------------------------
+
+    fn log_rows(c: &Crawler) -> Vec<(String, String, String)> {
+        let db = c.db.lock().unwrap();
+        let mut q = db.prepare("SELECT region, level, message FROM engine_log ORDER BY rowid").unwrap();
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect()
+    }
+
+    /// A Riot outage that pauses a group is a warning; a refused key is an error. Both land in `engine_log` with
+    /// their routing group, and the health view's last error is the newest of them.
+    #[tokio::test(start_paused = true)]
+    async fn riot_unavailable_pauses_and_key_errors_land_in_the_engine_log() {
+        let (base, _) = serve(riot).await;
+        let conn = sample_db();
+        queue(&conn, "NA1_1", "americas", "na1");
+        let crawler = crawler_on(conn, &base, KEY);
+        crawler.crawl_route("americas", vec!["na1".into()]).await.unwrap();
+        let rows = log_rows(&crawler);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("americas", WARN));
+        assert!(rows[0].2.ends_with("Paused this region for a minute."), "{}", rows[0].2);
+
+        let (base, _) = serve(americas_rejected).await;
+        let conn = take_db(crawler);
+        queue(&conn, "NA1_2", "americas", "na1");
+        let crawler = crawler_on(conn, &base, KEY);
+        crawler.riot.set_key_worked();
+        let err = crawler.crawl_route("americas", vec!["na1".into()]).await.unwrap_err();
+        let rows = log_rows(&crawler);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1], ("americas".to_string(), ERROR.to_string(), err.to_string()));
+        let last = tft_store::health(&crawler.db.lock().unwrap()).unwrap().last_error.unwrap();
+        assert_eq!((last.region, last.level, last.message), rows[1].clone());
+    }
+
+    /// Answers every request with a body shorter than its announced length, so every match answer is cut off.
+    async fn serve_cut_off() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let reply = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 500\r\n\r\n{\"metadata\":";
+                let _ = sock.write_all(reply.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://127.0.0.1:{port}/{{host}}")
+    }
+
+    /// Each cut-off answer is a warning in the engine log, up to the one that leaves the match for the next run.
+    #[tokio::test(start_paused = true)]
+    async fn cut_off_answers_land_in_the_engine_log() {
+        let base = serve_cut_off().await;
+        let conn = sample_db();
+        queue(&conn, "NA1_1", "americas", "na1");
+        let crawler = crawler_on(conn, &base, KEY);
+        crawler.riot.set_key_worked();
+        crawler.crawl_route("americas", vec!["na1".into()]).await.unwrap();
+        let rows = log_rows(&crawler);
+        let want: Vec<(String, String, String)> = [
+            "The answer for NA1_1 was cut off. It will be fetched again.",
+            "The answer for NA1_1 was cut off. It will be fetched again.",
+            "The answer for NA1_1 was cut off 3 times. Leaving it queued for the next run.",
+        ]
+        .iter()
+        .map(|m| ("americas".to_string(), WARN.to_string(), m.to_string()))
+        .collect();
+        assert_eq!(rows, want);
     }
 
     // ---- Servers and tiers from the settings (E9) ----------------------------------------------

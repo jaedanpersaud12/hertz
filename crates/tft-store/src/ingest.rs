@@ -38,6 +38,12 @@ impl Ingest<'_> {
         if added == 0 {
             return Ok(false); // dropping the transaction rolls back nothing, since nothing was written
         }
+        // When it was stored, for matches per hour (E10). Its own table, so `matches` rows stay what the TypeScript
+        // engine stores.
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+        tx.prepare_cached("INSERT OR REPLACE INTO match_stored (match_id, platform, at) VALUES (?,?,?)")?
+            .execute(params![m.metadata.match_id, self.platform, now])?;
 
         {
             let mut ins_part = tx.prepare_cached(
@@ -175,6 +181,9 @@ mod tests {
         assert_eq!(one("SELECT group_concat(item, ',') FROM unit_items WHERE character_id = 'U1'"), "Z,A,M");
         assert_eq!(one("SELECT COUNT(*) || '' FROM traits"), "1");
         assert_eq!(one("SELECT COUNT(*) || '' FROM players"), "2");
+        assert_eq!(one("SELECT match_id || ' ' || platform FROM match_stored"), "NA1_1 na1", "one stored-at row, not two");
+        let at: i64 = conn.query_row("SELECT at FROM match_stored", [], |r| r.get(0)).unwrap();
+        assert!(at > 1_700_000_000_000, "stored at the current time in ms, got {at}");
     }
 
     #[test]

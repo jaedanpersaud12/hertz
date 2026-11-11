@@ -52,6 +52,7 @@ pub fn prune_old_patches(conn: &mut Connection, keep: usize) -> Result<Pruned> {
     let participants =
         tx.execute("DELETE FROM participants WHERE id IN (SELECT id FROM gone_participants)", [])?;
     tx.execute("DELETE FROM match_queue WHERE match_id IN (SELECT match_id FROM gone_matches)", [])?;
+    tx.execute("DELETE FROM match_stored WHERE match_id IN (SELECT match_id FROM gone_matches)", [])?;
     let matches = tx.execute("DELETE FROM matches WHERE match_id IN (SELECT match_id FROM gone_matches)", [])?;
     tx.execute_batch("DROP TABLE gone_matches; DROP TABLE gone_participants;")?;
     tx.commit()?;
@@ -173,5 +174,20 @@ mod tests {
         assert!((c.after as f64) < (c.before as f64) * 0.75, "two of five patches gone should free over a quarter: {c:?}");
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The stored-at times (E10) of pruned matches go with them; the kept ones stay.
+    #[test]
+    fn pruning_drops_the_stored_at_times_of_pruned_matches() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::schema::SCHEMA).unwrap();
+        for (id, patch, at) in [("old", "90.1", 1), ("new", "90.2", 2)] {
+            conn.execute("INSERT INTO matches VALUES (?, 'na1', ?, 99, ?, 2000, 8)", params![id, patch, at]).unwrap();
+            conn.execute("INSERT INTO match_stored VALUES (?, 'na1', ?)", params![id, at]).unwrap();
+        }
+        prune_old_patches(&mut conn, 1).unwrap();
+        let left: Vec<String> =
+            conn.prepare("SELECT match_id FROM match_stored").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(left, ["new"]);
     }
 }

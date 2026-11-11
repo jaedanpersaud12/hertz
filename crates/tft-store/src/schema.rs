@@ -32,6 +32,13 @@ CREATE TABLE IF NOT EXISTS matches (
 );
 CREATE INDEX IF NOT EXISTS matches_patch ON matches(patch, rank);
 
+CREATE TABLE IF NOT EXISTS match_stored (  -- when each match was stored, for matches per hour (E10)
+  match_id TEXT PRIMARY KEY,
+  platform TEXT NOT NULL,
+  at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS match_stored_at ON match_stored(at, platform);
+
 CREATE TABLE IF NOT EXISTS participants (
   id         INTEGER PRIMARY KEY,
   match_id   TEXT NOT NULL,
@@ -99,7 +106,8 @@ CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime 
 ///    tiers' single division as Riot sends it, and for unranked players). `rank_sample_queue` holds every match
 ///    chosen for sampling; `done` turns 1 once all its players are in `rank_samples`. Rows are never removed, so
 ///    choosing a match again after a restart is a no-op.
-pub const MIGRATIONS: [(u32, &str); 2] = [
+/// 3. The engine log (E10): warnings and errors from the crawler and supervisor, newest kept. See `health.rs`.
+pub const MIGRATIONS: [(u32, &str); 3] = [
     (1, "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)"),
     (
         2,
@@ -109,6 +117,7 @@ CREATE TABLE IF NOT EXISTS rank_sample_queue (match_id TEXT PRIMARY KEY, platfor
 CREATE INDEX IF NOT EXISTS rank_sample_pending ON rank_sample_queue(done, platform);
 ",
     ),
+    (3, "CREATE TABLE IF NOT EXISTS engine_log (at INTEGER, region TEXT, level TEXT, message TEXT)"),
 ];
 
 const RATES: &str = "games INTEGER NOT NULL, sum_place INTEGER NOT NULL, wins INTEGER NOT NULL, top4 INTEGER NOT NULL";

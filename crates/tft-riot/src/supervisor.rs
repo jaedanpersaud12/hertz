@@ -14,7 +14,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tft_store::Connection;
+use tft_store::{Connection, ERROR, WARN};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
 
 /// How often each job runs.
@@ -47,6 +47,8 @@ pub trait Jobs: Send {
     fn idle(&mut self) -> Result<bool>;
     /// Prunes and compacts the database.
     fn prune_when_idle(&mut self) -> Result<()>;
+    /// Notes a failed job in the engine log (E10). `level` is [`tft_store::WARN`] or [`tft_store::ERROR`].
+    fn log(&mut self, _level: &str, _message: &str) {}
 }
 
 /// Runs `crawl` and schedules `jobs` around it until `crawl` ends, then returns what `crawl` returned.
@@ -80,11 +82,18 @@ where
                         println!("Set data updated: set {} ({}), {} units, {} traits, {} items.", s.set_number, s.set_name, s.units, s.traits, s.items);
                     }
                     if let Some(e) = &r.static_error {
-                        eprintln!("Could not download the set data ({e}). Trying again in {} h.", t.refresh.as_secs() / 3600);
+                        let hours = t.refresh.as_secs() / 3600;
+                        let msg = format!("Could not download the set data ({e}). Trying again in {hours} h.");
+                        eprintln!("{msg}");
+                        jobs.log(WARN, &msg);
                     }
                     relabelled |= r.relabelled > 0;
                 }
-                Err(e) => eprintln!("Could not download the patch calendar ({e:#}). Keeping the saved one."),
+                Err(e) => {
+                    let msg = format!("Could not download the patch calendar ({e:#}). Keeping the saved one.");
+                    eprintln!("{msg}");
+                    jobs.log(WARN, &msg);
+                }
             },
             // Due once a day; runs at the first stats tick from then on when the crawler is idle.
             _ = prune.tick() => prune_due = true,
@@ -92,14 +101,24 @@ where
                 match jobs.new_matches() {
                     Ok(fresh) if fresh || relabelled => match jobs.stats().await {
                         Ok(()) => relabelled = false,
-                        Err(e) => eprintln!("Building the stats failed ({e:#}). Trying again in 10 minutes."),
+                        Err(e) => {
+                            let msg = format!("Building the stats failed ({e:#}). Trying again in 10 minutes.");
+                            eprintln!("{msg}");
+                            jobs.log(ERROR, &msg);
+                        }
                     },
                     Ok(_) => {}
-                    Err(e) => eprintln!("Could not check for new matches ({e:#})."),
+                    Err(e) => {
+                        let msg = format!("Could not check for new matches ({e:#}).");
+                        eprintln!("{msg}");
+                        jobs.log(ERROR, &msg);
+                    }
                 }
                 if prune_due && jobs.idle().unwrap_or(false) {
                     if let Err(e) = jobs.prune_when_idle() {
-                        eprintln!("Pruning the database failed ({e:#}). Trying again tomorrow.");
+                        let msg = format!("Pruning the database failed ({e:#}). Trying again tomorrow.");
+                        eprintln!("{msg}");
+                        jobs.log(ERROR, &msg);
                     }
                     prune_due = false;
                 }
@@ -223,6 +242,11 @@ impl Jobs for EngineJobs {
     fn prune_when_idle(&mut self) -> Result<()> {
         prune_when_idle(&mut self.conn)
     }
+
+    fn log(&mut self, level: &str, message: &str) {
+        // Never fails a job: a log row that cannot be written is only lost.
+        let _ = tft_store::log_event(&self.conn, "", level, message);
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +357,50 @@ mod tests {
         assert_eq!(err.to_string(), "key expired");
     }
 
+    /// Jobs whose stats build always fails, and which note what they log.
+    #[derive(Default)]
+    struct Failing {
+        logged: Vec<(String, String)>,
+    }
+
+    impl Jobs for Failing {
+        fn new_matches(&mut self) -> Result<bool> {
+            Ok(true)
+        }
+        async fn stats(&mut self) -> Result<()> {
+            anyhow::bail!("disk full")
+        }
+        async fn refresh(&mut self) -> Result<Refreshed> {
+            anyhow::bail!("no network")
+        }
+        fn idle(&mut self) -> Result<bool> {
+            Ok(true)
+        }
+        fn prune_when_idle(&mut self) -> Result<()> {
+            anyhow::bail!("locked")
+        }
+        fn log(&mut self, level: &str, message: &str) {
+            self.logged.push((level.to_string(), message.to_string()));
+        }
+    }
+
+    /// E10: every failed job is noted in the log, and the crawl goes on.
+    #[tokio::test(start_paused = true)]
+    async fn failed_jobs_are_logged() {
+        let mut jobs = Failing::default();
+        let crawl = async {
+            tokio::time::sleep(Duration::from_secs(24 * 3600 + 60)).await;
+            Ok(())
+        };
+        supervise(crawl, &mut jobs, Timings::default()).await.unwrap();
+        let has = |level: &str, text: &str| jobs.logged.iter().any(|(l, m)| l == level && m.contains(text));
+        assert!(has(WARN, "Could not download the patch calendar (no network)"), "{:?}", jobs.logged);
+        assert!(has(ERROR, "Building the stats failed (disk full)"));
+        assert!(has(ERROR, "Pruning the database failed (locked)"));
+        let stats = jobs.logged.iter().filter(|(_, m)| m.starts_with("Building the stats")).count();
+        assert_eq!(stats, 24 * 6 + 1, "one per 10-minute tick");
+    }
+
     // ---- The real jobs, against a database file ----
 
     fn temp_db(name: &str) -> PathBuf {
@@ -377,5 +445,27 @@ mod tests {
         assert!(jobs.idle().unwrap());
         add_match(&conn, "NA1_3", "16.21");
         assert!(!jobs.idle().unwrap());
+    }
+
+    /// The real jobs write the engine log; a calendar download that fails shows as the last error.
+    #[tokio::test]
+    async fn engine_jobs_log_a_failed_refresh() {
+        crate::client::init_tls();
+        let path = temp_db("log");
+        let opts = SupervisorOptions {
+            db_path: path.clone(),
+            patch_count: 2,
+            source: Source { http: reqwest::Client::new(), base: "http://127.0.0.1:9".into() },
+            timings: Timings::default(),
+        };
+        let mut jobs = EngineJobs::new(&opts, None).unwrap();
+        let crawl = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(())
+        };
+        supervise(crawl, &mut jobs, Timings::default()).await.unwrap();
+        let last = tft_store::health(&tft_store::open(&path).unwrap()).unwrap().last_error.expect("a logged problem");
+        assert_eq!((last.region.as_str(), last.level.as_str()), ("", WARN));
+        assert!(last.message.starts_with("Could not download the patch calendar"), "{}", last.message);
     }
 }
