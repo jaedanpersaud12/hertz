@@ -29,6 +29,25 @@ const STAT_TABLES: [&str; 12] = [
     "stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels",
 ];
 
+/// SQL that keeps only ranked matches (E12): other game modes are stored but left out of every stat. `table` is
+/// the name or alias of the matches table in the query. NULL is a match stored before E12, when only ranked was
+/// stored. The same text as `rankedOnly` in `src/db.ts`; the ranked queue comes from `RANKED_QUEUE_ID`, as there.
+pub fn ranked_only(table: &str) -> String {
+    let id = tft_core::config::Config::from_env().ranked_queue_id;
+    format!("({table}.queue_id IS NULL OR {table}.queue_id = {id})")
+}
+
+/// The `patch_count` most recent patches that have ranked matches.
+fn recent_patches(conn: &Connection, patch_count: i64) -> Result<Vec<String>> {
+    Ok(conn
+        .prepare(&format!(
+            "SELECT patch FROM matches WHERE patch != 'unknown' AND {} GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT ?",
+            ranked_only("matches")
+        ))?
+        .query_map([patch_count], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -40,12 +59,7 @@ pub fn build_stats(conn: &mut Connection, patch_count: i64) -> Result<()> {
 
 /// [`build_stats`] with the progress lines sent to `log`.
 pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn FnMut(&str)) -> Result<()> {
-    let patches: Vec<String> = conn
-        .prepare(
-            "SELECT patch FROM matches WHERE patch != 'unknown' GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT ?",
-        )?
-        .query_map([patch_count], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    let patches = recent_patches(conn, patch_count)?;
 
     if patches.is_empty() {
         log("No matches stored yet. Run \"npm run crawl\" first.");
@@ -137,12 +151,7 @@ pub fn build_stats_incremental_with(
     patch_count: i64,
     log: &mut dyn FnMut(&str),
 ) -> Result<Vec<String>> {
-    let patches: Vec<String> = conn
-        .prepare(
-            "SELECT patch FROM matches WHERE patch != 'unknown' GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT ?",
-        )?
-        .query_map([patch_count], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+    let patches = recent_patches(conn, patch_count)?;
     if patches.is_empty() {
         log("No matches stored yet. Run \"npm run crawl\" first.");
         return Ok(Vec::new());
@@ -178,8 +187,11 @@ fn plan_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: i
         .optional()?;
     let (Some(mark), Some(held)) = (mark, held) else { return Ok(Plan::Full) };
     let (old, new): (i64, i64) = db.query_row(
-        "SELECT COALESCE(SUM(rowid <= ?4), 0), COALESCE(SUM(rowid > ?4), 0) FROM matches
-         WHERE patch = ?1 AND rank >= ?2 AND game_datetime >= ?3",
+        &format!(
+            "SELECT COALESCE(SUM(rowid <= ?4), 0), COALESCE(SUM(rowid > ?4), 0) FROM matches m
+             WHERE patch = ?1 AND rank >= ?2 AND game_datetime >= ?3 AND {}",
+            ranked_only("m")
+        ),
         params![patch, min_rank, since, mark],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
@@ -329,7 +341,10 @@ fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), t
                 Plan::Add(after) => Some(after),
             };
             let matches: i64 = tx.query_row(
-                "SELECT COUNT(*) n FROM matches WHERE patch = ? AND rank >= ? AND game_datetime >= ?",
+                &format!(
+                    "SELECT COUNT(*) n FROM matches m WHERE patch = ? AND rank >= ? AND game_datetime >= ? AND {}",
+                    ranked_only("m")
+                ),
                 params![patch, bucket.min, since[wi]],
                 |r| r.get(0),
             )?;
@@ -364,7 +379,8 @@ fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), t
         &format!(
             "INSERT INTO inc_b SELECT pa.id, pa.placement, pa.level, pa.comp_key, {band}, {w}, {seg}
              FROM participants pa JOIN matches m ON m.match_id = pa.match_id
-             WHERE m.patch = ? AND m.rank >= ? AND m.game_datetime >= ?"
+             WHERE m.patch = ? AND m.rank >= ? AND m.game_datetime >= ? AND {}",
+            ranked_only("m")
         ),
         params![patch, min_rank, min_since],
     )?;
@@ -579,9 +595,12 @@ fn build_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: 
     let k = params![patch, scope];
     db.execute_batch("DELETE FROM p; DELETE FROM topc")?;
     db.execute(
-        "INSERT INTO p SELECT pa.id, pa.placement, pa.level, pa.comp_key FROM participants pa
-         JOIN matches m ON m.match_id = pa.match_id
-         WHERE m.patch = ? AND m.rank >= ? AND m.game_datetime >= ?",
+        &format!(
+            "INSERT INTO p SELECT pa.id, pa.placement, pa.level, pa.comp_key FROM participants pa
+             JOIN matches m ON m.match_id = pa.match_id
+             WHERE m.patch = ? AND m.rank >= ? AND m.game_datetime >= ? AND {}",
+            ranked_only("m")
+        ),
         params![patch, min_rank, since],
     )?;
 
@@ -591,7 +610,10 @@ fn build_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: 
 
     let comps: i64 = db.query_row("SELECT COUNT(*) n FROM p", [], |r| r.get(0))?;
     let matches: i64 = db.query_row(
-        "SELECT COUNT(*) n FROM matches WHERE patch = ? AND rank >= ? AND game_datetime >= ?",
+        &format!(
+            "SELECT COUNT(*) n FROM matches m WHERE patch = ? AND rank >= ? AND game_datetime >= ? AND {}",
+            ranked_only("m")
+        ),
         params![patch, min_rank, since],
         |r| r.get(0),
     )?;
@@ -820,7 +842,7 @@ mod tests {
         for (i, (comp, place, units)) in boards.iter().enumerate() {
             let m = format!("M{}", i / 8);
             conn.execute(
-                "INSERT OR IGNORE INTO matches VALUES (?, 'na1', '99.1', 99, ?, 2000, 8)",
+                "INSERT OR IGNORE INTO matches VALUES (?, 'na1', '99.1', 99, ?, 2000, 8, NULL)",
                 params![m, now - 3_600_000],
             )
             .unwrap();
@@ -1164,12 +1186,104 @@ mod incremental_tests {
         std::fs::remove_dir_all(&fresh_dir).unwrap();
     }
 
+    /// PRD 1 E12: Double Up, Hyper Roll and revival lobbies are stored with their queue id, and no stat table counts
+    /// them, in a full rebuild or an incremental one. A patch with only other-mode matches gets no stats at all.
+    /// Ranked matches stored before E12 have no queue id and are counted.
+    #[test]
+    fn other_game_modes_are_stored_with_their_queue_and_left_out_of_every_stat() {
+        let now = now_ms();
+        let cal = Calendar(vec![
+            PatchStart { patch: "90.1".into(), since: 0 },
+            PatchStart { patch: "90.2".into(), since: now - 8 * DAY },
+            PatchStart { patch: "90.3".into(), since: now - DAY / 2 }, // other modes only
+        ]);
+        let ranks = [0, 3, 4, 5, 6, 7, 9];
+        let ranked = |first: usize, n: usize, from: i64, step: i64| -> Vec<Game> {
+            (first..first + n).map(|i| (format!("R{i}"), ranks[i % 7], from + (i - first) as i64 * step)).collect()
+        };
+        // Other modes: a queue per match, every third one spelt queueId as Riot sometimes sends it.
+        let others = |rng: &mut Rng, first: usize, n: usize, from: i64, step: i64| -> Vec<RiotMatch> {
+            (first..first + n)
+                .map(|i| {
+                    let mut m = lobby(rng, &format!("O{i}"), from + (i - first) as i64 * step, 1 + (i % 4) as i64);
+                    let q = [1160, 1130, 6000][i % 3];
+                    if i % 3 == 2 {
+                        (m.info.queue_id, m.info.queue_id_camel) = (None, Some(q));
+                    } else {
+                        m.info.queue_id = Some(q);
+                    }
+                    m
+                })
+                .collect()
+        };
+        let put = |conn: &mut Connection, ms: &[RiotMatch]| {
+            for (i, m) in ms.iter().enumerate() {
+                let ing = Ingest { platform: "na1", rank: ranks[i % 7], tier: "X", snowball: false };
+                assert!(ing.store(conn, m, &cal).unwrap());
+            }
+        };
+        let old = ranked(300, 20, now - 30 * DAY, 1_000_000); // 90.1
+        let first = ranked(0, 200, now - 7 * DAY, 1_000_000); // 90.2, older than 3 days
+        let more = ranked(200, 60, now - 4 * DAY, 2_000_000); // 90.2, both sides of 3 days
+        let mut rng = Rng(99);
+        let other_first = others(&mut rng, 0, 90, now - 7 * DAY, 5_000_000); // 90.2, both sides of 3 days
+        let other_more = others(&mut rng, 90, 30, now - DAY / 4, 100_000); // 90.3 only
+        let other_last = others(&mut rng, 120, 20, now - 6 * DAY, 1_000_000);
+
+        // Mixed: ranked and other modes interleaved, full rebuild, then more of both and an incremental build.
+        let (dir, mut conn) = fresh_db("modes");
+        store(&mut conn, &cal, 6, &old);
+        store(&mut conn, &cal, 3, &first[..100]);
+        put(&mut conn, &other_first);
+        store_with(&mut conn, &cal, 4, &first[100..], 5);
+        // One ranked match stored before E12: no queue id.
+        conn.execute("UPDATE matches SET queue_id = NULL WHERE match_id = 'R7'", []).unwrap();
+        build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
+        put(&mut conn, &other_more);
+        store_with(&mut conn, &cal, 5, &more, 3);
+        put(&mut conn, &other_last);
+        let touched = build_stats_incremental_with(&mut conn, 2, &mut |_| {}).unwrap();
+        assert!(!touched.is_empty() && touched.iter().all(|s| s.starts_with("90.2/")), "{touched:?}");
+
+        let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(q("SELECT COUNT(*) FROM matches"), 280 + 140, "every match is stored");
+        assert_eq!(q("SELECT COUNT(*) FROM matches WHERE queue_id = 1100"), 279);
+        assert_eq!(q("SELECT COUNT(*) FROM matches WHERE queue_id IS NULL"), 1);
+        for (queue, n) in [(1160, 47), (1130, 47), (6000, 46)] {
+            assert_eq!(q(&format!("SELECT COUNT(*) FROM matches WHERE queue_id = {queue}")), n, "queue {queue}");
+        }
+        assert_eq!(q("SELECT COUNT(*) FROM stat_meta WHERE patch = '90.3'"), 0, "a patch of other modes only has no stats");
+        assert_eq!(q("SELECT COUNT(DISTINCT patch) FROM stat_meta"), 2, "90.3 does not push 90.1 out of the two patches");
+        assert_eq!(q("SELECT matches FROM stat_meta WHERE patch = '90.2' AND bucket = 'ALL'"), 260);
+
+        // Only other modes new: nothing to rebuild.
+        put(&mut conn, &others(&mut rng, 140, 10, now - 2 * DAY, 1_000_000));
+        assert_eq!(build_stats_incremental_with(&mut conn, 2, &mut |_| {}).unwrap(), Vec::<String>::new());
+
+        // The same ranked matches alone, full rebuild: every stat table must be the same.
+        let (fresh_dir, mut fresh) = fresh_db("modes-fresh");
+        store(&mut fresh, &cal, 6, &old);
+        store(&mut fresh, &cal, 3, &first[..100]);
+        store_with(&mut fresh, &cal, 4, &first[100..], 5);
+        store_with(&mut fresh, &cal, 5, &more, 3);
+        build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
+        drop(fresh);
+        let compared = assert_same_stats(&conn, &fresh_dir.join("t.db"));
+        assert!(compared > 1000, "only {compared} rows compared");
+        // And a full rebuild of the mixed database gives them too.
+        build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
+        assert_same_stats(&conn, &fresh_dir.join("t.db"));
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&fresh_dir).unwrap();
+    }
+
     /// Boards straight into the tables, eight to a match (rank 8, an hour ago): (comp label, units) each.
     fn add_boards(conn: &Connection, first_match: usize, boards: &[(String, Vec<String>)]) {
         let now = now_ms();
         for (i, (comp, units)) in boards.iter().enumerate() {
             let m = format!("T{}", first_match + i / 8);
-            conn.execute("INSERT OR IGNORE INTO matches VALUES (?, 'na1', '91.1', 99, ?, 2000, 8)", params![m, now - 3_600_000])
+            conn.execute("INSERT OR IGNORE INTO matches VALUES (?, 'na1', '91.1', 99, ?, 2000, 8, NULL)", params![m, now - 3_600_000])
                 .unwrap();
             conn.execute(
                 "INSERT INTO participants (match_id, puuid, placement, level, comp_key) VALUES (?, ?, ?, ?, ?)",

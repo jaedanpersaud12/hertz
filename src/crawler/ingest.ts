@@ -5,7 +5,7 @@ import type { RiotMatch } from './riot'
 
 export function makeIngest(db: DB) {
   const insMatch = db.prepare(
-    'INSERT OR IGNORE INTO matches (match_id, platform, patch, set_number, game_datetime, game_length, rank) VALUES (?,?,?,?,?,?,?)',
+    'INSERT OR IGNORE INTO matches (match_id, platform, patch, set_number, game_datetime, game_length, rank, queue_id) VALUES (?,?,?,?,?,?,?,?)',
   )
   const insPart = db.prepare(
     'INSERT INTO participants (match_id, puuid, placement, level, last_round, gold_left, damage, comp_key) VALUES (?,?,?,?,?,?,?,?)',
@@ -20,7 +20,7 @@ export function makeIngest(db: DB) {
     const { info } = match
     const added = insMatch.run(
       match.metadata.match_id, platform, patchFor(info.game_version, info.game_datetime), info.tft_set_number ?? null,
-      info.game_datetime, info.game_length, rank,
+      info.game_datetime, info.game_length, rank, info.queue_id ?? info.queueId ?? null,
     )
     if (added.changes === 0) return false
 

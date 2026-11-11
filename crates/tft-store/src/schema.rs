@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS matches (
   set_number    INTEGER,
   game_datetime INTEGER NOT NULL,
   game_length   REAL,
-  rank          INTEGER NOT NULL          -- rank of the player this match was found through
+  rank          INTEGER NOT NULL,         -- rank of the player this match was found through
+  queue_id      INTEGER                   -- Riot's queue (1100 ranked); NULL for matches stored before E12, all ranked
 );
 CREATE INDEX IF NOT EXISTS matches_patch ON matches(patch, rank);
 

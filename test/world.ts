@@ -74,7 +74,32 @@ for (const platform of Object.keys(PLATFORMS)) {
     for (const p of lobby) idsByPlayer.set(p, [...(idsByPlayer.get(p) ?? []), id])
   }
 }
+
+// Other game modes (E12): Double Up, Hyper Roll and a revival queue. Stored with their queue id, left out of every
+// stat. Added after the matches above, so those stay exactly as they were. Boards are copied from a match above
+// into a new lobby; every sixth one sends Riot's other spelling, queueId.
+export const OTHER_QUEUES = [1160, 1130, 6000]
+for (const platform of Object.keys(PLATFORMS)) {
+  const everyone = Object.values(ladders[platform]).flat()
+  for (let m = 0; m < 24; m++) {
+    const id = `${platform.toUpperCase()}_${2000 + m}`
+    const from = matches.get(`${platform.toUpperCase()}_${1000 + m * 7}`)
+    const lobby = [...everyone].sort(() => rand() - 0.5).slice(0, 8)
+    const info = structuredClone(from.info)
+    info.participants.forEach((p: any, i: number) => {
+      archetypeOf.set(`${id}|${lobby[i]}`, archetypeOf.get(`${from.metadata.match_id}|${p.puuid}`)!)
+      p.puuid = lobby[i]; p.riotIdGameName = lobby[i]
+    })
+    delete info.queue_id
+    if (m % 6 === 5) info.queueId = OTHER_QUEUES[m % 3]
+    else info.queue_id = OTHER_QUEUES[m % 3]
+    matches.set(id, { metadata: { match_id: id, participants: lobby }, info })
+    for (const p of lobby) idsByPlayer.set(p, [...(idsByPlayer.get(p) ?? []), id])
+  }
+}
 export const rankedMatches = [...matches.values()].filter((m) => m.info.queue_id === 1100)
+/** The matches that are not ranked: normal games and the other modes above. Stored, but in no stat. */
+export const otherModeMatches = [...matches.values()].filter((m) => m.info.queue_id !== 1100)
 
 // ---- Fake Riot API with real rate limits -----------------------------------
 export const LIMITS: [number, number][] = [[50, 1], [400, 10]]

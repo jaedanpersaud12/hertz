@@ -112,7 +112,7 @@ mod tests {
                 for m in 0..60 {
                     let id = format!("{patch}-{m}");
                     let at = (p as i64) * 1_000_000 + m;
-                    tx.execute("INSERT INTO matches VALUES (?, 'na1', ?, 99, ?, 2000, 8)", params![id, patch, at]).unwrap();
+                    tx.execute("INSERT INTO matches VALUES (?, 'na1', ?, 99, ?, 2000, 8, NULL)", params![id, patch, at]).unwrap();
                     tx.execute("INSERT INTO match_queue VALUES (?, 'americas', 'na1', 8, 1)", [&id]).unwrap();
                     for s in 0..8 {
                         tx.execute(
@@ -132,7 +132,7 @@ mod tests {
                 tx.execute("INSERT INTO stat_units VALUES (?, 'ALL', 'U1', 480, 2160, 60, 240, 2.0)", [patch]).unwrap();
             }
             // A match still waiting for a patch label is not part of any patch, so it is kept.
-            tx.execute("INSERT INTO matches VALUES ('waiting', 'na1', 'unknown', 99, 0, 2000, 8)", []).unwrap();
+            tx.execute("INSERT INTO matches VALUES ('waiting', 'na1', 'unknown', 99, 0, 2000, 8, NULL)", []).unwrap();
             // A queue entry with no stored match (still pending) is kept.
             tx.execute("INSERT INTO match_queue VALUES ('pending', 'americas', 'na1', 8, 0)", []).unwrap();
             tx.commit().unwrap();
@@ -182,7 +182,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::schema::SCHEMA).unwrap();
         for (id, patch, at) in [("old", "90.1", 1), ("new", "90.2", 2)] {
-            conn.execute("INSERT INTO matches VALUES (?, 'na1', ?, 99, ?, 2000, 8)", params![id, patch, at]).unwrap();
+            conn.execute("INSERT INTO matches VALUES (?, 'na1', ?, 99, ?, 2000, 8, NULL)", params![id, patch, at]).unwrap();
             conn.execute("INSERT INTO match_stored VALUES (?, 'na1', ?)", params![id, at]).unwrap();
         }
         prune_old_patches(&mut conn, 1).unwrap();

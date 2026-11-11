@@ -6,7 +6,7 @@
  */
 import { fileURLToPath } from 'node:url'
 import { BUCKETS, scopeKey, WINDOWS } from '../config'
-import { openDb, STAT_TABLES, type DB } from '../db'
+import { openDb, rankedOnly, STAT_TABLES, type DB } from '../db'
 import { loadCalendar, refreshCalendar, relabelUnknown } from '../patches'
 
 /** A comp needs this share of all boards (and at least this many) to get its own row. */
@@ -58,7 +58,7 @@ function mergeLookalikes(db: DB, minGames: number) {
 
 export function buildStats(db: DB, patchCount = 2, log: (s: string) => void = console.log) {
   const patches = (db.prepare(
-    "SELECT patch FROM matches WHERE patch != 'unknown' GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT ?",
+    `SELECT patch FROM matches WHERE patch != 'unknown' AND ${rankedOnly('matches')} GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT ?`,
   ).all(patchCount) as { patch: string }[]).map((r) => r.patch)
 
   if (!patches.length) {
@@ -87,12 +87,12 @@ export function buildStats(db: DB, patchCount = 2, log: (s: string) => void = co
           db.prepare(`
             INSERT INTO p SELECT pa.id, pa.placement, pa.level, pa.comp_key FROM participants pa
             JOIN matches m ON m.match_id = pa.match_id
-            WHERE m.patch = ? AND m.rank >= ? AND m.game_datetime >= ?`).run(patch, bucket.min, since)
+            WHERE m.patch = ? AND m.rank >= ? AND m.game_datetime >= ? AND ${rankedOnly()}`).run(patch, bucket.min, since)
 
           for (const table of STAT_TABLES) db.prepare(`DELETE FROM ${table} WHERE patch = ? AND bucket = ?`).run(...k)
 
           const comps = (db.prepare('SELECT COUNT(*) n FROM p').get() as { n: number }).n
-          const matches = (db.prepare('SELECT COUNT(*) n FROM matches WHERE patch = ? AND rank >= ? AND game_datetime >= ?')
+          const matches = (db.prepare(`SELECT COUNT(*) n FROM matches m WHERE patch = ? AND rank >= ? AND game_datetime >= ? AND ${rankedOnly()}`)
             .get(patch, bucket.min, since) as { n: number }).n
           db.prepare('INSERT INTO stat_meta VALUES (?,?,?,?,?)').run(...k, matches, comps, Date.now())
           if (!comps) return

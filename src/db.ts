@@ -19,6 +19,13 @@ export const STAT_TABLES = [
   'stat_comps', 'stat_comp_units', 'stat_comp_items', 'stat_comp_traits', 'stat_comp_levels',
 ]
 
+/**
+ * SQL that keeps only ranked matches (E12): other game modes are stored but left out of every stat. `table` is the
+ * name or alias of the matches table in the query. NULL is a match stored before E12, when only ranked was stored.
+ * The same text as `ranked_only` in crates/tft-stats/src/lib.rs.
+ */
+export const rankedOnly = (table = 'm') => `(${table}.queue_id IS NULL OR ${table}.queue_id = ${Math.trunc(config.rankedQueueId)})`
+
 const SCHEMA = `
 -- ---- Raw data from the crawler -------------------------------------------------
 CREATE TABLE IF NOT EXISTS players (
@@ -46,7 +53,8 @@ CREATE TABLE IF NOT EXISTS matches (
   set_number    INTEGER,
   game_datetime INTEGER NOT NULL,
   game_length   REAL,
-  rank          INTEGER NOT NULL          -- rank of the player this match was found through
+  rank          INTEGER NOT NULL,         -- rank of the player this match was found through
+  queue_id      INTEGER                   -- Riot's queue (1100 ranked); NULL for matches stored before E12, all ranked
 );
 CREATE INDEX IF NOT EXISTS matches_patch ON matches(patch, rank);
 
@@ -161,6 +169,7 @@ function migrate(db: DB) {
     (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === col)
   if (!has('participants', 'comp_key')) db.exec('ALTER TABLE participants ADD COLUMN comp_key TEXT')
   if (!has('units', 'rarity')) db.exec('ALTER TABLE units ADD COLUMN rarity INTEGER')
+  if (!has('matches', 'queue_id')) db.exec('ALTER TABLE matches ADD COLUMN queue_id INTEGER') // E12; NULL rows are ranked
   for (const [, sql] of MIGRATIONS) db.exec(sql)
 
   if (db.pragma('user_version', { simple: true }) !== STATS_VERSION) {

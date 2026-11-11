@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 
-import { ARCHETYPES, idsByPlayer, ITEMS, matches, rankedMatches, startFakeRiot, UNITS, archetypeOf } from './world'
+import { ARCHETYPES, idsByPlayer, ITEMS, matches, otherModeMatches, rankedMatches, startFakeRiot, UNITS, archetypeOf } from './world'
 
 const run = (script: string, args: string[], env: Record<string, string>) =>
   new Promise<string>((resolve, reject) => {
@@ -65,22 +65,29 @@ try {
 
   const db = new Database(dbPath)
   const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n
-  assert.equal(count('SELECT COUNT(*) n FROM matches'), rankedMatches.length)
-  ok(`stored all ${rankedMatches.length} ranked matches, skipped ${matches.size - rankedMatches.length} normal games`)
-  assert.equal(count('SELECT COUNT(*) n FROM participants'), rankedMatches.length * 8)
+  // Every game mode is stored (E12), each with its queue id; only ranked ones reach the stats below.
+  assert.equal(count('SELECT COUNT(*) n FROM matches'), matches.size)
+  assert.equal(count('SELECT COUNT(*) n FROM matches WHERE queue_id = 1100'), rankedMatches.length)
+  for (const m of otherModeMatches) {
+    const want = m.info.queue_id ?? m.info.queueId
+    assert.equal((db.prepare('SELECT queue_id FROM matches WHERE match_id = ?').get(m.metadata.match_id) as any).queue_id, want)
+  }
+  assert.ok(otherModeMatches.some((m) => m.info.queue_id === undefined), 'the world has a match that spells it queueId')
+  ok(`stored all ${matches.size} matches with their queue: ${rankedMatches.length} ranked, ${otherModeMatches.length} other modes`)
+  assert.equal(count('SELECT COUNT(*) n FROM participants'), matches.size * 8)
   assert.equal(count('SELECT COUNT(*) n FROM players'), 300)
   ok('seeded 300 players from apex and paged ladders')
   assert.equal(seen.overLimit, 0, `client broke the rate limit ${seen.overLimit} times`)
   ok('never exceeded the rate limit the server announced')
   assert.ok(seen.forced429 === 1 && seen.forced500 > 0)
   ok(`recovered from a forced 429 and ${seen.forced500} server errors`)
-  assert.equal(count("SELECT COUNT(*) n FROM matches WHERE patch = '99.3'"), rankedMatches.length)
+  assert.equal(count("SELECT COUNT(*) n FROM matches WHERE patch = '99.3'"), matches.size)
   ok('parsed the patch number')
 
   // 2. Crawl again: nothing new should be fetched or duplicated
   const before = seen.total
   await run('src/crawler/crawl.ts', ['--once'], env)
-  assert.equal(count('SELECT COUNT(*) n FROM matches'), rankedMatches.length)
+  assert.equal(count('SELECT COUNT(*) n FROM matches'), matches.size)
   assert.equal(seen.total, before)
   ok('a second run made no requests and stored no duplicates')
 
@@ -138,6 +145,8 @@ try {
   const all = stat("SELECT matches FROM stat_meta WHERE bucket='ALL'").matches
   assert.ok(master > 0 && master < all)
   assert.equal(stat("SELECT matches FROM stat_meta WHERE bucket='ALL@3d'").matches, all)
+  assert.equal(all, rankedMatches.length, 'stats count ranked matches only')
+  assert.equal(stat("SELECT comps FROM stat_meta WHERE bucket='ALL'").comps, rankedMatches.length * 8)
   ok(`rank and time filters work (${master} of ${all} matches are Master+)`)
 
   // Riot's real match data has no usable version, so patches are dated from a calendar.

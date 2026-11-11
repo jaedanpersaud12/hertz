@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { BUCKETS, config, scopeKey, WINDOWS } from '../config'
-import { kvGet, kvSet, openDb } from '../db'
+import { kvGet, kvSet, openDb, rankedOnly } from '../db'
 import { makeDescribe, type Entity } from './describe'
 import { registerMe } from './me'
 import { stress } from './worstcase'
@@ -314,7 +314,7 @@ app.get('/api/explore', (c) => {
     SELECT DISTINCT pa.id, pa.placement FROM units u0
     JOIN participants pa ON pa.id = u0.participant_id
     JOIN matches m ON m.match_id = pa.match_id
-    WHERE u0.character_id = ? AND m.patch = ? AND m.rank >= ? AND m.game_datetime >= ?
+    WHERE u0.character_id = ? AND m.patch = ? AND m.rank >= ? AND m.game_datetime >= ? AND ${rankedOnly()}
     ${units.slice(1).map(() => 'AND EXISTS (SELECT 1 FROM units x WHERE x.participant_id = pa.id AND x.character_id = ?)').join('\n')}
     ${traits.map(() => 'AND EXISTS (SELECT 1 FROM traits t WHERE t.participant_id = pa.id AND t.name = ?)').join('\n')}
   `).run(units[0], s.patch, s.rankMin, s.since, ...units.slice(1), ...traits)
@@ -397,10 +397,13 @@ app.delete('/api/teams/:id', (c) => {
 
 app.get('/api/meta', (c) => {
   const s = scope(c)
-  const totals = db.prepare(`SELECT (SELECT COUNT(*) FROM matches) matches, (SELECT COUNT(*) FROM participants) comps,
+  // Ranked matches and their boards only (E12), as in the stats. Other game modes are stored but not counted.
+  const totals = db.prepare(`SELECT (SELECT COUNT(*) FROM matches m WHERE ${rankedOnly()}) matches,
+    (SELECT COUNT(*) FROM participants pa JOIN matches m ON m.match_id = pa.match_id WHERE ${rankedOnly()}) comps,
     (SELECT COUNT(*) FROM players) players, (SELECT COUNT(*) FROM match_queue WHERE status = 0) queued,
     (SELECT MAX(game_datetime) FROM matches) newest, (SELECT COUNT(*) FROM static_data) staticRows`).get()
-  const byPatch = db.prepare('SELECT patch, COUNT(*) matches FROM matches GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT 8').all()
+  const byPatch = db.prepare(`SELECT patch, COUNT(*) matches FROM matches m WHERE ${rankedOnly()}
+    GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT 8`).all()
   return c.json({
     ...pub(s), totals, byPatch,
     buckets: BUCKETS.map((b) => b.key),
