@@ -649,7 +649,8 @@ pub fn explore(conn: &Connection, q: Option<&str>) -> Result<Obj> {
     let ms = |t0: std::time::Instant| json!(t0.elapsed().as_millis() as i64);
     conn.execute_batch("DROP TABLE IF EXISTS temp.hit")?;
     let sql = format!(
-        "\n    CREATE TEMP TABLE hit AS\n    SELECT DISTINCT pa.id, pa.placement FROM units u0\n    JOIN participants pa ON pa.id = u0.participant_id\n    JOIN matches m ON m.match_id = pa.match_id\n    WHERE u0.character_id = ? AND m.patch = ? AND m.rank >= ? AND m.game_datetime >= ?\n    {}\n    {}\n  ",
+        "\n    CREATE TEMP TABLE hit AS\n    SELECT DISTINCT pa.id, pa.placement FROM units u0\n    JOIN participants pa ON pa.id = u0.participant_id\n    JOIN matches m ON m.match_id = pa.match_id\n    WHERE u0.character_id = ? AND m.patch = ? AND m.rank >= ? AND m.game_datetime >= ? AND {}\n    {}\n    {}\n  ",
+        ranked_only("m"),
         units[1..].iter().map(|_| "AND EXISTS (SELECT 1 FROM units x WHERE x.participant_id = pa.id AND x.character_id = ?)").collect::<Vec<_>>().join("\n"),
         traits.iter().map(|_| "AND EXISTS (SELECT 1 FROM traits t WHERE t.participant_id = pa.id AND t.name = ?)").collect::<Vec<_>>().join("\n"),
     );
@@ -753,14 +754,31 @@ pub fn lists(conn: &Connection) -> Result<Obj> {
 
 // ---- Status --------------------------------------------------------------------
 
+/// Ranked matches only (E12), the same SQL text as `rankedOnly()` in `src/db.ts` and `ranked_only` in tft-stats.
+/// Other game modes are stored but not counted.
+fn ranked_only(table: &str) -> String {
+    let id = tft_core::config::Config::from_env().ranked_queue_id;
+    format!("({table}.queue_id IS NULL OR {table}.queue_id = {id})")
+}
+
 pub fn meta(conn: &Connection, q: Option<&str>) -> Result<Obj> {
     let sc = scope(conn, q)?;
     let totals = row(
         conn,
-        "SELECT (SELECT COUNT(*) FROM matches) matches, (SELECT COUNT(*) FROM participants) comps,\n    (SELECT COUNT(*) FROM players) players, (SELECT COUNT(*) FROM match_queue WHERE status = 0) queued,\n    (SELECT MAX(game_datetime) FROM matches) newest, (SELECT COUNT(*) FROM static_data) staticRows",
+        &format!(
+            "SELECT (SELECT COUNT(*) FROM matches m WHERE {r}) matches,\n    (SELECT COUNT(*) FROM participants pa JOIN matches m ON m.match_id = pa.match_id WHERE {r}) comps,\n    (SELECT COUNT(*) FROM players) players, (SELECT COUNT(*) FROM match_queue WHERE status = 0) queued,\n    (SELECT MAX(game_datetime) FROM matches) newest, (SELECT COUNT(*) FROM static_data) staticRows",
+            r = ranked_only("m")
+        ),
         &[],
     )?;
-    let by_patch = rows(conn, "SELECT patch, COUNT(*) matches FROM matches GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT 8", &[])?;
+    let by_patch = rows(
+        conn,
+        &format!(
+            "SELECT patch, COUNT(*) matches FROM matches m WHERE {}\n    GROUP BY patch ORDER BY MAX(game_datetime) DESC LIMIT 8",
+            ranked_only("m")
+        ),
+        &[],
+    )?;
     Ok(with(
         public(&sc),
         &[
