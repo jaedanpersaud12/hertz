@@ -6,16 +6,61 @@
 use crate::limiter::{DEFAULT_LIMITS, Limiter, SlotUse};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tft_core::riot::{Account, LeagueEntry, LeagueList, RankEntry, RiotMatch};
 
+/// What is wrong with the API key. Each case has its own sentence and its own fix, so the crawler and the app
+/// (PRD 10's key test) show the same words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyProblem {
+    /// `RIOT_API_KEY` is empty or unset. No request was sent.
+    Missing,
+    /// Riot rejected (401 or 403) a key that has worked before.
+    Expired,
+    /// Riot kept rejecting a key that has never worked, for [`ACTIVATION_WAIT`].
+    NotActive,
+}
+
+impl KeyProblem {
+    /// What is wrong, in one sentence.
+    pub fn problem(self) -> &'static str {
+        match self {
+            KeyProblem::Missing => "Your Riot API key is not set.",
+            KeyProblem::Expired => "Your Riot API key has expired. Development keys last 24 hours.",
+            KeyProblem::NotActive => "Riot does not accept your API key. It is not active yet, or it is not a valid key.",
+        }
+    }
+
+    /// What to do about it.
+    pub fn fix(self) -> &'static str {
+        match self {
+            KeyProblem::Missing => {
+                "Copy .env.example to .env, put your key from developer.riotgames.com after RIOT_API_KEY=, then start again."
+            }
+            KeyProblem::Expired => {
+                "Generate a new key at developer.riotgames.com, put it after RIOT_API_KEY= in .env, then restart."
+            }
+            KeyProblem::NotActive => {
+                "Check that you copied the whole key into .env. New keys can take a few minutes to start working, \
+                 so wait a few minutes after generating it, then try again."
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for KeyProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.problem(), self.fix())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RiotError {
-    /// The key is missing, expired or not allowed. The crawler stops on this.
+    /// The key is missing, expired or not active. The crawler stops all groups on this.
     #[error("{0}")]
-    Key(String),
+    Key(KeyProblem),
     /// Riot kept failing or could not be reached. Nothing is lost: the caller waits and tries again.
     #[error("{0}")]
     Unavailable(String),
@@ -37,7 +82,25 @@ pub struct RiotClient {
     base: String,
     margin: f64,
     limiters: Mutex<HashMap<String, Arc<Limiter>>>,
+    /// Riot has accepted this key before: in this process, or in an earlier run (the crawler remembers it).
+    key_worked: AtomicBool,
     pub counts: Counts,
+}
+
+/// How long a key that has never worked keeps being retried before it is reported (PRD rule 5).
+pub const ACTIVATION_WAIT: Duration = Duration::from_secs(120);
+/// The spacing of those retries.
+const ACTIVATION_RETRY: Duration = Duration::from_secs(15);
+
+/// A fingerprint of the key that can be stored without storing the key: 64-bit FNV-1a, in hex. It cannot be
+/// turned back into the key, and it stays the same across builds, so it can be compared on the next start.
+pub fn key_fingerprint(key: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.trim().bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a64:{h:016x}")
 }
 
 /// Tries per request on server errors and network failures. A 429 does not use one up.
@@ -77,8 +140,25 @@ impl RiotClient {
             base: base.to_string(),
             margin,
             limiters: Mutex::new(HashMap::new()),
+            key_worked: AtomicBool::new(false),
             counts: Counts::default(),
         }
+    }
+
+    /// The fingerprint of this client's key, for remembering that it has worked.
+    pub fn key_fingerprint(&self) -> String {
+        key_fingerprint(&self.key)
+    }
+
+    /// Whether Riot has accepted this key, in this process or (if the caller said so) before.
+    pub fn key_worked(&self) -> bool {
+        self.key_worked.load(Ordering::Relaxed)
+    }
+
+    /// Says the key has worked before (in an earlier run), so a rejection means it has expired and is reported
+    /// straight away instead of after the activation wait.
+    pub fn set_key_worked(&self) {
+        self.key_worked.store(true, Ordering::Relaxed);
     }
 
     /// How much of a host's long rate-limit window is in use. `None` before the first request to it.
@@ -107,7 +187,12 @@ impl RiotClient {
     /// the host after the last try: the crawler pauses that group for 60 s on `Unavailable`, as the
     /// TypeScript crawler does, and the queued match stays queued.
     ///
-    /// Three intended differences from the TypeScript client:
+    /// On 401 or 403 (PRD rule 5): a key that has worked before has expired, and is reported at once. A key
+    /// that has never worked may still be activating, so the same request is retried every 15 s, through the
+    /// limiter, and [`KeyProblem::NotActive`] is reported only once [`ACTIVATION_WAIT`] has passed. Any success
+    /// in between carries on as normal.
+    ///
+    /// Four intended differences from the TypeScript client:
     /// - 429 retries are uncapped. A 429 waits Retry-After and sends the same request again, and never uses
     ///   up one of the six tries (PRD rule 4). The TypeScript client counts 429s against its tries.
     /// - The request does not check the crawler's stop flag between 429 waits. A stop takes effect once the
@@ -115,15 +200,17 @@ impl RiotClient {
     ///   gives up within six attempts.
     /// - The client gives up straight after the sixth failed try. The TypeScript client waits one more
     ///   backoff (32 s) after its last try before it throws.
+    /// - Key errors are told apart (missing, expired, not active yet) and a new key gets the 2-minute
+    ///   activation wait. The TypeScript client reports every 401 or 403 at once with one sentence. This is a
+    ///   deliberate Rust-only improvement (E4); the TypeScript crawler is left as it is.
     pub async fn get<T: DeserializeOwned>(&self, host: &str, path: &str) -> Result<Option<T>, RiotError> {
         if self.key.is_empty() {
-            return Err(RiotError::Key(
-                "RIOT_API_KEY is not set. Copy .env.example to .env and add your key.".into(),
-            ));
+            return Err(RiotError::Key(KeyProblem::Missing));
         }
         let url = format!("{}{}", self.base.replace("{host}", host), path);
         let limiter = self.limiter(host);
         let mut failures = 0;
+        let mut first_rejected: Option<tokio::time::Instant> = None;
 
         loop {
             let permit = limiter.acquire().await;
@@ -142,6 +229,10 @@ impl RiotClient {
             limiter.update_from_header(res.headers().get("x-app-rate-limit").and_then(|v| v.to_str().ok()));
 
             let status = res.status().as_u16();
+            if res.status().is_success() || status == 404 {
+                // Riot checks the key before anything else, so a 404 means the key was accepted too.
+                self.set_key_worked();
+            }
             if res.status().is_success() {
                 self.counts.ok.fetch_add(1, Ordering::Relaxed);
                 return res.json::<T>().await.map(Some).map_err(|source| RiotError::BadBody { url, source });
@@ -149,10 +240,14 @@ impl RiotClient {
             match status {
                 404 => return Ok(None),
                 401 | 403 => {
-                    return Err(RiotError::Key(format!(
-                        "Riot rejected the API key ({status}) on {host}. Development keys expire every 24 hours: \
-                         generate a new one at developer.riotgames.com and update .env."
-                    )));
+                    if self.key_worked() {
+                        return Err(RiotError::Key(KeyProblem::Expired));
+                    }
+                    let since = *first_rejected.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= ACTIVATION_WAIT {
+                        return Err(RiotError::Key(KeyProblem::NotActive));
+                    }
+                    tokio::time::sleep(ACTIVATION_RETRY).await;
                 }
                 429 => {
                     self.counts.limited.fetch_add(1, Ordering::Relaxed);
@@ -304,13 +399,28 @@ mod tests {
 
     /// No request timeout and no idle pool, so the only timers in a paused-time test are the client's own.
     fn client(base: &str) -> RiotClient {
+        client_with_key("test-key", base)
+    }
+
+    fn client_with_key(key: &str, base: &str) -> RiotClient {
         init_tls();
         let http = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
-        RiotClient::new("test-key", base, 1.0).with_http(http)
+        RiotClient::new(key, base, 1.0).with_http(http)
+    }
+
+    fn key_problem(err: RiotError) -> KeyProblem {
+        match err {
+            RiotError::Key(p) => p,
+            other => panic!("expected a key error, got {other:?}"),
+        }
     }
 
     fn gaps(hits: &Hits) -> Vec<Duration> {
-        hits.lock().unwrap().windows(2).map(|w| w[1].0 - w[0].0).collect()
+        gaps_of(&hits.lock().unwrap())
+    }
+
+    fn gaps_of(hits: &[(Instant, String)]) -> Vec<Duration> {
+        hits.windows(2).map(|w| w[1].0 - w[0].0).collect()
     }
 
     #[tokio::test(start_paused = true)]
@@ -459,5 +569,121 @@ mod tests {
         }
         let used = riot.slot_use("americas").unwrap();
         assert_eq!((used.last_window, used.riot_limit), (3, 50));
+    }
+
+    // ---- Key errors (E4, PRD rule 5) ----------------------------------------------------------------
+
+    #[test]
+    fn each_key_problem_has_its_own_sentence_and_fix() {
+        let all = [KeyProblem::Missing, KeyProblem::Expired, KeyProblem::NotActive];
+        for (i, a) in all.iter().enumerate() {
+            assert_eq!(a.to_string(), format!("{} {}", a.problem(), a.fix()));
+            for b in &all[i + 1..] {
+                assert_ne!(a.problem(), b.problem());
+                assert_ne!(a.fix(), b.fix());
+            }
+        }
+        let missing = KeyProblem::Missing.to_string();
+        assert!(missing.contains("not set") && missing.contains(".env") && missing.contains("developer.riotgames.com"));
+        let expired = KeyProblem::Expired.to_string();
+        assert!(expired.contains("expired") && expired.contains("24 hours"));
+        assert!(expired.contains("developer.riotgames.com") && expired.contains(".env") && expired.contains("restart"));
+        let not_active = KeyProblem::NotActive.to_string();
+        assert!(not_active.contains("not active yet") && not_active.contains("not a valid key"));
+        assert!(not_active.contains("whole key") && not_active.contains("wait a few minutes"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_key_is_reported_at_once_and_nothing_is_sent() {
+        let (base, hits) = serve(vec![]).await;
+        for key in ["", "   "] {
+            let riot = client_with_key(key, &base);
+            let err = riot.get::<Vec<String>>("americas", "/ids").await.unwrap_err();
+            assert_eq!(key_problem(err), KeyProblem::Missing);
+        }
+        assert_eq!(hits.lock().unwrap().len(), 0, "no request may be sent without a key");
+    }
+
+    /// A new key that Riot keeps rejecting is retried for two minutes, then reported as not active.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_that_has_never_worked_is_retried_for_two_minutes_then_reported_as_not_active() {
+        let (base, hits) = serve((0..40).map(|_| Reply::Http(403, "", "{}")).collect()).await;
+        let riot = client(&base);
+        let started = Instant::now();
+
+        let err = riot.get::<Vec<String>>("americas", "/ids").await.unwrap_err();
+        let reported = Instant::now() - started;
+        assert_eq!(key_problem(err), KeyProblem::NotActive);
+        assert!(reported >= ACTIVATION_WAIT, "reported after {reported:?}, before the 2-minute activation wait");
+        let hits = hits.lock().unwrap().clone();
+        assert!(hits.iter().all(|(_, p)| p == "/americas/ids"), "the same request is retried");
+        let span = hits.last().unwrap().0 - hits[0].0;
+        assert!(span >= ACTIVATION_WAIT, "first and last try were {span:?} apart, expected 2 minutes");
+        assert!(span < ACTIVATION_WAIT + Duration::from_secs(16), "first and last try were {span:?} apart");
+        assert!(hits.len() >= 5 && hits.len() <= 13, "{} tries in two minutes; expected one every 10-15 s", hits.len());
+        for gap in gaps_of(&hits) {
+            assert!(gap >= Duration::from_secs(10), "retried after {gap:?}");
+        }
+        assert!(!riot.key_worked());
+    }
+
+    /// The key starts working 40 s in: the request carries on as if nothing had happened.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_key_that_starts_working_within_two_minutes_carries_on_with_no_error() {
+        let mut script: Vec<Reply> = (0..3).map(|_| Reply::Http(403, "", "{}")).collect();
+        script.push(Reply::Http(200, "", "[\"NA1_9\"]"));
+        let (base, hits) = serve(script).await;
+        let riot = client(&base);
+        let started = Instant::now();
+
+        let got = riot.get::<Vec<String>>("americas", "/ids").await.unwrap();
+        assert_eq!(got, Some(vec!["NA1_9".to_string()]));
+        assert_eq!(hits.lock().unwrap().len(), 4);
+        let took = Instant::now() - started;
+        assert!(took >= Duration::from_secs(30) && took < ACTIVATION_WAIT, "took {took:?}");
+        assert!(riot.key_worked(), "a success marks the key as working");
+    }
+
+    /// A key remembered as working (from an earlier run) that Riot now rejects has expired: no 2-minute wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_that_worked_before_is_reported_expired_at_once() {
+        for status in [401, 403] {
+            let (base, hits) = serve((0..20).map(|_| Reply::Http(status, "", "{}")).collect()).await;
+            let riot = client(&base);
+            riot.set_key_worked();
+            let started = Instant::now();
+
+            let err = riot.get::<Vec<String>>("americas", "/ids").await.unwrap_err();
+            assert_eq!(key_problem(err), KeyProblem::Expired, "status {status}");
+            assert_eq!(hits.lock().unwrap().len(), 1, "status {status}: exactly one request");
+            assert!(Instant::now() - started < Duration::from_secs(1), "status {status}: reported late");
+        }
+    }
+
+    /// Within one run, once Riot has accepted the key, a later rejection means it has expired.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_after_a_success_in_the_same_run_is_reported_expired() {
+        let (base, hits) =
+            serve(vec![Reply::Http(200, "", "[]"), Reply::Http(403, "", "{}"), Reply::Http(403, "", "{}")]).await;
+        let riot = client(&base);
+        assert!(!riot.key_worked());
+
+        assert_eq!(riot.get::<Vec<String>>("americas", "/ids").await.unwrap(), Some(vec![]));
+        assert!(riot.key_worked());
+        let started = Instant::now();
+        let err = riot.get::<Vec<String>>("europe", "/ids").await.unwrap_err();
+        assert_eq!(key_problem(err), KeyProblem::Expired);
+        assert_eq!(hits.lock().unwrap().len(), 2);
+        assert!(Instant::now() - started < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_key_fingerprint_is_stable_and_does_not_contain_the_key() {
+        let key = "RGAPI-00000000-1111-2222-3333-444444444444";
+        let fp = key_fingerprint(key);
+        assert_eq!(fp, key_fingerprint(&format!(" {key}\n")), "trimmed like the client trims the key");
+        assert_ne!(fp, key_fingerprint("RGAPI-00000000-1111-2222-3333-444444444445"));
+        assert!(!fp.contains("RGAPI") && !fp.contains("4444"), "{fp}");
+        assert_eq!(key_fingerprint("a"), "fnv1a64:af63dc4c8601ec8c", "the same across builds");
     }
 }

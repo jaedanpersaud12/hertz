@@ -6,5 +6,5 @@ pub mod client;
 pub mod crawl;
 pub mod limiter;
 
-pub use client::{RiotClient, RiotError, http_client, init_tls};
+pub use client::{ACTIVATION_WAIT, KeyProblem, RiotClient, RiotError, http_client, init_tls, key_fingerprint};
 pub use crawl::{CrawlOptions, Crawler};
