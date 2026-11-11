@@ -103,6 +103,13 @@ pub const STAT_TABLES: [&str; 12] = [
     "stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels",
 ];
 
+/// Numbered schema additions, applied in order on every open. Each one is idempotent. Kept identical to
+/// `MIGRATIONS` in `src/db.ts`.
+pub const MIGRATIONS: [&str; 1] = [
+    // 1. PRD 1 E5: which match rows each stats scope already holds, for incremental rebuilds.
+    "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)",
+];
+
 /// Bump when the stat table layout changes: old stat tables are dropped and rebuilt on the next stats run.
 pub const STATS_VERSION: i64 = 2;
 

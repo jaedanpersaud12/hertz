@@ -128,6 +128,12 @@ ${stat('stat_comp_traits', 'comp_key, name, tier_current', `comp_key TEXT NOT NU
 ${stat('stat_comp_levels', 'comp_key, level', `comp_key TEXT NOT NULL, level INTEGER NOT NULL, games INTEGER NOT NULL, sum_place INTEGER NOT NULL`)}
 `
 
+/** Numbered schema additions, applied in order on every open. Each one is idempotent. Kept identical to MIGRATIONS in crates/tft-store/src/schema.rs. */
+const MIGRATIONS = [
+  // 1. PRD 1 E5: which match rows each stats scope already holds, for incremental rebuilds.
+  'CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)',
+]
+
 /** Bump when the stat table layout changes: old stat tables are dropped and rebuilt on the next "npm run stats". */
 const STATS_VERSION = 2
 
@@ -153,6 +159,7 @@ export function openDb(path = config.dbPath, opts: { readonly?: boolean } = {}):
     db.exec(SCHEMA)
     migrate(db) // adds columns to databases made by an older version, drops outdated stat tables
     db.exec(STATS_SCHEMA)
+    for (const step of MIGRATIONS) db.exec(step)
   }
   return db
 }
