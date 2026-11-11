@@ -8,6 +8,7 @@
 //!   tft patches                download the patch calendar and date matches stored without one
 //!   tft stats [--patches N]    rebuild the stat tables for the N most recent patches (same as `npm run stats`)
 //!   tft stats --incremental    rebuild only the parts with new matches, and list them
+//!   tft stats --profile        also time every SQL statement and print the slowest (works with --incremental)
 //!   tft serve [--port N] [--dev]  serve the app and its API on 127.0.0.1 (PORT from .env, then 5174)
 //!                              --dev: the API alone on PORT+1 for Vite, with the ?data= stress switch
 //!   tft refresh                download the patch calendar and the set data (names, costs, icons) now
@@ -19,6 +20,7 @@
 //!
 //! Settings come from `.env` in the current folder, the same file the TypeScript engine reads.
 
+mod profile;
 mod synth;
 
 use anyhow::{Context, Result, bail};
@@ -116,6 +118,9 @@ enum Command {
         /// Rebuild only the ranks and time windows that have new matches, and list them. Gives the same tables.
         #[arg(long)]
         incremental: bool,
+        /// Time every SQL statement of the build and print the slowest at the end.
+        #[arg(long)]
+        profile: bool,
     },
     /// Serve the built app and its API on 127.0.0.1, like `npm start`.
     Serve {
@@ -301,7 +306,7 @@ async fn run(command: Command, config: Config) -> Result<()> {
             println!("Stored {added} matches ({repeats} were already stored).");
         }
 
-        Command::Stats { patches, incremental } => {
+        Command::Stats { patches, incremental, profile } => {
             let mut conn = tft_store::open(&config.db_path)?;
             // Matches stored without a patch (Riot stopped sending one) get dated from the patch calendar first.
             let unknown: i64 =
@@ -321,6 +326,7 @@ async fn run(command: Command, config: Config) -> Result<()> {
                     println!("Could not reach Community Dragon for the patch calendar. Check your connection and run this again.");
                 }
             }
+            let prof = if profile { Some(profile::Profile::start(&mut conn)?) } else { None };
             if incremental {
                 let touched = tft_stats::build_stats_incremental_with(&mut conn, patches, &mut |line| println!("{line}"))?;
                 if !touched.is_empty() {
@@ -328,6 +334,9 @@ async fn run(command: Command, config: Config) -> Result<()> {
                 }
             } else {
                 tft_stats::build_stats(&mut conn, patches)?;
+            }
+            if let Some(p) = prof {
+                p.report(25);
             }
         }
 
