@@ -44,7 +44,7 @@ import { request, createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
-import { CDRAGON_LISTING, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, WORLD_NOW } from '../test/world'
+import { CDRAGON_LISTING, fakeSetData, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, WORLD_NOW } from '../test/world'
 
 const UPDATE = process.argv.includes('--update')
 const dir = mkdtempSync(join(tmpdir(), 'tft-golden-'))
@@ -61,6 +61,8 @@ const STAT_TABLES = [
   'stat_comp_special',
   // PRD 2 C8 flex and swaps (migration 6)
   'stat_comp_flex_adds', 'stat_comp_swaps',
+  // PRD 3 unit and trait page depth (migration 7)
+  'stat_unit_pairs', 'stat_teammates', 'stat_trait_sets',
 ]
 let failures = 0
 const ok = (label: string) => console.log(`  ok  ${label}`)
@@ -323,11 +325,17 @@ async function statsSection(ingested: string) {
   // The fixture has no emblems, artifacts or radiants. Set data calling one item an emblem gives stat_comp_special
   // rows; it is removed after the rebuild, so nothing the API section reads changes except those rows.
   pre.prepare("INSERT INTO static_data (kind, id, name, icon, data) VALUES ('item', 'TFT_Item_Thing9', 'Thing 9', NULL, '{\"type\":\"emblem\"}')").run()
+  // Set data's unit traits give stat_trait_sets rows (PRD 3 U8); removed after the rebuild as well.
+  const set99 = fakeSetData().sets['99']
+  const addStatic = pre.prepare('INSERT INTO static_data (kind, id, name, icon, data) VALUES (?, ?, ?, NULL, ?)')
+  for (const t of set99.traits) addStatic.run('trait', t.apiName, t.name, '{}')
+  for (const c of set99.champions!) addStatic.run('unit', c.apiName, c.name, JSON.stringify({ traits: c.traits }))
   pre.close()
   const PATCHES = 4 // the fixture has three patches; one more checks that a short list is handled
   await run(bin, ['--db', path, 'stats', '--patches', String(PATCHES)], {})
   const post = new Database(path)
   post.prepare("DELETE FROM static_data WHERE kind = 'item' AND id = 'TFT_Item_Thing9'").run()
+  post.prepare("DELETE FROM static_data WHERE kind IN ('unit', 'trait')").run()
   post.close()
   const db = new Database(path, { readonly: true })
   for (const table of STAT_TABLES) {
@@ -599,6 +607,21 @@ function apiChecks(db: Database.Database, phase: 'bare' | 'full', icons: { ok: s
     if (id.startsWith('TFT99_Unit1')) for (const s of someScopes) add('/api/units/:id', `/api/units/${enc(id)}${s}`)
   }
   for (const id of ['nope', 'tft99_unit6', 'TFT99%5FUnit6', 'TFT99_Unit6%2Fx', '%E0%A4%A', 'TFT99_KOGMAW']) add('/api/units/:id', `/api/units/${id}`)
+
+  // PRD 3: builds by comp (U2), the item completer (U3) and the trait page (U8).
+  for (const id of ['TFT99_Unit17', 'TFT99_Unit9', 'TFT99_Unit6']) {
+    add('/api/units/:id/builds', `/api/units/${id}/builds?min=1`, nonEmpty)
+    for (const c of comps.slice(0, 3)) add('/api/units/:id/builds', `/api/units/${id}/builds?min=1&comp=${enc(c)}`)
+    add('/api/units/:id/pairs', `/api/units/${id}/pairs?min=1`, nonEmpty)
+    for (const have of ['TFT_Item_Thing1', 'TFT_Item_Thing1,TFT_Item_Thing2', 'TFT_Item_Thing2,TFT_Item_Thing1', 'TFT_Item_Thing3,TFT_Item_Thing3', 'TFT_Item_Thing9']) {
+      add('/api/units/:id/pairs', `/api/units/${id}/pairs?min=1&have=${have}`)
+    }
+  }
+  for (const u of ['/api/units/nope/builds', '/api/units/nope/pairs?have=x', '/api/units/TFT99_Unit17/builds?comp=nope', '/api/units/TFT99_Unit17/pairs?patch=16.22&window=3d']) add('/api/units/:id/*', u)
+  for (const t of ['TFT99_Vanguard', 'TFT99_Shared', 'TFT99_Loner', 'TFT99_Mystic', 'nope']) {
+    add('/api/traits/:id', `/api/traits/${t}`)
+    add('/api/traits/:id', `/api/traits/${t}?bucket=MASTER%2B&window=3d`)
+  }
 
   for (const id of items) {
     add('/api/items/:id', `/api/items/${enc(id)}`, (b) => b.item.games > 0)
@@ -1027,6 +1050,7 @@ async function stressSection(from: string, cwd: string) {
       '/api/units/nope', '/api/items', '/api/items/TFT_Item_Thing1', '/api/items/nope', '/api/traits', '/api/explore?units=TFT99_Unit6',
       '/api/explore?units=nope', '/api/explore', '/api/lists', '/api/me', '/api/me/matches', '/api/icon/unit/TFT99_Unit0', '/api/nothing', '/',
       '/api/health', '/api/settings/crawl',
+      '/api/units/TFT99_Unit17/builds', '/api/units/TFT99_Unit17/pairs?have=TFT_Item_Thing1', '/api/traits/TFT99_Vanguard',
     ]
     const modes = ['worst', 'empty', 'one', 'many', '', 'bogus', 'WORST', 'worst&data=empty']
     const SYNTHETIC = ['worst', 'empty', 'one', 'many', 'worst&data=empty']

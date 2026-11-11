@@ -133,9 +133,12 @@ enum Route {
     Comp(String),
     Units,
     Unit(String),
+    UnitBuilds(String),
+    UnitPairs(String),
     Items,
     Item(String),
     Traits,
+    Trait(String),
     Explore,
     Lists,
     Health,
@@ -154,9 +157,12 @@ fn route(path: &str) -> Option<Route> {
         ["", "api", "comps", id] if !id.is_empty() => Route::Comp(p(id)),
         ["", "api", "units"] => Route::Units,
         ["", "api", "units", id] if !id.is_empty() => Route::Unit(p(id)),
+        ["", "api", "units", id, "builds"] if !id.is_empty() => Route::UnitBuilds(p(id)),
+        ["", "api", "units", id, "pairs"] if !id.is_empty() => Route::UnitPairs(p(id)),
         ["", "api", "items"] => Route::Items,
         ["", "api", "items", id] if !id.is_empty() => Route::Item(p(id)),
         ["", "api", "traits"] => Route::Traits,
+        ["", "api", "traits", id] if !id.is_empty() => Route::Trait(p(id)),
         ["", "api", "explore"] => Route::Explore,
         ["", "api", "lists"] => Route::Lists,
         ["", "api", "health"] => Route::Health,
@@ -302,9 +308,12 @@ async fn answer(app: Arc<App>, req: Request<Body>) -> Response {
                     Route::Comp(id) => routes::comp(&conn, q, &id, &app2.comps),
                     Route::Units => routes::units(&conn, q),
                     Route::Unit(id) => routes::unit(&conn, q, &id, &app2.comps),
+                    Route::UnitBuilds(id) => routes::unit_builds(&conn, q, &id),
+                    Route::UnitPairs(id) => routes::unit_pairs(&conn, q, &id),
                     Route::Items => routes::items(&conn, q),
                     Route::Item(id) => routes::item(&conn, q, &id),
                     Route::Traits => routes::traits(&conn, q),
+                    Route::Trait(id) => routes::trait_detail(&conn, q, &id),
                     Route::Explore => routes::explore(&conn, q),
                     Route::Lists => routes::lists(&conn),
                     Route::Health => engine::health(&conn, &app2.config),
@@ -438,6 +447,10 @@ mod tests {
         assert!(matches!(route("/api/units/a%2Fb"), Some(Route::Unit(id)) if id == "a/b"));
         assert!(route("/api/comps/").is_none());
         assert!(route("/api/comps/a/b").is_none());
+        assert!(matches!(route("/api/units/a%2Fb/pairs"), Some(Route::UnitPairs(id)) if id == "a/b"));
+        assert!(matches!(route("/api/units/x/builds"), Some(Route::UnitBuilds(id)) if id == "x"));
+        assert!(matches!(route("/api/traits/T"), Some(Route::Trait(id)) if id == "T"));
+        assert!(route("/api/units//pairs").is_none() && route("/api/units/x/other").is_none());
         assert!(route("/api/icon/unit/").is_none());
         assert!(matches!(action(&Method::GET, "/api/me"), Some(Action::Me)));
         assert!(matches!(action(&Method::DELETE, "/api/teams/3"), Some(Action::DeleteTeam(id)) if id == "3"));
