@@ -315,7 +315,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_429_honours_retry_after_and_does_not_use_up_a_try() {
-        let mut script: Vec<Reply> = (0..7).map(|_| Reply::Http(429, "retry-after: 3\r\n", "")).collect();
+        // 8 s is above the client's 5 s fallback, so a client that ignored the header would retry too soon.
+        let mut script: Vec<Reply> = (0..7).map(|_| Reply::Http(429, "retry-after: 8\r\n", "")).collect();
         script.push(Reply::Http(200, "", "[\"NA1_1\"]"));
         let (base, hits) = serve(script).await;
         let riot = client(&base);
@@ -325,7 +326,8 @@ mod tests {
         assert_eq!(hits.lock().unwrap().len(), 8);
         assert!(hits.lock().unwrap().iter().all(|(_, p)| p == "/americas/ids"), "the same request is retried");
         for gap in gaps(&hits) {
-            assert!(gap >= Duration::from_secs(3), "retried after {gap:?}, Retry-After said 3 s");
+            assert!(gap >= Duration::from_secs(8), "retried after {gap:?}, Retry-After said 8 s");
+            assert!(gap < Duration::from_millis(9500), "retried after {gap:?}, Retry-After said 8 s");
         }
         assert_eq!(riot.counts.limited.load(Ordering::Relaxed), 7);
         assert_eq!(riot.counts.retried.load(Ordering::Relaxed), 0);
@@ -335,7 +337,8 @@ mod tests {
     /// that got it (PRD rule 4: block that group). Other regions keep going.
     #[tokio::test(start_paused = true)]
     async fn a_429_blocks_the_whole_group_and_leaves_other_regions_free() {
-        let (base, hits) = serve(vec![Reply::Http(429, "retry-after: 3\r\n", "")]).await;
+        // 8 s is above the client's 5 s fallback, so a client that ignored the header would release the group too soon.
+        let (base, hits) = serve(vec![Reply::Http(429, "retry-after: 8\r\n", "")]).await;
         let riot = client(&base);
 
         let a = riot.get::<Vec<String>>("americas", "/a");
@@ -355,13 +358,23 @@ mod tests {
 
         let hits = hits.lock().unwrap().clone();
         let sent = |path: &str| hits.iter().filter(|(_, p)| p == path).map(|(at, _)| *at).collect::<Vec<_>>();
-        assert_eq!(sent("/americas/a").len(), 2, "A gets its 429, then is sent again");
+        let a_at = sent("/americas/a");
+        assert_eq!(a_at.len(), 2, "A gets its 429, then is sent again");
+        let a_gap = a_at[1] - a_at[0];
+        assert!(
+            a_gap >= Duration::from_secs(8) && a_gap < Duration::from_millis(9500),
+            "americas A was sent again {a_gap:?} after its 429; Retry-After said 8 s"
+        );
         let b_at = sent("/americas/b");
         assert_eq!(b_at.len(), 1);
+        let b_wait = b_at[0] - limited_at;
         assert!(
-            b_at[0] - limited_at >= Duration::from_secs(3),
-            "americas B was sent {:?} after the 429; Retry-After said 3 s for the whole group",
-            b_at[0] - limited_at
+            b_wait >= Duration::from_secs(8),
+            "americas B was sent {b_wait:?} after the 429; Retry-After said 8 s for the whole group"
+        );
+        assert!(
+            b_wait < Duration::from_millis(9500),
+            "americas B was sent {b_wait:?} after the 429; Retry-After said 8 s for the whole group"
         );
         let eu_at = sent("/europe/eu");
         assert_eq!(eu_at.len(), 1);
