@@ -1,9 +1,11 @@
 //! The SQLite database: opening and upgrading it, small key-value settings, and storing matches.
 
 mod ingest;
+mod prune;
 pub mod schema;
 
 pub use ingest::{Ingest, relabel_unknown};
+pub use prune::{Compacted, Pruned, compact, prune_old_patches};
 pub use rusqlite::{Connection, Error, params};
 
 use anyhow::{Context, Result};
