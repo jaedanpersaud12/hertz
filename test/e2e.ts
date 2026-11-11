@@ -1,33 +1,40 @@
 /**
- * End-to-end check against a fake Riot API running on this machine.
+ * End-to-end check of the tft engine against a fake Riot API and a fake Community Dragon running on this machine.
  * Covers: ladder seeding, rate limiting, retries, match storage, comp grouping, stats maths and the app's API.
  *
  *   npm test
  */
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { execFileSync, spawn } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 
-import { ARCHETYPES, idsByPlayer, ITEMS, matches, otherModeMatches, rankedMatches, startFakeRiot, UNITS, archetypeOf } from './world'
+import { ARCHETYPES, idsByPlayer, ITEMS, matches, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, UNITS, archetypeOf } from './world'
 
-const run = (script: string, args: string[], env: Record<string, string>) =>
+const root = join(import.meta.dirname, '..')
+const bin = join(root, 'target', 'debug', process.platform === 'win32' ? 'tft.exe' : 'tft')
+execFileSync('cargo', ['build', '-q', '-p', 'tft-cli'], { cwd: root, stdio: 'inherit' })
+
+/** Runs `tft <args>` and resolves with what it printed. */
+const run = (args: string[], env: Record<string, string>) =>
   new Promise<string>((resolve, reject) => {
-    const child = spawn(process.execPath, ['--import', 'tsx', script, ...args], { env: { ...process.env, ...env } })
+    const child = spawn(bin, args, { env: { ...process.env, ...env } })
     let out = ''
     child.stdout.on('data', (d) => (out += d))
     child.stderr.on('data', (d) => (out += d))
-    child.on('exit', (code) => (code === 0 ? resolve(out) : reject(new Error(`${script} exited ${code}\n${out}`))))
+    child.on('exit', (code) => (code === 0 ? resolve(out) : reject(new Error(`tft ${args.join(' ')} exited ${code}\n${out}`))))
   })
 
 const dir = mkdtempSync(join(tmpdir(), 'tft-local-test-'))
 const dbPath = process.env.TEST_KEEP_DB ?? join(dir, 'tft.db') // set TEST_KEEP_DB to keep the fixture database for a look around
 const fake = await startFakeRiot()
+const cdragon = await startFakeCdragon()
 const { seen } = fake
 const mockPort = fake.port
 const env = {
+  NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost', CDRAGON_BASE: cdragon.base,
   RIOT_API_KEY: 'TEST-KEY', RIOT_API_BASE: `http://127.0.0.1:${mockPort}/{host}`, DB_PATH: dbPath,
   PLATFORMS: 'na1,euw1', TIERS: 'CHALLENGER,GRANDMASTER,MASTER,DIAMOND', PAGES_PER_DIVISION: '2', SNOWBALL: 'true', PORT: '5298',
   RIOT_ID: 'Tester#NA1', MY_PLATFORM: 'na1',
@@ -49,7 +56,7 @@ try {
       INSERT INTO units VALUES (1,'A',2,3,'x|y|z'), (1,'B',2,0,NULL), (1,'C',1,0,NULL), (1,'D',2,1,NULL);
       INSERT INTO traits VALUES (1,'Big',6,3,4), (1,'Small',2,1,1);`)
     old.close()
-    await run('src/stats/recluster.ts', [], { ...env, DB_PATH: oldPath })
+    await run(['recluster'], { ...env, DB_PATH: oldPath })
     const upgraded = new Database(oldPath)
     assert.equal((upgraded.prepare('SELECT comp_key FROM participants').get() as any).comp_key, 'Big|A')
     assert.equal((upgraded.prepare("SELECT COUNT(*) n FROM pragma_table_info('stat_units') WHERE name = 'avg_star'").get() as any).n, 1)
@@ -60,7 +67,7 @@ try {
   // 1. Crawl
   console.log('Crawling the fake API...')
   const t0 = Date.now()
-  await run('src/crawler/crawl.ts', ['--once'], env)
+  await run(['crawl', '--once'], env)
   console.log(`  took ${((Date.now() - t0) / 1000).toFixed(1)} s, ${seen.total} requests`)
 
   const db = new Database(dbPath)
@@ -86,13 +93,13 @@ try {
 
   // 2. Crawl again: nothing new should be fetched or duplicated
   const before = seen.total
-  await run('src/crawler/crawl.ts', ['--once'], env)
+  await run(['crawl', '--once'], env)
   assert.equal(count('SELECT COUNT(*) n FROM matches'), matches.size)
   assert.equal(seen.total, before)
   ok('a second run made no requests and stored no duplicates')
 
   // 3. Stats, checked against a straight recount of the fixtures
-  await run('src/stats/build.ts', [], env)
+  await run(['stats'], env)
   const stat = (sql: string, ...a: unknown[]) => db.prepare(sql).get(...a) as any
   const boards = rankedMatches.flatMap((m) => m.info.participants.map((p: any) => ({ ...p, arch: archetypeOf.get(`${m.metadata.match_id}|${p.puuid}`)! })))
   const avg = (bs: any[]) => bs.reduce((s, b) => s + b.placement, 0) / bs.length
@@ -150,52 +157,54 @@ try {
   ok(`rank and time filters work (${master} of ${all} matches are Master+)`)
 
   // Riot's real match data has no usable version, so patches are dated from a calendar.
+  // The calendar comes from Community Dragon's listing (the fake one lists 16.21, latest, 16.22 and pbe);
+  // tft ingest dates each match by it. The same cases run as unit tests in tft-core (patches.rs).
   {
-    const { toCalendar, patchAt, patchFor } = await import('../src/patches')
-    const cal = toCalendar([
-      { name: '16.21', mtime: 'Wed, 21 Oct 2026 07:15:23 GMT' }, { name: 'latest', mtime: 'Wed, 04 Nov 2026 07:47:21 GMT' },
-      { name: '16.22', mtime: 'Wed, 04 Nov 2026 07:47:21 GMT' }, { name: 'pbe', mtime: 'Thu, 27 Feb 2025 06:58:53 GMT' },
-    ])
-    assert.deepEqual(cal.map((p) => p.patch), ['16.21', '16.22'])
-    assert.equal(patchAt(Date.parse('2026-11-10T18:00:00Z'), cal), '16.22')
-    assert.equal(patchAt(Date.parse('2026-11-03T18:00:00Z'), cal), '16.21')
-    assert.equal(patchAt(Date.parse('2026-09-01T00:00:00Z'), cal), '16.21')
-    assert.equal(patchAt(Date.now(), []), 'unknown')
-    assert.equal(patchFor('Linux Version 15.9.1 [PUBLIC] <Releases/15.9>', 0), '15.9')
+    const calPath = join(dir, 'calendar.db')
+    const bare = join(dir, 'no-calendar.db')
+    await run(['refresh'], { ...env, DB_PATH: calPath })
+    const cal = JSON.parse((new Database(calPath).prepare("SELECT value FROM kv WHERE key = 'patch_calendar'").get() as any).value)
+    assert.deepEqual(cal.map((p: any) => p.patch), ['16.21', '16.22'])
+    const at = (id: string, version: string, when: number) => {
+      const m = structuredClone(rankedMatches[0])
+      m.metadata.match_id = id
+      m.info.game_version = version
+      m.info.game_datetime = when
+      return m
+    }
+    const file = join(dir, 'versions.json')
+    writeFileSync(file, JSON.stringify([
+      at('CAL_1110', 'TFT Unreal Version ?.?.?.?', Date.parse('2026-11-10T18:00:00Z')),
+      at('CAL_1103', 'TFT Unreal Version ?.?.?.?', Date.parse('2026-11-03T18:00:00Z')),
+      at('CAL_0901', 'TFT Unreal Version ?.?.?.?', Date.parse('2026-09-01T00:00:00Z')),
+      at('CAL_159', 'Linux Version 15.9.1 [PUBLIC] <Releases/15.9>', 0),
+    ]))
+    await run(['ingest', file, '--no-snowball'], { ...env, DB_PATH: calPath })
+    await run(['ingest', file, '--no-snowball'], { ...env, DB_PATH: bare })
+    const patchOf = (path: string, id: string) => (new Database(path, { readonly: true }).prepare('SELECT patch FROM matches WHERE match_id = ?').get(id) as any).patch
+    assert.equal(patchOf(calPath, 'CAL_1110'), '16.22')
+    assert.equal(patchOf(calPath, 'CAL_1103'), '16.21')
+    assert.equal(patchOf(calPath, 'CAL_0901'), '16.21')
+    assert.equal(patchOf(bare, 'CAL_1110'), 'unknown')
+    assert.equal(patchOf(calPath, 'CAL_159'), '15.9')
     ok('matches without a version are dated to a patch from the calendar')
   }
 
   // 4. Static data
-  const { storeStatic, cleanText, itemType } = await import('../src/static/fetch')
-  const icon = (n: string) => `ASSETS/Characters/${n}/HUD/${n}_Square.TFT_Set99.tex`
-  const traitNames = [...ARCHETYPES.map((a) => a.trait), 'TFT99_Shared', 'TFT99_Loner']
-  storeStatic(db as any, {
-    items: ITEMS.map((i, n) => ({ apiName: i.id, name: `Thing ${n}`, icon: `ASSETS/Maps/TFT/Icons/Items/Thing${n}.TFT_Set99.tex`, composition: n < 6 ? ['TFT_Item_BFSword', 'TFT_Item_ChainVest'] : [] })),
-    sets: {
-      '98': { name: 'Old', champions: [], traits: [] },
-      '99': {
-        name: 'Test Set',
-        traits: traitNames.map((t) => ({ apiName: t, name: t.replace('TFT99_', ''), effects: [{ minUnits: 2, style: 1 }, { minUnits: 4, style: 2 }, { minUnits: 6, style: 4 }] })),
-        champions: UNITS.map((unit, n) => ({
-          apiName: unit.id, name: `Unit ${n}`, cost: unit.cost, role: 'Attack Carry', tileIcon: icon(`TFT99_Unit${n}`),
-          traits: ARCHETYPES.filter((a) => a.core.includes(n)).map((a) => a.trait.replace('TFT99_', '')).concat(n % 2 ? ['Shared'] : []),
-          ability: { name: 'Big Hit', desc: 'Deal <physicalDamage>@Damage@ (%i:scaleAD%)</physicalDamage> damage.<br>Stun for @StunDuration@ seconds.', variables: [{ name: 'Damage', value: [0, 100, 150, 900] }, { name: 'StunDuration', value: [1, 1, 1, 1] }] },
-          stats: { hp: 800, mana: 60, initialMana: 0, damage: 55, armor: 40, magicResist: 40, attackSpeed: 0.75, range: 4 },
-        })),
-      },
-    },
-  })
+  // tft refresh downloads the set data from the fake Community Dragon (test/world.ts, fakeSetData: sets 98 and 99).
+  // The text cleaning and item type cases run as unit tests in tft-riot (cdragon.rs, stored_rows_are_the_typescript_ones).
+  await run(['refresh'], env)
+  assert.equal(stat("SELECT COUNT(*) n FROM static_data WHERE kind='unit' AND id LIKE 'TFT99_%'").n, UNITS.length)
   assert.equal(stat("SELECT icon FROM static_data WHERE kind='unit' AND id='TFT99_Unit19'").icon,
     'https://raw.communitydragon.org/latest/game/assets/characters/tft99_unit19/hud/tft99_unit19_square.tft_set99.png')
-  assert.equal(cleanText('Deal <b>@Damage@</b> (%i:scaleAD%) damage.<br>Stun for @Stun*100@%.', [{ name: 'Damage', value: [0, 100, 150, 900] }, { name: 'Stun', value: [0.5, 0.5, 0.5, 0.5] }]),
-    'Deal 100/150/900 damage.\nStun for 50%.')
-  assert.deepEqual(['TFT5_Item_BloodthirsterRadiant', 'TFT_Item_Artifact_Fishbones', 'TFT99_Item_VanguardEmblemItem', 'TFT_Item_BFSword', 'TFT_Item_X'].map((i) => itemType(i)),
-    ['radiant', 'artifact', 'emblem', 'component', 'other'])
+  assert.equal(JSON.parse(stat("SELECT data FROM static_data WHERE kind='unit' AND id='TFT99_Unit9'").data).ability.text, 'Deal 100/150/900 damage.\nStun for 1 seconds.')
+  assert.deepEqual(ITEMS.map((i) => JSON.parse(stat("SELECT data FROM static_data WHERE kind='item' AND id=?", i.id).data).type),
+    ITEMS.map((_, n) => (n < 6 ? 'craftable' : 'other')))
   ok('static data picks the newest set, builds icon URLs, cleans ability text and sorts items into types')
   db.close()
 
   // 5. The app's API
-  const api = spawn(process.execPath, ['--import', 'tsx', 'src/server/index.ts', '--dev'], { env: { ...process.env, ...env } })
+  const api = spawn(bin, ['serve', '--dev'], { env: { ...process.env, ...env } }) // PORT + 1, as behind Vite
   let apiOut = ''
   api.stdout.on('data', (d) => (apiOut += d)); api.stderr.on('data', (d) => (apiOut += d))
   try {
@@ -291,5 +300,6 @@ try {
   console.log('\nAll checks passed.')
 } finally {
   await fake.close()
+  await cdragon.close()
   rmSync(dir, { recursive: true, force: true })
 }
