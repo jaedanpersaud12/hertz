@@ -19,7 +19,7 @@ import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
-import { rankedMatches, startFakeRiot } from '../test/world'
+import { otherModeMatches, rankedMatches, startFakeRiot } from '../test/world'
 
 const dir = mkdtempSync(join(tmpdir(), 'tft-parity-'))
 const root = join(import.meta.dirname, '..')
@@ -74,6 +74,10 @@ function awkwardMatches() {
         character_id: id, tier: 2, rarity: 4, itemNames: ['TFT_Item_Thing1', 'TFT_Item_Thing2'],
       }))
     }),
+    // Other game modes (E12): stored with their queue id, either spelling; no queue at all is stored as NULL.
+    mk('EDGE_DOUBLEUP', (m) => { m.info.queue_id = 1160 }),
+    mk('EDGE_HYPER_CAMEL', (m) => { delete m.info.queue_id; m.info.queueId = 1130 }),
+    mk('EDGE_NOQUEUE', (m) => { delete m.info.queue_id }),
     // The same match twice: stored once.
     structuredClone(base),
   ]
@@ -129,7 +133,7 @@ try {
 
   // ---- 1. Ingest -------------------------------------------------------------------------
   console.log('\nIngest: same files through both engines')
-  const files = [...rankedMatches, ...awkwardMatches()]
+  const files = [...rankedMatches, ...otherModeMatches, ...awkwardMatches()]
   const matchFile = join(dir, 'matches.json')
   writeFileSync(matchFile, JSON.stringify(files))
 

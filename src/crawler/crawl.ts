@@ -1,5 +1,6 @@
 /**
- * Collects ranked TFT matches into the local database.
+ * Collects TFT matches into the local database. Other game modes (Double Up, Hyper Roll, normals) are stored too,
+ * with their queue id, and left out of the stats.
  *
  *   npm run crawl                     run until you press Ctrl+C
  *   npm run crawl -- --max 5000       stop after storing 5000 matches
@@ -126,11 +127,14 @@ async function crawlRoute(route: string, platforms: string[]) {
       if (stopping || stored >= maxMatches) return
       const match = await getMatch(route, job.match_id)
       const queueId = match?.info.queue_id ?? match?.info.queueId
-      if (!match || queueId !== config.rankedQueueId || match.info.participants.length < 2) {
+      // A match with no queue id is skipped: a stored NULL means "stored before E12", which was always ranked.
+      if (!match || queueId == null || match.info.participants.length < 2) {
         q.setStatus.run(2, job.match_id)
         return
       }
-      if (ingest(match, job.platform, job.seed_rank, TIERS[job.seed_rank], config.snowball)) stored++
+      // Only ranked lobbies are close in rank, so only they bring in new players at the seed player's rank.
+      const ranked = queueId === config.rankedQueueId
+      if (ingest(match, job.platform, job.seed_rank, TIERS[job.seed_rank], config.snowball && ranked)) stored++
       q.setStatus.run(1, job.match_id)
     }))
   }

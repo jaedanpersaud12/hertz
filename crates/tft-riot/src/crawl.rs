@@ -706,24 +706,27 @@ impl Crawler {
                     continue;
                 }
             };
-            let ranked = m.as_ref().is_some_and(|m| {
-                m.info.queue() == Some(self.config.ranked_queue_id) && m.info.participants.len() >= 2
-            });
-            let Some(m) = m.filter(|_| ranked) else {
+            // Every game mode is stored with its queue id (E12); the stats count ranked only. A match with no queue id
+            // is skipped: a stored NULL means "stored before E12", which was always ranked.
+            let keep = m.as_ref().is_some_and(|m| m.info.queue().is_some() && m.info.participants.len() >= 2);
+            let Some(m) = m.filter(|_| keep) else {
                 set_status(id, 2)?;
                 continue;
             };
+            let ranked = m.info.queue() == Some(self.config.ranked_queue_id);
             if !self.below_max() {
                 continue;
             }
-            let ingest = Ingest { platform, rank: *seed_rank, tier: tier_name(*seed_rank), snowball: self.config.snowball };
+            // Only ranked lobbies are close in rank, so only they bring in new players at the seed player's rank.
+            let ingest =
+                Ingest { platform, rank: *seed_rank, tier: tier_name(*seed_rank), snowball: self.config.snowball && ranked };
             let added = {
                 let cal = self.calendar.read().unwrap();
                 die_at("before_store", id);
                 let mut db = self.db.lock().unwrap();
                 let added = ingest.store(&mut db, &m, &cal)?;
                 // Queued even when it was stored before (a kill before its status was set), so none is missed.
-                if is_sampled(id, self.config.rank_sample_rate) {
+                if ranked && is_sampled(id, self.config.rank_sample_rate) {
                     queue_sample(&db, id, platform)?;
                 }
                 added

@@ -66,6 +66,9 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has("units", "rarity")? {
         conn.execute_batch("ALTER TABLE units ADD COLUMN rarity INTEGER")?;
     }
+    if !has("matches", "queue_id")? {
+        conn.execute_batch("ALTER TABLE matches ADD COLUMN queue_id INTEGER")?; // E12; NULL rows are ranked
+    }
     apply_migrations(conn)?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if version != schema::STATS_VERSION {
@@ -124,7 +127,8 @@ mod tests {
         {
             let old = Connection::open(&path).unwrap();
             old.execute_batch(
-                "CREATE TABLE participants (id INTEGER PRIMARY KEY, match_id TEXT NOT NULL, puuid TEXT NOT NULL, placement INTEGER NOT NULL, level INTEGER, last_round INTEGER, gold_left INTEGER, damage INTEGER);
+                "CREATE TABLE matches (match_id TEXT PRIMARY KEY, platform TEXT NOT NULL, patch TEXT NOT NULL, set_number INTEGER, game_datetime INTEGER NOT NULL, game_length REAL, rank INTEGER NOT NULL);
+                 CREATE TABLE participants (id INTEGER PRIMARY KEY, match_id TEXT NOT NULL, puuid TEXT NOT NULL, placement INTEGER NOT NULL, level INTEGER, last_round INTEGER, gold_left INTEGER, damage INTEGER);
                  CREATE TABLE units (participant_id INTEGER NOT NULL, character_id TEXT NOT NULL, star INTEGER NOT NULL, n_items INTEGER NOT NULL, build TEXT);
                  CREATE TABLE stat_units (patch TEXT, bucket TEXT, character_id TEXT, games INTEGER);",
             )
@@ -141,6 +145,7 @@ mod tests {
         };
         assert!(cols("participants").contains(&"comp_key".to_string()));
         assert!(cols("units").contains(&"rarity".to_string()));
+        assert_eq!(cols("matches").last().map(String::as_str), Some("queue_id"), "an old matches table gets queue_id last");
         assert!(cols("stat_units").contains(&"avg_star".to_string()));
 
         kv_set(&conn, "x", &vec![1, 2]).unwrap();

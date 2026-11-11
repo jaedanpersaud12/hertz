@@ -24,7 +24,7 @@ impl Ingest<'_> {
         let info = &m.info;
         let added = tx
             .prepare_cached(
-                "INSERT OR IGNORE INTO matches (match_id, platform, patch, set_number, game_datetime, game_length, rank) VALUES (?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO matches (match_id, platform, patch, set_number, game_datetime, game_length, rank, queue_id) VALUES (?,?,?,?,?,?,?,?)",
             )?
             .execute(params![
                 m.metadata.match_id,
@@ -34,6 +34,7 @@ impl Ingest<'_> {
                 info.game_datetime,
                 info.game_length,
                 self.rank,
+                info.queue(),
             ])?;
         if added == 0 {
             return Ok(false); // dropping the transaction rolls back nothing, since nothing was written
@@ -184,6 +185,31 @@ mod tests {
         assert_eq!(one("SELECT match_id || ' ' || platform FROM match_stored"), "NA1_1 na1", "one stored-at row, not two");
         let at: i64 = conn.query_row("SELECT at FROM match_stored", [], |r| r.get(0)).unwrap();
         assert!(at > 1_700_000_000_000, "stored at the current time in ms, got {at}");
+    }
+
+    /// E12: the queue is stored on every match, whichever way Riot spells it; no queue at all is NULL.
+    #[test]
+    fn stores_the_queue_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::schema::SCHEMA).unwrap();
+        let ing = Ingest { platform: "na1", rank: 9, tier: "CHALLENGER", snowball: false };
+        let with = |id: &str, snake: Option<i64>, camel: Option<i64>| {
+            let mut m = sample(id);
+            (m.info.queue_id, m.info.queue_id_camel) = (snake, camel);
+            m
+        };
+        for m in [with("R", Some(1100), None), with("D", Some(1160), None), with("H", None, Some(1130)), with("N", None, None)] {
+            ing.store(&mut conn, &m, &Calendar::default()).unwrap();
+        }
+        let got: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT match_id, queue_id FROM matches ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let want = [("R", Some(1100)), ("D", Some(1160)), ("H", Some(1130)), ("N", None)];
+        assert_eq!(got, want.map(|(id, q)| (id.to_string(), q)));
     }
 
     #[test]
