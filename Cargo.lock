@@ -1291,11 +1291,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "regex",
  "reqwest",
  "rustls",
  "serde",
  "serde_json",
  "tft-core",
+ "tft-stats",
  "tft-store",
  "thiserror",
  "tokio",
