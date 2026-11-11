@@ -8,7 +8,7 @@
 //!   tft patches                download the patch calendar and date matches stored without one
 //!   tft stats [--patches N]    rebuild the stat tables for the N most recent patches (same as `npm run stats`)
 //!   tft stats --incremental    rebuild only the parts with new matches, and list them
-//!   tft serve [--port N]       serve the app and its read-only API on 127.0.0.1 (PORT from .env, then 5174)
+//!   tft serve [--port N]       serve the app and its API on 127.0.0.1 (PORT from .env, then 5174)
 //!   tft health                 matches per hour per server, matches waiting, the last problem, how old the stats are
 //!   tft init                   create or upgrade the database and print where it is
 //!
@@ -98,7 +98,7 @@ enum Command {
         #[arg(long)]
         incremental: bool,
     },
-    /// Serve the built app and its read-only API on 127.0.0.1, like `npm start`.
+    /// Serve the built app and its API on 127.0.0.1, like `npm start`.
     Serve {
         /// Port to listen on. Defaults to PORT from .env, then 5174.
         #[arg(long)]
@@ -136,7 +136,8 @@ async fn run(command: Command, config: Config) -> Result<()> {
         }
 
         Command::Serve { port } => {
-            tft_api::serve(tft_api::Options { port: port.unwrap_or(config.port), db_path: config.db_path }).await?;
+            let (port, db_path) = (port.unwrap_or(config.port), config.db_path.clone());
+            tft_api::serve(tft_api::Options { port, db_path, config }).await?;
         }
 
         Command::Crawl { max, reseed, once, no_supervisor } => {
@@ -163,8 +164,8 @@ async fn run(command: Command, config: Config) -> Result<()> {
             let db_path = config.db_path.clone();
             // Opened once before both halves start, so they never race to create or upgrade the tables.
             let conn = tft_store::open(&db_path)?;
-            let mut server =
-                tokio::spawn(tft_api::serve(tft_api::Options { port: port.unwrap_or(config.port), db_path: db_path.clone() }));
+            let opts = tft_api::Options { port: port.unwrap_or(config.port), db_path: db_path.clone(), config: config.clone() };
+            let mut server = tokio::spawn(tft_api::serve(opts));
             let key_missing = config.api_key.trim().is_empty();
             let crawler = Crawler::new(config, CrawlOptions { reseed, ..Default::default() }, conn, Arc::clone(&stop))?;
             let mut crawl = tokio::spawn(async move {

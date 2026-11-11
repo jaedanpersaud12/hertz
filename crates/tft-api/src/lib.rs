@@ -1,12 +1,13 @@
-//! The read-only `/api` routes the React app calls, and the built app itself, served the way `src/server/index.ts`
-//! serves them (`tft serve`). Every answer matches the TypeScript API exactly; `npm run parity` checks it.
-//!
-//! Not here yet: the summoner routes (`/api/me*`) and the routes that change your lists (POST `/api/lists/*`,
-//! POST and DELETE `/api/teams*`). They answer 501 so nothing mistakes them for working. The dev-only `?data=`
-//! stress switch stays in the TypeScript server.
+//! The `/api` routes the React app calls, and the built app itself, served the way `src/server/index.ts` serves
+//! them (`tft serve`): the stats and lists, the routes that change your lists (POST `/api/lists/*`, POST and
+//! DELETE `/api/teams*`) and the summoner routes (`/api/me*`, which call Riot). Every answer, and every change to
+//! the database, matches the TypeScript API exactly; `npm run parity` checks it. The dev-only `?data=` stress
+//! switch stays in the TypeScript server.
 
 mod describe;
 pub mod js;
+mod jsval;
+mod me;
 mod routes;
 
 use anyhow::{Context, Result};
@@ -20,6 +21,7 @@ use sha1::{Digest, Sha1};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
+use tft_core::config::Config;
 use tft_store::Connection;
 
 /// Read-only connections for the routes, opened as needed and reused.
@@ -46,21 +48,30 @@ struct App {
     /// The built app (`dist/`), when `dist/index.html` existed at start.
     dist: Option<PathBuf>,
     http: reqwest::Client,
+    /// The one connection that writes: your lists and your own matches.
+    write: Arc<Mutex<Connection>>,
+    me: Arc<me::Me>,
 }
 
 pub struct Options {
     pub db_path: PathBuf,
     pub port: u16,
+    /// The Riot key and base URL, and your Riot ID and server from .env, for the summoner routes.
+    pub config: Config,
 }
 
 /// Opens (or creates) the database, then serves the API and the built app on 127.0.0.1 until stopped.
 pub async fn serve(opts: Options) -> Result<()> {
     // Creates the file and tables on first run, so the app opens before any crawl.
-    drop(tft_store::open(&opts.db_path)?);
+    let write = tft_store::open(&opts.db_path)?;
+    // The patch calendar is read once at start, as the TypeScript server reads it.
+    let calendar = tft_store::load_calendar(&write)?;
+    let write = Arc::new(Mutex::new(write));
     let parent = opts.db_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let icons = parent.join("icons");
     std::fs::create_dir_all(&icons).with_context(|| format!("creating {}", icons.display()))?;
     tft_riot::init_tls();
+    let me = Arc::new(me::Me::new(Arc::clone(&write), &opts.config, calendar));
     let app = Arc::new(App {
         pool: Pool { path: opts.db_path.clone(), idle: Mutex::new(Vec::new()) },
         comps: Mutex::default(),
@@ -68,6 +79,8 @@ pub async fn serve(opts: Options) -> Result<()> {
         dist: Path::new("dist/index.html").exists().then(|| PathBuf::from("dist")),
         // Like Node's fetch: no proxy, 15 seconds.
         http: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(15)).build()?,
+        write,
+        me,
     });
     let router = axum::Router::new().fallback(handle).with_state(app);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", opts.port))
@@ -91,12 +104,8 @@ fn server_error(err: anyhow::Error) -> Response {
     eprintln!("{err:#}");
     respond(StatusCode::INTERNAL_SERVER_ERROR, "text/plain; charset=UTF-8", "Internal Server Error")
 }
-fn not_ported() -> Response {
-    respond(
-        StatusCode::NOT_IMPLEMENTED,
-        "application/json",
-        r#"{"error":"This route is not in the Rust engine yet. Use npm start for it."}"#,
-    )
+fn json_status(status: u16, body: Obj) -> Response {
+    respond(StatusCode::from_u16(status).unwrap(), "application/json", serde_json::to_vec(&body).unwrap())
 }
 
 enum Route {
@@ -135,17 +144,72 @@ fn route(path: &str) -> Option<Route> {
     })
 }
 
-/// The routes the TypeScript server has that this one does not yet.
-fn is_unported(method: &Method, path: &str) -> bool {
+/// The routes that change the database or call Riot.
+enum Action {
+    Me,
+    MyMatches,
+    SetAccount,
+    Refresh,
+    Mark,
+    Pin,
+    SaveTeam,
+    DeleteTeam(String),
+}
+
+fn action(method: &Method, path: &str) -> Option<Action> {
     let seg: Vec<&str> = path.split('/').collect();
-    let one = |s: &&str| !s.is_empty();
-    match seg.as_slice() {
-        ["", "api", "me"] | ["", "api", "me", "matches"] => method == Method::GET,
-        ["", "api", "me", "account"] | ["", "api", "me", "refresh"] => method == Method::POST,
-        ["", "api", "lists", "mark"] | ["", "api", "lists", "pin"] | ["", "api", "teams"] => method == Method::POST,
-        ["", "api", "teams", id] if one(id) => method == Method::DELETE,
-        _ => false,
-    }
+    let (get, post, delete) = (method == Method::GET, method == Method::POST, method == Method::DELETE);
+    Some(match seg.as_slice() {
+        ["", "api", "me"] if get => Action::Me,
+        ["", "api", "me", "matches"] if get => Action::MyMatches,
+        ["", "api", "me", "account"] if post => Action::SetAccount,
+        ["", "api", "me", "refresh"] if post => Action::Refresh,
+        ["", "api", "lists", "mark"] if post => Action::Mark,
+        ["", "api", "lists", "pin"] if post => Action::Pin,
+        ["", "api", "teams"] if post => Action::SaveTeam,
+        ["", "api", "teams", id] if delete && !id.is_empty() => Action::DeleteTeam(js::try_decode_component(id)),
+        _ => return None,
+    })
+}
+
+/// A change made on the write connection, off the async threads.
+type Write = Box<dyn FnOnce(&Connection) -> Result<Obj> + Send>;
+
+/// Runs one of the [`Action`] routes. Anything the TypeScript handler would throw on is a 500.
+async fn act(app: &Arc<App>, a: Action, body: Body) -> Result<Response> {
+    let bytes = axum::body::to_bytes(body, usize::MAX).await?;
+    let parsed = jsval::parse_body(&bytes);
+    // `await c.req.json()` without a catch: a body that is not JSON throws.
+    let strict = || parsed.clone().ok_or_else(|| anyhow::anyhow!("the request body is not JSON"));
+    let write = |f: Write| {
+        let db = Arc::clone(&app.write);
+        async move { tokio::task::spawn_blocking(move || f(&db.lock().unwrap())).await? }
+    };
+    Ok(match a {
+        Action::Me => json(app.me.get().await?),
+        Action::MyMatches => {
+            let me = Arc::clone(&app.me);
+            json(tokio::task::spawn_blocking(move || me.matches()).await??)
+        }
+        Action::SetAccount => {
+            let (status, body) = app.me.set_account(parsed).await?;
+            json_status(status, body)
+        }
+        Action::Refresh => json(app.me.refresh_now().await?),
+        Action::Mark => {
+            let b = strict()?;
+            json(write(Box::new(move |c| routes::mark(c, &b))).await?)
+        }
+        Action::Pin => {
+            let b = strict()?;
+            json(write(Box::new(move |c| routes::pin(c, &b))).await?)
+        }
+        Action::SaveTeam => {
+            let b = strict()?;
+            json(write(Box::new(move |c| routes::save_team(c, &b))).await?)
+        }
+        Action::DeleteTeam(id) => json(write(Box::new(move |c| routes::delete_team(c, &id))).await?),
+    })
 }
 
 async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
@@ -153,8 +217,8 @@ async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     let method = if req.method() == Method::HEAD { Method::GET } else { req.method().clone() };
     let path = js::hono_path(req.uri().path());
     let query = req.uri().query().map(str::to_string);
-    if is_unported(&method, &path) {
-        return not_ported();
+    if let Some(a) = action(&method, &path) {
+        return act(&app, a, req.into_body()).await.unwrap_or_else(server_error);
     }
     if method == Method::GET {
         if let Some(r) = route(&path) {
@@ -307,9 +371,13 @@ mod tests {
         assert!(route("/api/comps/").is_none());
         assert!(route("/api/comps/a/b").is_none());
         assert!(route("/api/icon/unit/").is_none());
-        assert!(is_unported(&Method::GET, "/api/me"));
-        assert!(is_unported(&Method::DELETE, "/api/teams/3"));
-        assert!(!is_unported(&Method::GET, "/api/lists"));
+        assert!(matches!(action(&Method::GET, "/api/me"), Some(Action::Me)));
+        assert!(matches!(action(&Method::DELETE, "/api/teams/3"), Some(Action::DeleteTeam(id)) if id == "3"));
+        assert!(matches!(action(&Method::DELETE, "/api/teams/%201"), Some(Action::DeleteTeam(id)) if id == " 1"));
+        assert!(action(&Method::DELETE, "/api/teams/").is_none());
+        assert!(action(&Method::GET, "/api/teams/3").is_none());
+        assert!(action(&Method::POST, "/api/me").is_none());
+        assert!(action(&Method::GET, "/api/lists").is_none());
         assert_eq!(mime_type("dist/assets/app.JS"), Some("text/javascript; charset=utf-8"));
         assert_eq!(mime_type("dist/x.unknownext"), None);
     }

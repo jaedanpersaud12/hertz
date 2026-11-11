@@ -14,8 +14,10 @@
  * 4. API: the stats databases from step 2 are served by the TypeScript API and by `tft serve`, and the same
  *    read-only URLs (every route, scope and parameter, ids that exist and ids that do not, bad values) are
  *    requested from both. Status, content type and body must match; JSON bodies are compared after parsing.
- *    The summoner routes (/api/me*) and the write routes (POST /api/lists/*, POST and DELETE /api/teams*)
- *    are not ported yet and are not checked here.
+ *    Then the routes that change things (POST /api/lists/*, POST and DELETE /api/teams*, and the summoner
+ *    routes /api/me*, each server against its own fake Riot API) are driven through the same sequences, and
+ *    after every step the answers and every table they write (comp_marks, saved_teams, kv, my_matches) must
+ *    match. Only `created` on teams saved in the run and `fetchedAt` on your account are normalised.
  *
  * Exits non-zero on any difference.
  */
@@ -462,6 +464,353 @@ function apiChecks(db: Database.Database, phase: 'bare' | 'full', icons: { ok: s
   return checks
 }
 
+// ---- Write and summoner routes (section 4, second half) ---------------------------------
+
+/** Any request: the body goes out as written, with a JSON content type. */
+const httpSend = (port: number, method: string, path: string, body?: string) =>
+  new Promise<Reply>((resolve, reject) => {
+    const headers: Record<string, string | number> = body === undefined ? {} : { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) }
+    const req = request({ host: '127.0.0.1', port, path, method, agent: false, headers }, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('end', () => resolve({
+        status: res.statusCode ?? 0, type: String(res.headers['content-type'] ?? ''),
+        cache: String(res.headers['cache-control'] ?? ''), body: Buffer.concat(chunks),
+      }))
+    })
+    req.on('error', reject)
+    req.setTimeout(120_000, () => req.destroy(new Error(`timed out: ${method} ${path}`)))
+    req.end(body)
+  })
+
+/**
+ * The only values normalised: `created` on teams saved during the run and `fetchedAt` on your account, both
+ * Date.now() at the moment each server did the work. A 13-digit value under either key that falls inside this
+ * run becomes -1 on both sides; anything else (an old or a wrong time) is compared as it is.
+ */
+const settle = (text: string, since: number) =>
+  text.replace(/(\\?"(?:created|fetchedAt)\\?":)(\d{13})(?!\d)/g, (m, key, n) => (Number(n) >= since && Number(n) <= Date.now() ? `${key}-1` : m))
+
+/** Every table the write and summoner routes change, read in a fixed order. */
+const writeTables = (path: string) => {
+  const db = new Database(path, { readonly: true })
+  try {
+    return {
+      comp_marks: db.prepare('SELECT rowid, comp_key, typeof(comp_key) t, fav, hidden FROM comp_marks ORDER BY rowid').all(),
+      saved_teams: db.prepare('SELECT id, name, hex(name) bytes, board, created FROM saved_teams ORDER BY id').all(),
+      kv: db.prepare('SELECT key, value FROM kv ORDER BY key').all(),
+      my_matches: db.prepare('SELECT match_id, game_datetime, typeof(game_datetime) t, json FROM my_matches ORDER BY match_id').all(),
+    }
+  } finally {
+    db.close()
+  }
+}
+
+type Step =
+  | { route: string; method: 'GET' | 'POST' | 'DELETE'; url: string; body?: string; status?: number; has?: (b: any) => boolean;
+      /** Ask each side again until this holds (a refresh running in the background), then compare. */
+      until?: (b: any) => boolean
+      /** Background work is still running on each side: compare the database at the next step instead. */
+      settling?: boolean
+      /** What the TypeScript database must hold after this step, so an empty table cannot pass. */
+      rows?: { table: keyof ReturnType<typeof writeTables>; min: number; max?: number } }
+  | { route: string; db: (db: Database.Database) => void }
+
+/** Sends each step to both servers in turn and compares the answers and then every table the routes change. */
+async function compareSteps(tsPort: number, rsPort: number, tsDb: string, rsDb: string, since: number, list: Step[]) {
+  const byRoute = new Map<string, { n: number; bad: number; withData: number }>()
+  for (const s of list) {
+    const tally = byRoute.get(s.route) ?? { n: 0, bad: 0, withData: 0 }
+    byRoute.set(s.route, tally)
+    tally.n++
+    const label = 'db' in s ? `${s.route}` : `${s.method} ${s.url}${s.body !== undefined ? ` ${s.body.slice(0, 60)}` : ''}`
+    const problem = await (async () => {
+      if ('db' in s) {
+        for (const path of [tsDb, rsDb]) {
+          const db = new Database(path)
+          s.db(db)
+          db.close()
+        }
+        return null
+      }
+      const ask = async (port: number) => {
+        let r = await httpSend(port, s.method, s.url, s.body)
+        for (let i = 0; s.until && i < 300 && r.status === 200 && !s.until(JSON.parse(r.body.toString())); i++) {
+          await new Promise((res) => setTimeout(res, 100))
+          r = await httpSend(port, s.method, s.url, s.body)
+        }
+        return r
+      }
+      const [a, b] = [await ask(tsPort), await ask(rsPort)]
+      if (s.status !== undefined && a.status !== s.status) return `TS answered ${a.status}, expected ${s.status}, so this step proves nothing`
+      if (a.status !== b.status) return `status: TS ${a.status}, Rust ${b.status} (Rust body ${JSON.stringify(b.body.toString().slice(0, 160))})`
+      if (a.type !== b.type) return `content type: TS "${a.type}", Rust "${b.type}"`
+      if (!a.type.startsWith('application/json')) {
+        return a.body.equals(b.body) ? null : `body: TS ${JSON.stringify(a.body.toString().slice(0, 80))}, Rust ${JSON.stringify(b.body.toString().slice(0, 80))}`
+      }
+      const [ja, jb] = [JSON.parse(settle(a.body.toString(), since)), JSON.parse(settle(b.body.toString(), since))]
+      if (s.until && (!s.until(ja) || !s.until(jb))) return `still waiting after 30 s: TS ${JSON.stringify(ja).slice(0, 120)}, Rust ${JSON.stringify(jb).slice(0, 120)}`
+      if (s.has) {
+        if (!s.has(ja)) return `the TypeScript answer has no data here, so this step proves nothing: ${JSON.stringify(ja).slice(0, 200)}`
+        tally.withData++
+      }
+      return jsonDiff(ja, jb)
+    })()
+    // Then the database: every table these routes write, after every step.
+    const dbProblem = (() => {
+      if ('settling' in s && s.settling) return null
+      const [ta, tb] = [writeTables(tsDb), writeTables(rsDb)]
+      for (const t of Object.keys(ta) as (keyof typeof ta)[]) {
+        const [ra, rb] = [ta[t].map((r) => settle(JSON.stringify(r), since)), tb[t].map((r) => settle(JSON.stringify(r), since))]
+        const first = ra.findIndex((r, i) => r !== rb[i])
+        if (ra.length !== rb.length || first >= 0) {
+          const at = first < 0 ? Math.min(ra.length, rb.length) : first
+          return `table ${t}: TS ${ra.length} rows, Rust ${rb.length}. First difference at row ${at}:\n      TS:   ${ra[at]?.slice(0, 300)}\n      Rust: ${rb[at]?.slice(0, 300)}`
+        }
+      }
+      const want = 'rows' in s ? s.rows : undefined
+      if (want && (ta[want.table].length < want.min || ta[want.table].length > (want.max ?? Infinity))) {
+        return `table ${want.table} has ${ta[want.table].length} rows in TS after this step, expected ${want.min}${want.max === undefined ? ' or more' : ` to ${want.max}`}`
+      }
+      return null
+    })()
+    const all = [problem, dbProblem].filter(Boolean).join('\n    ')
+    if (all) {
+      tally.bad++
+      fail(label, `    ${all}`)
+    }
+  }
+  for (const [route, t] of byRoute) {
+    const detail = `${t.n} steps${t.withData ? `, ${t.withData} with data` : ''}`
+    if (!t.bad) ok(`${route}: ${detail} identical, database identical after each`)
+    else fail(route, `    ${t.bad} of ${detail} differ`)
+  }
+}
+
+/** Matches the fake world never sends: missing names, units and placements, other queues, no version, not yours. */
+function awkwardMyMatches(puuid: string) {
+  const base = structuredClone(rankedMatches.find((m) => !m.metadata.participants.includes(puuid))!) // only the boards set below are yours
+  const mk = (id: string, when: number, edit: (m: any) => void) => {
+    const m = structuredClone(base)
+    m.metadata.match_id = id
+    m.info.game_datetime = when
+    m.info.participants[0].puuid = puuid
+    edit(m)
+    return m
+  }
+  const t = Date.parse('2026-11-08T12:00:00Z')
+  return [
+    mk('MY_EDGE_1', t + 5000, (m) => {
+      const p = m.info.participants
+      delete p[0].riotIdGameName
+      p[1].riotIdGameName = ''
+      delete p[2].riotIdTagline
+      delete p[3].units
+      p[4].traits = [{ name: 'TFT99_Loner', num_units: 1, style: 3, tier_current: 1 }, { name: 'TFT99_Zero', num_units: 9, style: 0, tier_current: 0 },
+        { name: 'TFT99_Big', num_units: 7, style: 2, tier_current: 2 }, { name: 'TFT99_Tie', num_units: 1, style: 1, tier_current: 1 }]
+      p[0].units = [{ character_id: 'TFT99_NotInStatic', tier: 2, rarity: 4, itemNames: ['', 'TFT_Item_Unknown'] },
+        { character_id: 'TFT99_Unit3', tier: 1 }, { character_id: 'TFT99_Unit7', tier: 3, rarity: 6 }, { character_id: 'TFT99_NoRarity', tier: 1, rarity: 3 }]
+      delete p[5].placement
+      delete p[6].total_damage_to_players
+      m.info.queue_id = 1130
+      delete m.info.game_version
+    }),
+    mk('MY_EDGE_2', t + 4000, (m) => { delete m.info.queue_id; m.info.queueId = 1160; m.info.game_version = 'TFT Unreal Version ?.?.?.?'; m.info.game_length = 1999.75 }),
+    mk('MY_EDGE_3', t + 3000, (m) => { delete m.info.queue_id; delete m.info.game_version }), // dated by the calendar
+    mk('MY_EDGE_6', Date.parse('2026-01-01T00:00:00Z'), (m) => { m.info.game_version = 'no version here' }), // before the calendar
+    mk('MY_EDGE_4', t + 2000, (m) => { m.info.queue_id = 1090; m.info.participants.reverse() }),
+    // Not yours: stored, but never shown.
+    mk('MY_EDGE_5', t + 1000, (m) => { m.info.participants[0].puuid = 'someone-else' }),
+  ]
+}
+
+/**
+ * Section 4, second half: the routes that change your lists and the summoner routes, driven through the same
+ * sequences on both servers, each against its own fake Riot API. Lists: favourite, hide, pin and unpin, save and
+ * delete teams (valid, invalid, missing ids, ids Number() reads oddly). Summoner: no account, no key, each typo,
+ * an unknown Riot ID, a real fake-world account, refresh, a stale card refreshed in the background, a change of
+ * account clearing your matches, and the Riot ID read from .env.
+ */
+async function writeParity(fromTs: string, fromRs: string, bare: string) {
+  const comps = (() => {
+    const db = new Database(fromTs, { readonly: true })
+    const keys = (db.prepare("SELECT comp_key FROM stat_comps WHERE patch = '99.3' AND bucket = 'ALL' ORDER BY comp_key").all() as any[]).map((r) => r.comp_key as string)
+    db.close()
+    return keys
+  })()
+  const copies = (name: string) => {
+    const [ts, rs] = [join(dir, `${name}-ts.db`), join(dir, `${name}-rs.db`)]
+    copyFileSync(fromTs, ts)
+    copyFileSync(fromRs, rs)
+    return { ts, rs }
+  }
+  const tsx = pathToFileURL(join(root, 'node_modules', 'tsx', 'dist', 'loader.mjs')).href
+  const serverTs = join(root, 'src', 'server', 'index.ts')
+  const since = Date.now() // teams saved and accounts looked up from here on carry a time from this run
+  const pair = async (label: string, cwd: string, dbs: { ts: string; rs: string }, env: Record<string, string>, list: Step[]) => {
+    console.log(`  ${label}:`)
+    const [fakeTs, fakeRs] = [await startFakeRiot(), await startFakeRiot()]
+    const riot = (port: number) => ({ RIOT_API_BASE: `http://127.0.0.1:${port}/{host}`, ...env })
+    const [tsPort, rsPort] = [await freePort(), await freePort()]
+    const ts = await startServer('TypeScript', process.execPath, ['--import', tsx, serverTs], cwd, { DB_PATH: dbs.ts, PORT: String(tsPort), ...riot(fakeTs.port) }, tsPort)
+    let rs: Awaited<ReturnType<typeof startServer>> | undefined
+    try {
+      rs = await startServer('Rust', bin, ['--db', dbs.rs, 'serve', '--port', String(rsPort)], cwd, riot(fakeRs.port), rsPort)
+      await compareSteps(tsPort, rsPort, dbs.ts, dbs.rs, since, list)
+      if (fakeTs.seen.total === fakeRs.seen.total) ok(`both servers sent the fake Riot API ${fakeTs.seen.total} requests`)
+      else fail('Riot requests', `    TS sent ${fakeTs.seen.total}, Rust ${fakeRs.seen.total}`)
+    } catch (e) {
+      fail(`${label}`, `    ${(e as Error).message.split('\n').slice(0, 3).join('\n    ')}`)
+    } finally {
+      await stop(ts.child)
+      if (rs) await stop(rs.child)
+      await fakeTs.close()
+      await fakeRs.close()
+    }
+  }
+  const J = JSON.stringify
+  const get = (route: string, url: string, has?: (b: any) => boolean): Step => ({ route, method: 'GET', url, has })
+  const post = (route: string, url: string, body: unknown, status = 200, has?: (b: any) => boolean): Step =>
+    ({ route, method: 'POST', url, body: typeof body === 'string' ? body : J(body), status, has })
+  const raw = (route: string, url: string, body: string, status: number): Step => ({ route, method: 'POST', url, body, status })
+  const del = (url: string, status = 200, has?: (b: any) => boolean): Step => ({ route: 'DELETE /api/teams/:id', method: 'DELETE', url, status, has })
+  const lists = (has?: (b: any) => boolean) => get('GET /api/lists', '/api/lists', has)
+  const mark = (body: unknown, status = 200, has?: (b: any) => boolean) => [post('POST /api/lists/mark', '/api/lists/mark', body, status, has), lists()]
+  const pin = (body: unknown, status = 200, has?: (b: any) => boolean) => [post('POST /api/lists/pin', '/api/lists/pin', body, status, has), lists()]
+  const team = (body: unknown, status = 200, has?: (b: any) => boolean) => [post('POST /api/teams', '/api/teams', body, status, has), lists()]
+  const account = (body: unknown, status: number, has?: (b: any) => boolean) => post('POST /api/me/account', '/api/me/account', body, status, has)
+  const me = (has?: (b: any) => boolean) => get('GET /api/me', '/api/me', has)
+  const myMatches = (has?: (b: any) => boolean) => get('GET /api/me/matches', '/api/me/matches', has)
+  const refresh = (has?: (b: any) => boolean) => post('POST /api/me/refresh', '/api/me/refresh', '', 200, has)
+  // Teams saved within the same millisecond would tie on `created`; a short pause keeps the order meaningful.
+  const pause: Step = { route: 'pause', db: () => { const end = Date.now() + 3; while (Date.now() < end); } }
+  const typo = (b: any) => b.ok === false && typeof b.error === 'string'
+
+  // 1. Your lists, and the summoner routes with no Riot ID and then no API key.
+  const w = copies('write')
+  await pair('Your lists; summoner routes with no account and no API key', bare, w, { RIOT_API_KEY: '' }, [
+    lists((b) => b.teams.length === 3 && b.favs.length > 0 && b.pinned),
+    ...mark({ key: comps[3], fav: true }, 200, (b) => b.favs.includes(comps[3])),
+    ...mark({ key: comps[3], hidden: true, fav: false }, 200, (b) => b.hidden.includes(comps[3]) && !b.favs.includes(comps[3])),
+    ...mark({ key: 'New|TFT99_Unit2', fav: 1, hidden: 0 }, 200, (b) => b.favs.includes('New|TFT99_Unit2')),
+    ...mark({ key: comps[0], fav: null }),
+    ...mark({ key: comps[1], hidden: [] }),
+    ...mark({ key: 5, fav: true }, 200, (b) => b.favs.includes('5.0')), // a number key is stored as text "5.0"
+    ...mark({ key: 2 ** 60, hidden: 'yes' }),
+    ...mark({ fav: true }), // no key: a row with a NULL key
+    ...mark('"just a string"'),
+    ...mark('[1, 2]'),
+    ...mark({ key: true }, 500), ...mark({ key: {} }, 500), ...mark({ key: [] }, 500), ...mark({ key: [comps[2], 'x'] }, 500), ...mark({ key: [[comps[2]]] }, 500),
+    ...mark({ key: [comps[2]], fav: 'yes' }, 200, (b) => b.favs.includes(comps[2])), // one-entry arrays bind as their entry
+    ...mark({ key: [null], hidden: 1 }),
+    ...mark('not json', 500), ...mark('null', 500), ...mark('', 500),
+    get('GET /api/comps', '/api/comps', (b) => b.favs.length > 0 && b.hidden.length > 0),
+    ...pin({ key: comps[3] }, 200, (b) => b.pinned === comps[3]),
+    ...pin({ key: { a: 1, b: [1.0, 'x', null], c: 1e21 } }, 200, (b) => b.pinned?.a === 1),
+    ...pin({ key: 0 }, 200, (b) => b.pinned === null),
+    ...pin({ key: 'Gone|TFT99_Unit1' }), ...pin({}), ...pin({ key: '' }), ...pin({ key: 12.5 }), ...pin({ key: false }),
+    ...pin({ key: comps[2] }), ...pin({ key: null }, 200, (b) => b.pinned === null), ...pin({ key: comps[2] }),
+    ...pin('null', 500), ...pin('{', 500),
+    ...team({ name: 'Test team', board: [{ unit: 'TFT99_Unit1', hex: 3, items: ['TFT_Item_Thing1'] }] }, 200, (b) => b.teams.some((t: any) => t.name === 'Test team')), pause,
+    ...team({ name: '', board: [] }, 200, (b) => b.teams.some((t: any) => t.name === 'Untitled team')), pause,
+    ...team({ board: { x: 1.50, y: 1e21, z: -0 } }, 200, (b) => b.teams.some((t: any) => t.name === 'undefined')), pause,
+    ...team({ name: null, board: null }), pause,
+    ...team({ name: `${'x'.repeat(59)}\u{1F600}`, board: 1 }), pause, // the cut leaves half an emoji
+    ...team({ name: `  ${'é'.repeat(70)}`, board: 'b' }), pause,
+    ...team({ name: 12.0, board: true }), pause,
+    ...team({ name: ['a', null, 2.5, ['b', 'c']], board: { nested: { deep: [1, { k: 'v' }] } } }), pause,
+    ...team({ name: { o: 1 }, board: [] }), pause,
+    ...team({ name: 'No board' }, 500), ...team('garbage', 500), ...team('null', 500),
+    lists((b) => b.teams.length === 12),
+    del('/api/teams/4', 200, (b) => b.teams.length === 11), lists(),
+    del('/api/teams/5.0'), del('/api/teams/0x6'), del('/api/teams/%207%20'), del('/api/teams/1e0'),
+    del('/api/teams/abc'), del('/api/teams/999'), del('/api/teams/-1'), del('/api/teams/Infinity'),
+    del('/api/teams/', 404), { route: 'DELETE /api/teams/:id', method: 'DELETE', url: '/api/teams', status: 404 },
+    lists((b) => b.teams.length === 7),
+    get('POST to a GET route', '/api/lists'), post('POST to a GET route', '/api/lists', {}, 404), post('POST to a GET route', '/api/me', {}, 404),
+
+    me((b) => b.configured === false && b.riotId === '' && b.platform === 'na1'),
+    myMatches((b) => b.configured === false),
+    refresh((b) => b.configured === false),
+    account({ riotId: 'NoTag', platform: 'na1' }, 400, typo),
+    account({ riotId: 'Tester#NA1', platform: 'mars' }, 400, typo),
+    account({ riotId: 'Te#NA1', platform: 'na1' }, 400, typo),
+    account({ riotId: 'Tester#N', platform: 'na1' }, 400, typo),
+    account({ riotId: 'Tester#TOOLONG', platform: 'na1' }, 400, typo),
+    account({ riotId: 'Seventeen_chars_x#NA1', platform: 'na1' }, 400, typo),
+    account({ riotId: 'Tes#ter#NA1', platform: 'na1' }, 400, typo),
+    account({ riotId: 'Tester#NA1' }, 400, typo),
+    account({ riotId: 'Tester#NA1', platform: 'NA 1' }, 400, typo),
+    account({ riotId: 12345, platform: 'na1' }, 400, typo),
+    account({ riotId: { id: 'Tester#NA1' }, platform: 'na1' }, 400, typo),
+    account({}, 400, typo), account('not json', 400, typo), account('', 400, typo), account('"Tester#NA1"', 400, typo),
+    raw('POST /api/me/account', '/api/me/account', 'null', 500),
+    me((b) => b.configured === false),
+    // Valid, after trimming and lower-casing; there is no key, so the check with Riot fails.
+    account({ riotId: ['  Tester  #NA1 '], platform: ' NA1 ' }, 200, (b) => b.ok === false && /RIOT_API_KEY/.test(b.error)),
+    me((b) => b.configured === true && b.riotId === 'Tester#NA1' && /RIOT_API_KEY/.test(b.error)),
+    refresh((b) => b.ok === false && /RIOT_API_KEY/.test(b.error)),
+    myMatches((b) => b.configured === true && b.matches.length === 0),
+  ])
+
+  // 2. The same database with a key and the fake Riot API: the account saved above is looked up.
+  let staleAt = 0
+  const stale = (db: Database.Database) => {
+    const row = db.prepare("SELECT value FROM kv WHERE key = 'me'").get() as { value: string }
+    const v = JSON.parse(row.value)
+    v.fetchedAt = staleAt ||= Date.now() - 10 * 60_000 // the same time in both copies
+    db.prepare("UPDATE kv SET value = ? WHERE key = 'me'").run(JSON.stringify(v))
+  }
+  const awkward = (db: Database.Database) => {
+    const put = db.prepare('INSERT OR REPLACE INTO my_matches (match_id, game_datetime, json) VALUES (?, ?, ?)')
+    for (const m of awkwardMyMatches('na1-chal-0')) put.run(m.metadata.match_id, m.info.game_datetime, JSON.stringify(m))
+  }
+  const loaded = (b: any) => b.name === 'Tester' && b.tier === 'CHALLENGER' && b.lp === 512 && b.recent.length === 10 && b.error === null
+  const rows = (step: Step, table: 'my_matches', min: number, max?: number): Step => ({ ...step, rows: { table, min, max } }) as Step
+  await pair('Summoner routes against the fake Riot API', bare, w, { RIOT_API_KEY: 'TEST-KEY' }, [
+    rows(me(loaded), 'my_matches', 10),
+    myMatches((b) => b.matches.length >= 10 && b.matches[0].lobby.length === 8 && b.matches[0].mine.units.length > 0),
+    lists((b) => b.teams.length === 7),
+    refresh((b) => b.ok === true && b.error === null),
+    { route: 'stale account', db: stale },
+    { ...me((b) => b.refreshing === true && b.name === 'Tester'), settling: true },
+    { route: 'GET /api/me (until refreshed)', method: 'GET', url: '/api/me', has: loaded, until: (b) => b.refreshing === false },
+    { route: 'my matches the fake world never sends', db: awkward },
+    myMatches((b) => b.matches.some((m: any) => m.queue === 'Hyper Roll') && b.matches.some((m: any) => m.queue === 'Double Up') &&
+      b.matches.some((m: any) => m.queue === 'Other mode') && b.matches.some((m: any) => m.queue === 'Normal') && !b.matches.some((m: any) => m.id === 'MY_EDGE_5')),
+    me((b) => b.recent.length === 10),
+    account({ riotId: 'Tester#NA1', platform: 'oc1' }, 200, (b) => b.ok === true), // same account, a "sea" server
+    me((b) => b.platform === 'oc1' && b.name === 'Tester'),
+    myMatches((b) => b.matches.some((m: any) => m.id === 'MY_EDGE_1')), // the same Riot ID keeps its matches
+    rows(account({ riotId: 'Nobody#XX1', platform: 'na1' }, 200, (b) => b.ok === false && /No Riot account called Nobody#XX1/.test(b.error)), 'my_matches', 0, 0),
+    me((b) => b.riotId === 'Nobody#XX1' && /No Riot account/.test(b.error)),
+    myMatches((b) => b.configured === true && b.matches.length === 0), // a new account clears the old one's matches
+    refresh((b) => b.ok === false),
+    rows(account({ riotId: 'Tester # NA1', platform: 'na1' }, 200, (b) => b.ok === true), 'my_matches', 10),
+    me((b) => b.riotId === 'Tester#NA1' && loaded(b)),
+    myMatches((b) => b.matches.length >= 10),
+  ])
+
+  // 3. The Riot ID from .env, written the way dotenv cuts off (an unquoted #), with a server that does not exist.
+  const envDir = (name: string, text: string) => {
+    const d = join(dir, name)
+    mkdirSync(d, { recursive: true })
+    writeFileSync(join(d, '.env'), text)
+    return d
+  }
+  await pair('Riot ID from .env, unknown server', envDir('cwd-env-mars', '# yours\nRIOT_ID=Tester#NA1\nMY_PLATFORM=Mars\n'), copies('env-mars'),
+    { RIOT_API_KEY: 'TEST-KEY' }, [
+      me((b) => b.configured === true && b.riotId === 'Tester#NA1' && b.platform === 'mars' && /"mars" is not a known server/.test(b.error)),
+      refresh((b) => b.ok === false),
+      myMatches((b) => b.configured === true && b.matches.length === 0),
+    ])
+  await pair('Riot ID from .env, quoted', envDir('cwd-env-quoted', 'RIOT_ID = "Tester#NA1"\r\nOTHER=1\r\n'), copies('env-quoted'),
+    { RIOT_API_KEY: 'TEST-KEY' }, [
+      me((b) => b.riotId === 'Tester#NA1' && b.platform === 'na1' && loaded(b)),
+      myMatches((b) => b.matches.length >= 10),
+    ])
+}
+
 /** Section 4: the read-only API routes, served from the stats databases of section 2. */
 async function apiParity(tsStats: string, rsStats: string) {
   const tsDir = join(dir, 'api-ts')
@@ -605,6 +954,8 @@ async function apiParity(tsStats: string, rsStats: string) {
   if (originHits - hitsBefore === 4) ok('icons: each server downloaded once, then served from its cache')
   else fail('icon cache', `    the icon origin saw ${originHits - hitsBefore} requests, expected 4`)
   await new Promise<void>((r) => origin.close(() => r()))
+
+  await writeParity(tsDb, rsDb, bare)
 }
 
 try {
