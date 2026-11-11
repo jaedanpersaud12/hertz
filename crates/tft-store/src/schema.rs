@@ -89,6 +89,28 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime INTEGER NOT NULL, json TEXT NOT NULL);
 ";
 
+/// Numbered additions to [`SCHEMA`], applied in order every time the database is opened. Each one is idempotent
+/// (`IF NOT EXISTS`), so applying it again changes nothing. Kept byte-for-byte identical to `MIGRATIONS` in
+/// `src/db.ts`. New ones take the next number.
+///
+/// 1. Which match rows each stats scope already holds, for incremental rebuilds (E5).
+/// 2. Real ranks for a sample of lobbies (E7). `rank_samples` holds one row per looked-up player: `tier` is
+///    Riot's tier, or `UNRANKED` when the player has no ranked TFT entry; `division` is I to IV (empty for apex
+///    tiers' single division as Riot sends it, and for unranked players). `rank_sample_queue` holds every match
+///    chosen for sampling; `done` turns 1 once all its players are in `rank_samples`. Rows are never removed, so
+///    choosing a match again after a restart is a no-op.
+pub const MIGRATIONS: [(u32, &str); 2] = [
+    (1, "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)"),
+    (
+        2,
+        "
+CREATE TABLE IF NOT EXISTS rank_samples (match_id TEXT, puuid TEXT, tier TEXT, division TEXT, PRIMARY KEY (match_id, puuid));
+CREATE TABLE IF NOT EXISTS rank_sample_queue (match_id TEXT PRIMARY KEY, platform TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS rank_sample_pending ON rank_sample_queue(done, platform);
+",
+    ),
+];
+
 const RATES: &str = "games INTEGER NOT NULL, sum_place INTEGER NOT NULL, wins INTEGER NOT NULL, top4 INTEGER NOT NULL";
 
 fn stat(name: &str, keys: &str, cols: &str) -> String {
@@ -101,13 +123,6 @@ fn stat(name: &str, keys: &str, cols: &str) -> String {
 pub const STAT_TABLES: [&str; 12] = [
     "stat_meta", "stat_units", "stat_unit_dist", "stat_traits", "stat_items", "stat_unit_items", "stat_unit_builds",
     "stat_comps", "stat_comp_units", "stat_comp_items", "stat_comp_traits", "stat_comp_levels",
-];
-
-/// Numbered schema additions, applied in order on every open. Each one is idempotent. Kept identical to
-/// `MIGRATIONS` in `src/db.ts`.
-pub const MIGRATIONS: [&str; 1] = [
-    // 1. PRD 1 E5: which match rows each stats scope already holds, for incremental rebuilds.
-    "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)",
 ];
 
 /// Bump when the stat table layout changes: old stat tables are dropped and rebuilt on the next stats run.

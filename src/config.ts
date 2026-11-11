@@ -64,4 +64,6 @@ export const config = {
   myPlatform: (process.env.MY_PLATFORM ?? '').toLowerCase(),
   /** Fraction of the published rate limit we allow ourselves. */
   rateMargin: Number(process.env.RATE_MARGIN ?? 1.0),
+  /** Share of stored matches (0 to 1) whose 8 players get their real rank looked up. Used by the Rust crawler only. */
+  rankSampleRate: Number(process.env.RANK_SAMPLE_RATE ?? 0.01),
 }
