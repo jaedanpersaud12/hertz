@@ -11,6 +11,7 @@ mod jsval;
 mod me;
 mod routes;
 mod stress;
+mod tierlist;
 
 use anyhow::{Context, Result};
 use axum::body::Body;

@@ -172,7 +172,16 @@ fn js_round(x: f64) -> f64 {
 }
 
 fn load_comps(conn: &Connection, sc: &Scope, cache: &CompCache) -> Result<std::sync::Arc<Vec<Obj>>> {
-    let cache_key = format!("{}|{}|{}", sc.patch, sc.key, sc.built_at.map(|b| b.to_string()).unwrap_or("null".into()));
+    // Tiers and trends are worked out after a scope is written (they read other scopes), so they are in the key too.
+    let finished = row(
+        conn,
+        "SELECT COUNT(*) n, TOTAL(score) s, TOTAL(prev_place) p, TOTAL(d3_place) d FROM stat_comps WHERE patch = ? AND bucket = ?",
+        &[&sc.patch, &sc.key],
+    )?
+    .map(|r| format!("{}|{}|{}|{}", g(&r, "n"), g(&r, "s"), g(&r, "p"), g(&r, "d")))
+    .unwrap_or_default();
+    let cache_key =
+        format!("{}|{}|{}|{finished}", sc.patch, sc.key, sc.built_at.map(|b| b.to_string()).unwrap_or("null".into()));
     if let Some(hit) = cache.lock().unwrap().get(&cache_key) {
         return Ok(hit.clone());
     }
@@ -312,7 +321,9 @@ fn load_comps(conn: &Connection, sc: &Scope, cache: &CompCache) -> Result<std::s
                 ("pickRate", if sc.matches != 0 { num(cg / sc.matches as f64) } else { json!(0) }),
             ],
         );
-        comps.push(merge(comp, rate(&c, sc.comps as f64)));
+        let mut comp = merge(comp, rate(&c, sc.comps as f64));
+        comp.extend(crate::tierlist::fields(&c, f(&c, "sum_place") / cg).into_iter().map(|(k, v)| (k.to_string(), v)));
+        comps.push(comp);
     }
     let comps = std::sync::Arc::new(comps);
     let mut c = cache.lock().unwrap();
@@ -347,8 +358,11 @@ fn arr(xs: Vec<Obj>) -> Value {
 pub fn comps(conn: &Connection, q: Option<&str>, cache: &CompCache) -> Result<Obj> {
     let sc = scope(conn, q)?;
     let all = load_comps(conn, &sc, cache)?;
-    let rows: Vec<Obj> = all.iter().filter(|r| f(r, "games") >= sc.min).cloned().collect();
-    Ok(with(merge(public(&sc), marks(conn)?), &[("rows", arr(rows))]))
+    let listed: Vec<&Obj> = all.iter().filter(|r| f(r, "games") >= sc.min).collect();
+    // The tier list's filters (PRD 2 C11). With none asked for, every listed comp.
+    let filters = crate::tierlist::Filters::from_query(q);
+    let rows: Vec<Obj> = listed.iter().filter(|r| filters.keep(r)).map(|r| (*r).clone()).collect();
+    Ok(with(merge(public(&sc), marks(conn)?), &[("rows", arr(rows)), ("options", crate::tierlist::options(&listed))]))
 }
 
 pub fn comp(conn: &Connection, q: Option<&str>, id: &str, cache: &CompCache) -> Result<Obj> {

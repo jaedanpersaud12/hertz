@@ -17,5 +17,6 @@ serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha1.workspace = true
 tft-core.workspace = true
 tft-riot.workspace = true
+tft-stats.workspace = true
 tft-store.workspace = true
 tokio.workspace = true

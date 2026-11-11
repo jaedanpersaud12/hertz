@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import type { Grade } from './tiers'
 
 // ---- Shapes the local API returns ---------------------------------------------
 export type Entity = { id: string; name: string; icon: string | null; cost?: number | null; traits?: string[]; type?: string }
@@ -20,7 +21,13 @@ export type Comp = Rates & {
   units: (BoardUnit & { star: number; freq: number; avgItems: number })[]
   flex: (Entity & { freq: number })[]; traits: TraitChipData[]
   avgLevel: number; pickRate: number; play: { kind: string; label: string }
+  /** Tier list (PRD 2 C3, C4): letter and score from config/tier-list.json; null before the stats are rebuilt. */
+  tier: Grade | null; score: number | null
+  /** Average place last patch and in the last 3 days; the deltas are against this row's avgPlace (negative is better). */
+  prevPlace: number | null; d3Place: number | null; patchDelta: number | null; d3Delta: number | null; rising: boolean
 }
+/** What the tier list's filters can pick from, out of the comps listed before filtering. */
+export type CompOptions = { units: Entity[]; traits: Entity[]; items: Entity[]; playstyles: string[] }
 export type Marks = { favs: string[]; hidden: string[]; pinned: string | null }
 
 // ---- Filters shared by every stats page ---------------------------------------
