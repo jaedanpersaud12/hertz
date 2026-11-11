@@ -196,12 +196,11 @@ fn load_comps(conn: &Connection, sc: &Scope, cache: &CompCache) -> Result<std::s
     let mut comps = Vec::new();
     for c in rows(conn, "SELECT * FROM stat_comps WHERE patch = ? AND bucket = ?", &k)? {
         let comp_key = s(&c, "comp_key").to_string();
-        let mut split = comp_key.split('|');
-        let trait_id = split.next().unwrap_or("").to_string();
-        let carry_id = split.next().unwrap_or("").to_string();
         let us = unit_rows.get(&comp_key).unwrap_or(&empty);
         let its = item_rows.get(&comp_key).unwrap_or(&empty);
         let cg = f(&c, "games");
+        let (trait_id, carry_id) =
+            crate::comp_admin::trait_and_carry(&comp_key, trait_rows.get(&comp_key).unwrap_or(&empty), us, cg);
 
         // Core units: on the board in at least half the games. Small or messy comps fall back to the seven most common.
         let mut core: Vec<&Obj> = us.iter().filter(|u| f(u, "games") / cg >= 0.5).take(10).collect();
@@ -311,7 +310,7 @@ fn load_comps(conn: &Connection, sc: &Scope, cache: &CompCache) -> Result<std::s
             Map::new(),
             &[
                 ("id", json!(comp_key)),
-                ("name", json!(name.join(" "))),
+                ("name", json!(crate::comp_admin::name_override(conn, &comp_key)?.unwrap_or_else(|| name.join(" ")))),
                 ("trait", tr.map(Value::Object).unwrap_or(Value::Null)),
                 ("carries", Value::Array(carries.into_iter().map(Value::Object).collect())),
                 ("units", Value::Array(units.into_iter().map(Value::Object).collect())),

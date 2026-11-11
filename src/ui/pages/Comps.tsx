@@ -8,6 +8,7 @@ import { CopyButton } from '../interior/copy-button'
 import { Button, Change, Empty, FavButton, GradeChip, Icon, IconButton, PlaceRail, placeTone, Search, Select, Status, Tag, TraitChip, UnitChip } from '../parts'
 import { anyFilter, filterQuery, NO_FILTERS, PLAYSTYLES, readFilters, writeFilters, type TierFilters } from '../tierFilters'
 import tierConfig from '../../../config/tier-list.json'
+import { CompOverrides } from '../CompOverrides'
 
 type Rated = { games: number; freq: number; avgPlace: number; placeChange: number }
 type Band = {
@@ -175,6 +176,7 @@ function CompDetail({ comp }: { comp: Comp }) {
         </section>
       ) : null}
       <div className="detail-copy"><CopyButton className="ibtn" value={boardText} label="Copy board as text" copiedLabel="Copied" /></div>
+      <CompOverrides comp={comp} />
     </div>
   )
 }
