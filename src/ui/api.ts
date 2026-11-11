@@ -31,7 +31,7 @@ export const useFilters = () => useContext(FiltersCtx)
 const query = (f: Filters) =>
   `bucket=${encodeURIComponent(f.bucket)}&window=${f.window}&min=${f.min}${f.patch ? `&patch=${encodeURIComponent(f.patch)}` : ''}`
 
-/** Dev only: which stress dataset the switch at the bottom of the app has picked (see src/server/worstcase.ts). */
+/** Dev only: which stress dataset the switch at the bottom of the app has picked (see crates/tft-api/src/stress.rs). */
 export const STRESS = import.meta.env.DEV ? new URLSearchParams(location.search).get('data') : null
 const stressed = (url: string) => (STRESS ? `${url}${url.includes('?') ? '&' : '?'}data=${STRESS}` : url)
 

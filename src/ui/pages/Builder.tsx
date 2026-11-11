@@ -112,7 +112,7 @@ export function Builder() {
       {!data.loaded ? (
         <div className="mb-5">
           <CollapsibleBanner title="Unit costs and traits are not downloaded yet"
-            description={<>Traits cannot be counted until they are. Run <code>npm run static</code> in the project folder.</>} />
+            description={<>Traits cannot be counted until they are. Run <code>npm run refresh</code> in the project folder, or leave <code>npm start</code> running.</>} />
         </div>
       ) : null}
       <div className="builder-main">

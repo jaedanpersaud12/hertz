@@ -8,8 +8,8 @@ import { Fact } from '../parts'
 import { CrawlSettingsForm, PipelineHealth } from './Pipeline'
 
 const COMMANDS = [
-  { icon: Shapes, title: 'Names and icons', command: 'npm run static', text: 'Download unit, item and trait data for the current set. Run again after each patch.' },
-  { icon: DownloadSimple, title: 'Collect matches', command: 'npm run crawl', text: 'Leave it running. Stop with Ctrl+C and it resumes where it left off.' },
+  { icon: Shapes, title: 'Names and icons', command: 'npm run refresh', text: 'Download unit, item and trait data and the patch calendar now. The engine also does this on its own every 3 hours.' },
+  { icon: DownloadSimple, title: 'Collect matches', command: 'npm run crawl', text: 'Collects matches and keeps stats current. Leave it running; npm start does this too. Stop with Ctrl+C and it resumes where it left off.' },
   { icon: ChartBar, title: 'Rebuild stats', command: 'npm run stats', text: 'Recount every number in the app. Safe to run while collecting.' },
   { icon: Stack, title: 'Regroup comps', command: 'npm run recluster', text: 'Re-label stored boards after changing the comp rules.' },
 ]
@@ -43,7 +43,7 @@ export function Data({ meta }: { meta: Meta }) {
       <h3>Setup</h3>
       <div className="max-w-[460px]">
         <TaskSteps label="Setup progress" current={current} steps={[
-          { id: 'static', label: 'Download names and icons', meta: t.staticRows ? count(t.staticRows, 'entry', 'entries') : 'npm run static' },
+          { id: 'static', label: 'Download names and icons', meta: t.staticRows ? count(t.staticRows, 'entry', 'entries') : 'npm run refresh' },
           { id: 'crawl', label: 'Collect matches', meta: t.matches ? `${num(t.matches)} stored` : 'npm run crawl' },
           { id: 'stats', label: 'Build stats', meta: meta.builtAt ? `rebuilt ${ago(meta.builtAt)}` : 'npm run stats' },
         ]} />

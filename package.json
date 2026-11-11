@@ -8,6 +8,7 @@
     "start": "tsx scripts/tft.ts run",
     "crawl": "tsx scripts/tft.ts crawl",
     "stats": "tsx scripts/tft.ts stats",
+    "refresh": "tsx scripts/tft.ts refresh",
     "recluster": "tsx scripts/tft.ts recluster",
     "tft": "tsx scripts/tft.ts",
     "demo": "tsx scripts/demo.ts",
