@@ -1,10 +1,11 @@
-//! The read-only routes of `src/server/index.ts`, one function per route, in the same order and with the same
-//! queries. Each returns the JSON body; the server in `lib.rs` turns it into a response.
+//! The routes of `src/server/index.ts`, one function per route, in the same order and with the same queries.
+//! Each returns the JSON body; the server in `lib.rs` turns it into a response. The summoner routes are in `me.rs`.
 
 use crate::describe::{Kind, describe};
 use crate::js::{self, num, number, number_of, patch_order};
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, ToSql, types::ValueRef};
+use crate::jsval::{self, JsValue};
+use rusqlite::{Connection, OptionalExtension, ToSql, types::Value as SqlValue, types::ValueRef};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -742,13 +743,96 @@ pub fn static_data(conn: &Connection) -> Result<Obj> {
 
 // ---- Your lists ----------------------------------------------------------------
 
-pub fn lists(conn: &Connection) -> Result<Obj> {
+fn teams(conn: &Connection) -> Result<Value> {
     let mut teams = Vec::new();
     for t in rows(conn, "SELECT id, name, board, created FROM saved_teams ORDER BY created DESC", &[])? {
         let board: Value = serde_json::from_str(s(&t, "board"))?;
         teams.push(json!({ "id": g(&t, "id"), "name": g(&t, "name"), "created": g(&t, "created"), "board": board }));
     }
-    Ok(with(marks(conn)?, &[("teams", Value::Array(teams))]))
+    Ok(Value::Array(teams))
+}
+
+pub fn lists(conn: &Connection) -> Result<Obj> {
+    Ok(with(marks(conn)?, &[("teams", teams(conn)?)]))
+}
+
+/// A value bound the way better-sqlite3 binds it: numbers as doubles, `undefined` as NULL, a one-entry array as
+/// its entry. Booleans, objects and other arrays make it throw, which the TypeScript API answers with a 500.
+fn bind(v: Option<&JsValue>) -> Result<SqlValue> {
+    Ok(match v {
+        None | Some(JsValue::Null) => SqlValue::Null,
+        Some(JsValue::Str(x)) => SqlValue::Text(x.clone()),
+        Some(JsValue::Num(x)) if x.is_nan() => SqlValue::Null,
+        Some(JsValue::Num(x)) => SqlValue::Real(*x),
+        // An array is the list of parameters: one entry binds as that entry.
+        Some(JsValue::Arr(xs)) if xs.len() == 1 && !matches!(xs[0], JsValue::Arr(_)) => bind(Some(&xs[0]))?,
+        Some(other) => anyhow::bail!("SQLite3 can only bind numbers, strings, bigints, buffers, and null (got {})", other.stringify()),
+    })
+}
+
+/// `const { a, b } = body`: a body of `null` throws.
+fn fields(body: &JsValue) -> Result<&JsValue> {
+    if *body == JsValue::Null {
+        anyhow::bail!("Cannot destructure a body of null");
+    }
+    Ok(body)
+}
+
+/// POST /api/lists/mark: { key, fav?, hidden? }.
+pub fn mark(conn: &Connection, body: &JsValue) -> Result<Obj> {
+    let b = fields(body)?;
+    let key = bind(b.get("key"))?;
+    conn.execute("INSERT OR IGNORE INTO comp_marks (comp_key) VALUES (?)", [&key])?;
+    if let Some(fav) = b.get("fav") {
+        conn.execute("UPDATE comp_marks SET fav = ? WHERE comp_key = ?", rusqlite::params![i64::from(fav.truthy()), key])?;
+    }
+    if let Some(hidden) = b.get("hidden") {
+        conn.execute("UPDATE comp_marks SET hidden = ? WHERE comp_key = ?", rusqlite::params![i64::from(hidden.truthy()), key])?;
+    }
+    marks(conn)
+}
+
+/// POST /api/lists/pin: { key } pins a comp; a falsy key unpins.
+pub fn pin(conn: &Connection, body: &JsValue) -> Result<Obj> {
+    match fields(body)?.get("key").filter(|k| k.truthy()) {
+        Some(key) => crate::me::kv_set_js(conn, "pinned", key)?,
+        None => {
+            conn.execute("DELETE FROM kv WHERE key = 'pinned'", [])?;
+        }
+    }
+    marks(conn)
+}
+
+/// POST /api/teams: { name, board }. The name is cut to 60 UTF-16 units, as `String(name).slice(0, 60)` cuts it.
+pub fn save_team(conn: &Connection, body: &JsValue) -> Result<Obj> {
+    let b = fields(body)?;
+    let units: Vec<u16> = jsval::js_string(b.get("name")).encode_utf16().take(60).collect();
+    // A cut through an emoji leaves half of it; better-sqlite3 stores that as its three-byte (CESU-8) form.
+    let mut name = Vec::new();
+    for c in char::decode_utf16(units.iter().copied()) {
+        match c {
+            Ok(c) => name.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+            Err(e) => {
+                let u = u32::from(e.unpaired_surrogate());
+                name.extend_from_slice(&[0xE0 | (u >> 12) as u8, 0x80 | ((u >> 6) & 0x3F) as u8, 0x80 | (u & 0x3F) as u8]);
+            }
+        }
+    }
+    let name = if name.is_empty() { b"Untitled team".to_vec() } else { name };
+    let board = b.get("board").map(JsValue::stringify); // JSON.stringify(undefined) binds as NULL and fails NOT NULL
+    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as f64;
+    conn.execute(
+        "INSERT INTO saved_teams (name, board, created) VALUES (?,?,?)",
+        rusqlite::params![rusqlite::types::ToSqlOutput::Borrowed(ValueRef::Text(&name)), board, created],
+    )?;
+    Ok(with(Map::new(), &[("teams", teams(conn)?)]))
+}
+
+/// DELETE /api/teams/:id. The id goes through `Number()`, so "1.0" and "0x1" delete team 1.
+pub fn delete_team(conn: &Connection, id: &str) -> Result<Obj> {
+    let id = js::number(id);
+    conn.execute("DELETE FROM saved_teams WHERE id = ?", [(!id.is_nan()).then_some(id)])?;
+    Ok(with(Map::new(), &[("teams", teams(conn)?)]))
 }
 
 // ---- Status --------------------------------------------------------------------
