@@ -115,10 +115,13 @@ CREATE TABLE IF NOT EXISTS my_matches (match_id TEXT PRIMARY KEY, game_datetime 
 ///    (C13), rebuilt with the stats when the comp method is `clusters`. See `cluster.rs` in tft-stats.
 /// 6. Flex and swaps on the comp page (PRD 2 C8), written by `tft-stats` (`flex.rs`) like migration 4's tables;
 ///    and the difficulty you give a comp (C10), yours and never rebuilt: `level` is easy, medium or hard.
+/// 7. Unit and trait page depth (PRD 3 U3, U4, U8): item pairs per unit, teammates, the units that carry each trait
+///    breakpoint. Written per scope by `tft-stats` (`unit_depth.rs`), kept out of [`STAT_TABLES`] as migration 4's are.
+///    `item_c` '' means any third item (or none).
 /// 8. Item depth (PRD 3 U5, U7), written by `tft-stats` (`items_depth.rs`) per scope: what each component builds,
 ///    weighted by place change on S and A comps (`stat_components`), and the trait level each emblem's trait is at
-///    on the boards that hold it (`stat_emblem_tiers`). Number 7 is taken by other PRD 3 work.
-pub const MIGRATIONS: [(u32, &str); 7] = [
+///    on the boards that hold it (`stat_emblem_tiers`).
+pub const MIGRATIONS: [(u32, &str); 8] = [
     (1, "CREATE TABLE IF NOT EXISTS stat_watermark (scope TEXT PRIMARY KEY, last_rowid INTEGER, built_at INTEGER)"),
     (
         2,
@@ -190,6 +193,26 @@ CREATE TABLE IF NOT EXISTS comp_difficulty (comp_key TEXT PRIMARY KEY, level TEX
 ",
     ),
     (
+        7,
+        "
+CREATE TABLE IF NOT EXISTS stat_unit_pairs (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, character_id TEXT NOT NULL, item_a TEXT NOT NULL, item_b TEXT NOT NULL,
+  item_c TEXT NOT NULL, games INTEGER NOT NULL, sum_place INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, character_id, item_a, item_b, item_c)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_teammates (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, character_id TEXT NOT NULL, other TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, character_id, other)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS stat_trait_sets (
+  patch TEXT NOT NULL, bucket TEXT NOT NULL, name TEXT NOT NULL, tier_current INTEGER NOT NULL, units TEXT NOT NULL,
+  games INTEGER NOT NULL, sum_place INTEGER NOT NULL,
+  PRIMARY KEY (patch, bucket, name, tier_current, units)
+) WITHOUT ROWID;
+",
+    ),
+    (
         8,
         "
 CREATE TABLE IF NOT EXISTS stat_components (
@@ -225,7 +248,8 @@ pub const STAT_TABLES: [&str; 13] = [
 /// 4: the comp page tables (migration 4) are filled by a rebuild, so stats built before them are rebuilt in full.
 /// 5: stat_comps gained core and flex, and stat_comp_variants was added (PRD 2 C1, C2).
 /// 6: the flex and swap tables (migration 6) are filled by a rebuild, so stats built before them are rebuilt in full.
-/// 8: the item depth tables (migration 8) are filled by a rebuild (PRD 3 U5, U7). 7 is taken by other PRD 3 work.
+/// 7: the unit and trait page tables (migration 7) are filled by a rebuild (PRD 3 U3, U4, U8).
+/// 8: the item depth tables (migration 8) are filled by a rebuild (PRD 3 U5, U7).
 pub const STATS_VERSION: i64 = 8;
 
 pub fn stats_schema() -> String {

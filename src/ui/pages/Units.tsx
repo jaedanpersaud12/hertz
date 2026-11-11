@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { count, num, pct, useApi, useFilters, type BoardUnit, type Entity, type Rates, type Scope } from '../api'
 import { Tabs } from '../interior/tabs'
 import { ValueFlash } from '../interior/value-flash'
-import { Change, Dist, Empty, Fact, Games, GradeChip, Icon, PlaceRail, rateCols, Search, Segmented, Status, Table, Tag, UnitChip } from '../parts'
+import { Button, Change, Dist, Empty, Fact, Games, GradeChip, Icon, PlaceRail, placeTone, rateCols, Search, Segmented, Select, Status, Table, Tag, UnitChip } from '../parts'
 import { gradeByChange, gradeByPlace } from '../tiers'
 
 type UnitRow = Entity & Rates & { avgStar: number }
@@ -56,7 +56,20 @@ type Detail = Scope & {
   builds: BuildStat[]
   comps: { id: string; name: string; games: number; avgPlace: number; pickRate: number; units: BoardUnit[]; play: { kind: string; label: string } }[]
   trend: ({ patch: string } & Rates)[]
+  /** PRD 3 U1: star 1 to 3 by 0 to 3 items, all twelve cells. */
+  grid: GridCell[]
+  /** PRD 3 U4: the units it places best alongside (200 shared boards or more), place change against its own average. */
+  teammates: (Entity & { games: number; avgPlace: number; placeChange: number })[]
+  /** The last 3 days of this patch, for the trend (null when the window is already 3 days, or nothing was played). */
+  recent: ({ window: string; label: string } & Rates) | null
+  /** False for summons and units that cannot hold items: no builds or item pairs. */
+  holdsItems: boolean
 }
+type GridCell = { star: number; items: number; games: number; avgPlace: number | null; top4Rate: number | null }
+type BuildRow = { id: string; items: Entity[]; games: number; share: number; avgPlace: number; placeChange: number | null }
+type Builds = Scope & { comp: string | null; compGames: number; minCompGames: number; fallback: boolean; holdsItems: boolean; rows: BuildRow[] }
+type PairRow = Entity & { games: number; avgPlace: number; placeChange: number; copies: number }
+type Pairs = Scope & { have: Entity[]; base: { games: number; avgPlace: number; placeChange: number } | null; holdsItems: boolean; rows: PairRow[] }
 
 const STAT_LABELS: [string, string][] = [
   ['hp', 'Health'], ['mana', 'Mana'], ['damage', 'Attack damage'], ['attackSpeed', 'Attack speed'],
@@ -78,16 +91,7 @@ export function Unit({ id }: { id: string }) {
   const emptyHint = `Nothing with ${num(f.min)} games yet. Lower the minimum games.`
 
   const panels: Record<string, React.ReactNode> = {
-    builds: (
-      <Table flush label="Three-item builds" rows={data.builds} initial="games" desc empty={emptyHint} cols={[
-        { key: 'build', label: 'Build', render: (r) => <span className="holders">{r.items.map((i, n) => <Icon key={n} e={i} size={30} plain />)}</span> },
-        { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByChange(r.placeChange ?? 0)} />, width: '60px' },
-        { key: 'change', label: 'Place change', sort: (r) => r.placeChange ?? 0, render: (r) => <Change value={r.placeChange} />, align: 'right' },
-        { key: 'place', label: 'Avg place', sort: (r) => r.avgPlace, render: (r) => r.avgPlace.toFixed(2), align: 'right' },
-        { key: 'win', label: 'Win rate', sort: (r) => r.winRate, render: (r) => pct(r.winRate), align: 'right' },
-        { key: 'games', label: 'Games', sort: (r) => r.games, align: 'right', render: (r) => <Games r={r} /> },
-      ]} />
-    ),
+    builds: <BuildsPanel id={id} comps={data.comps} holds={data.holdsItems} />,
     items: (
       <Table flush label="Items" rows={data.items} initial="change" empty={emptyHint} cols={[
         { key: 'name', label: 'Item', sort: (r) => r.name, render: (r) => <a className="name" href={itemLink(r)}><Icon e={r} size={28} plain /><span>{r.name}</span></a> },
@@ -107,8 +111,19 @@ export function Unit({ id }: { id: string }) {
         { key: 'games', label: 'Games', sort: (r) => r.games, render: (r) => num(r.games), align: 'right', width: '90px' },
       ]} />
     ),
+    teammates: (
+      <Table flush label="Teammates" rows={data.teammates} initial="change" cols={[
+        { key: 'name', label: 'Unit', sort: (r) => r.name, render: (r) => <a className="name" href={unitLink(r)}><Icon e={r} size={28} /><span>{r.name}</span></a> },
+        { key: 'change', label: 'Place change', sort: (r) => r.placeChange, render: (r) => <Change value={r.placeChange} />, align: 'right' },
+        { key: 'place', label: 'Avg place together', sort: (r) => r.avgPlace, render: (r) => <PlaceRail value={r.avgPlace} />, width: '170px' },
+        { key: 'games', label: 'Shared boards', sort: (r) => r.games, render: (r) => num(r.games), align: 'right' },
+      ]} empty="No unit shares 200 boards with this one at these filters. Pick a wider rank filter or the whole patch." />
+    ),
     trend: (
-      <Table flush label="By patch" rows={data.trend.map((t) => ({ ...t, id: t.patch }))} initial="patch" desc cols={[
+      <Table flush label="By patch" rows={[
+        ...(data.recent ? [{ ...data.recent, patch: `${data.patch}, last 3 days`, id: 'recent' }] : []),
+        ...data.trend.map((t) => ({ ...t, id: t.patch })),
+      ]} initial="patch" desc cols={[
         { key: 'patch', label: 'Patch', sort: (r) => r.patch, render: (r) => r.patch },
         { key: 'place', label: 'Avg place', render: (r) => <PlaceRail value={r.avgPlace} />, width: '150px' },
         { key: 'win', label: 'Win rate', render: (r) => pct(r.winRate), align: 'right' },
@@ -176,7 +191,10 @@ export function Unit({ id }: { id: string }) {
               <h3>Items held</h3>
               <Dist rows={[...data.itemCounts].reverse().map((s) => ({ label: s.value === 1 ? '1 item' : `${s.value} items`, share: s.share, avgPlace: s.avgPlace, games: s.games }))} />
             </section>
+            <StarGrid cells={data.grid} min={f.min} />
           </div>
+
+          <NextItem id={id} holds={data.holdsItems} />
 
           {best || popular ? (
             <p className="recommend">
@@ -186,10 +204,104 @@ export function Unit({ id }: { id: string }) {
           ) : null}
 
           <Tabs label={`${u.name} details`} value={tab} onValueChange={setTab}
-            items={[{ value: 'builds', label: 'Builds' }, { value: 'items', label: 'Items' }, { value: 'comps', label: 'Comps' }, { value: 'trend', label: 'By patch' }]}
+            items={[{ value: 'builds', label: 'Builds' }, { value: 'items', label: 'Items' }, { value: 'teammates', label: 'Teammates' }, { value: 'comps', label: 'Comps' }, { value: 'trend', label: 'By patch' }]}
             renderPanel={(value) => panels[value]} />
         </>
       )}
     </>
+  )
+}
+
+/** U1: average place and games for each star level and item count. Cells under the minimum games are dimmed. */
+function StarGrid({ cells, min }: { cells: GridCell[]; min: number }) {
+  if (!cells.length) return null
+  return (
+    <section className="card grow">
+      <h3>Stars by items</h3>
+      <table className="star-grid" aria-label="Average place by star level and items held">
+        <thead><tr><th scope="col"><span className="sr-only">Star level</span></th>{[0, 1, 2, 3].map((n) => <th key={n} scope="col">{n === 1 ? '1 item' : `${n} items`}</th>)}</tr></thead>
+        <tbody>
+          {[1, 2, 3].map((star) => (
+            <tr key={star}>
+              <th scope="row" aria-label={`${star} star`}>{'★'.repeat(star)}</th>
+              {[0, 1, 2, 3].map((n) => {
+                const c = cells.find((x) => x.star === star && x.items === n)
+                const thin = !c || c.games < min
+                return (
+                  <td key={n} className={thin ? 'thin' : undefined} title={c?.games ? `${num(c.games)} games${thin ? ', under the minimum' : ''}` : 'Not played'}>
+                    {c && c.avgPlace != null ? <><b className={`tone-${placeTone(c.avgPlace)}`}>{c.avgPlace.toFixed(2)}</b><span className="muted small">{num(c.games)}</span></> : <span className="muted">–</span>}
+                  </td>
+                )
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  )
+}
+
+/** U2: three-item builds by place change, on all boards or in one comp. A comp where the unit held three items on
+ * fewer than 50 boards falls back to all boards, and says so. */
+function BuildsPanel({ id, comps, holds }: { id: string; comps: Detail['comps']; holds: boolean }) {
+  const f = useFilters()
+  const [comp, setComp] = useState('')
+  const { data, error, loading } = useApi<Builds>(`/api/units/${encodeURIComponent(id)}/builds${comp ? `?comp=${encodeURIComponent(comp)}` : ''}`, f)
+  if (!holds) return <p className="muted px-4 py-6">This unit cannot hold items, so it has no builds.</p>
+  const picker = comps.length ? (
+    <div className="panel-bar">
+      <Select label="Comp" prefix="Boards:" value={comp} onChange={setComp}
+        options={[{ value: '', label: 'All boards' }, ...comps.map((c) => ({ value: c.id, label: c.name, hint: `${num(c.games)} games` }))]} />
+      {data?.fallback ? <span className="muted small">Under {num(data.minCompGames)} games with three items in this comp ({num(data.compGames)}), so these builds are from all boards.</span> : null}
+    </div>
+  ) : null
+  if (error || !data) return <>{picker}<div className="px-4 py-4"><Status error={error} loading={loading} /></div></>
+  return (
+    <>
+      {picker}
+      <Table flush label="Three-item builds" rows={data.rows} initial="change" empty={`No build has ${num(f.min)} games yet. Lower the minimum games${comp ? ', or pick all boards' : ''}.`} cols={[
+        { key: 'build', label: 'Build', render: (r) => <span className="holders">{r.items.map((i, n) => <Icon key={n} e={i} size={30} plain />)}</span> },
+        { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByChange(r.placeChange ?? 0)} />, width: '60px' },
+        { key: 'change', label: 'Place change', sort: (r) => r.placeChange ?? 0, render: (r) => <Change value={r.placeChange} />, align: 'right' },
+        { key: 'place', label: 'Avg place', sort: (r) => r.avgPlace, render: (r) => r.avgPlace.toFixed(2), align: 'right' },
+        { key: 'games', label: 'Games', sort: (r) => r.games, align: 'right', render: (r) => <>{num(r.games)} <span className="muted small">{pct(r.share)}</span></> },
+      ]} />
+    </>
+  )
+}
+
+/** U3: pick up to two items the unit already holds; the list shows the best item to add. Each pick is one click. */
+function NextItem({ id, holds }: { id: string; holds: boolean }) {
+  const f = useFilters()
+  const [have, setHave] = useState<string[]>([])
+  const { data, error, loading } = useApi<Pairs>(holds ? `/api/units/${encodeURIComponent(id)}/pairs${have.length ? `?have=${have.map(encodeURIComponent).join(',')}` : ''}` : null, f)
+  if (!holds) return null
+  const step = have.length === 0 ? 'Pick the first item it holds' : have.length === 1 ? 'Pick the second item it holds' : 'Best third item'
+  const full = have.length >= 2
+  return (
+    <section className="card next-item">
+      <div className="next-head">
+        <h3>Item completer</h3>
+        <span className="held" aria-live="polite">
+          {have.map((h, n) => {
+            const e = data?.have.find((x) => x.id === h) ?? { id: h, name: h, icon: null }
+            return <Button key={`${h}-${n}`} size="sm" onClick={() => setHave(have.filter((_, i) => i !== n))} aria-label={`Remove ${e.name}`}><Icon e={e} size={18} plain /> {e.name} ×</Button>
+          })}
+          {have.length ? <Button size="sm" variant="ghost" onClick={() => setHave([])}>Start over</Button> : null}
+        </span>
+        <span className="muted small next-step">{step}{data?.base ? <>: holding these, avg place {data.base.avgPlace.toFixed(2)} (<Change value={data.base.placeChange} />) in {num(data.base.games)} games</> : null}</span>
+      </div>
+      {error || !data ? <Status error={error} loading={loading} /> : (
+        <Table flush label={step} rows={data.rows} initial="change" rowHeight={44} minWidth={480}
+          empty={have.length ? `Nothing to add with ${num(f.min)} games yet. Remove an item, or lower the minimum games.` : `No item has ${num(f.min)} games on this unit yet. Lower the minimum games.`} cols={[
+          { key: 'name', label: full ? 'Add as third item' : 'Item', sort: (r) => r.name, render: (r) => full
+            ? <span className="name"><Icon e={r} size={26} plain /><span>{r.name}{r.copies > 1 ? <b className="copies"> x{r.copies}</b> : null}</span></span>
+            : <button type="button" className="name pick" onClick={() => setHave([...have, r.id])} title={`Add ${r.name} to the items it holds`}><Icon e={r} size={26} plain /><span>{r.name}{r.copies > 1 ? <b className="copies"> x{r.copies}</b> : null}</span></button> },
+          { key: 'change', label: 'Place change', sort: (r) => r.placeChange, render: (r) => <Change value={r.placeChange} />, align: 'right' },
+          { key: 'place', label: 'Avg place', sort: (r) => r.avgPlace, render: (r) => r.avgPlace.toFixed(2), align: 'right' },
+          { key: 'games', label: 'Games', sort: (r) => r.games, render: (r) => num(r.games), align: 'right' },
+        ]} />
+      )}
+    </section>
   )
 }

@@ -17,6 +17,8 @@ pub type Obj = Map<String, Value>;
 mod comp_page;
 mod flex;
 mod items_page;
+mod unit_depth;
+pub use unit_depth::{builds as unit_builds, pairs as unit_pairs, trait_detail};
 
 /// Time windows inside a patch, as `WINDOWS` in `src/config.ts`. '' is the whole patch.
 const WINDOWS: [(&str, &str, Option<i64>); 2] = [("", "Whole patch", None), ("3d", "Last 3 days", Some(3))];
@@ -465,6 +467,10 @@ pub fn unit(conn: &Connection, q: Option<&str>, id: &str, cache: &CompCache) -> 
                 ("comps", json!([])),
                 ("trend", json!([])),
                 ("prev", Value::Null),
+                ("grid", json!([])),
+                ("teammates", json!([])),
+                ("recent", Value::Null),
+                ("holdsItems", json!(unit_depth::holds_items(conn, id)?)),
             ],
         ));
     };
@@ -548,7 +554,8 @@ pub fn unit(conn: &Connection, q: Option<&str>, id: &str, cache: &CompCache) -> 
         build_out.push(with(d, &[("placeChange", g(r, "place_change"))]));
     }
     let full = merge(describe(conn, Kind::Unit, id, true)?, rate(&unit, sc.comps as f64));
-    Ok(with(
+    let depth = unit_depth::unit_sections(conn, &sc, id, f(&unit, "sum_place") / ug)?;
+    let body = with(
         public(&sc),
         &[
             ("unit", Value::Object(with(full, &[("avgStar", g(&unit, "avg_star"))]))),
@@ -560,7 +567,8 @@ pub fn unit(conn: &Connection, q: Option<&str>, id: &str, cache: &CompCache) -> 
             ("items", arr(item_out)),
             ("builds", arr(build_out)),
         ],
-    ))
+    );
+    Ok(with(body, &depth))
 }
 
 // ---- Traits --------------------------------------------------------------------

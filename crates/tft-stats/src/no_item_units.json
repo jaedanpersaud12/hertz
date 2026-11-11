@@ -1,0 +1,4 @@
+{
+  "about": "Units left out of item build and item pair stats (PRD 3 edge cases): summons and units that cannot hold items. SQL LIKE patterns matched against the unit id, ignoring ASCII case. Add a set's own ids here when a new set adds them.",
+  "patterns": ["%summon%", "%trainingdummy%"]
+}

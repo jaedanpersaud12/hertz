@@ -252,6 +252,7 @@ fn worst(path: &str, body: &mut Obj) {
     if path.starts_with("/api/comps/") {
         comp_page(body, true);
     }
+    depth_page(path, body, "worst");
 
     let long_ago = num(now_ms() - 400.0 * DAY);
     if path == "/api/meta" {
@@ -291,13 +292,14 @@ fn worst(path: &str, body: &mut Obj) {
     }
 }
 
-const LISTS: [&str; 24] = [
+const LISTS: [&str; 25] = [
     "rows", "matches", "teams", "favs", "hidden", "builds", "levels", "partners", "items", "holders", "comps", "trend",
     "stars", "itemCounts", "units", "traits", "recent", "byPatch", "levelling", "carries", "special",
-    "addAt9", "swaps", "variants",
+    "addAt9", "swaps", "variants", "teammates",
 ];
 
 fn shrink(path: &str, body: &mut Obj, keep: usize) {
+    depth_page(path, body, if keep == 0 { "empty" } else { "one" });
     for key in LISTS {
         if let Some(Value::Array(xs)) = body.get_mut(key) {
             xs.truncate(keep);
@@ -534,6 +536,78 @@ fn many(body: &mut Obj) {
     }
 }
 
+/// The unit page's grid and teammates and the trait page's breakpoints (PRD 3 U1, U4, U8). The grid keeps its
+/// twelve cells in every mode: empty has none played, one has a single played cell, worst mixes the extremes with
+/// unplayed cells. Many fills teammates to the ten shown, a trait to eight breakpoints, each with ten units.
+fn depth_page(path: &str, body: &mut Obj, mode: &str) {
+    let seg: Vec<&str> = path.split('/').collect();
+    let unit_page = seg.len() == 4 && seg[2] == "units";
+    let trait_page = seg.len() == 4 && seg[2] == "traits";
+    if unit_page && let Some(Value::Array(cells)) = body.get_mut("grid") {
+        for (i, c) in cells.iter_mut().enumerate() {
+            let Value::Object(c) = c else { continue };
+            let (games, place, top4) = match mode {
+                "empty" => (json!(0), Value::Null, Value::Null),
+                "one" if i > 0 => (json!(0), Value::Null, Value::Null),
+                "one" => (json!(1), json!(8), json!(0)),
+                "worst" if i % 3 == 2 => (json!(0), Value::Null, Value::Null),
+                "worst" if i == 0 => (json!(12_345_678), json!(1), json!(1)),
+                "worst" => (json!(1 + i), json!(8), json!(0)),
+                _ => continue,
+            };
+            c.insert("games".into(), games);
+            c.insert("avgPlace".into(), place);
+            c.insert("top4Rate".into(), top4);
+        }
+    }
+    if unit_page && mode == "worst" {
+        extreme(body.get_mut("teammates"));
+        if let Some(Value::Object(r)) = body.get_mut("recent") {
+            r.insert("games".into(), json!(1));
+            r.insert("avgPlace".into(), json!(8));
+            r.insert("frequency".into(), json!(0.00004));
+        }
+    }
+    let fill = |xs: &mut Vec<Value>, n: usize| {
+        if xs.is_empty() {
+            return;
+        }
+        let base = xs.clone();
+        *xs = (0..n)
+            .map(|i| {
+                let mut v = base[i % base.len()].clone();
+                if let (true, Value::Object(o)) = (i >= base.len(), &mut v)
+                    && let Some(Value::String(id)) = o.get("id")
+                {
+                    let id = format!("{id}~{i}");
+                    o.insert("id".into(), json!(id));
+                }
+                v
+            })
+            .collect();
+    };
+    if unit_page && mode == "many" && let Some(Value::Array(xs)) = body.get_mut("teammates") {
+        fill(xs, 10);
+    }
+    if trait_page && (mode == "many" || mode == "worst") && let Some(Value::Array(levels)) = body.get_mut("levels") {
+        fill(levels, 8);
+        for (i, l) in levels.iter_mut().enumerate() {
+            let Value::Object(o) = l else { continue };
+            if let Some(Value::Array(us)) = o.get_mut("set").and_then(|s| s.get_mut("units")) {
+                fill(us, 10);
+            }
+            if mode == "worst" && i == 1 {
+                o.insert("set".into(), Value::Null); // no unit set for this breakpoint
+            }
+            o.insert("level".into(), json!(i + 1));
+            o.insert("units".into(), json!(2 * (i + 1)));
+        }
+    }
+    if trait_page && mode == "worst" {
+        extreme(body.get_mut("levels"));
+    }
+}
+
 // ---- The Data page's engine routes (`engine.rs`), which the TypeScript server never had -------------------
 
 const HOUR: i64 = 3_600_000;
@@ -688,6 +762,7 @@ pub fn stress(mode: &str, path: &str, body: &mut Value) {
         }
         "many" => {
             many(b);
+            depth_page(path, b, "many");
             if path.starts_with("/api/comps/") {
                 comp_page(b, false);
             }
@@ -833,5 +908,37 @@ mod tests {
         let mut one = body;
         stress("one", "/api/comps/X%7CU", &mut one);
         assert_eq!(one["special"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unit_and_trait_depth_hold_their_shape() {
+        let cells: Vec<Value> = (0..12).map(|i| json!({ "star": 1 + i / 4, "items": i % 4, "games": 30, "avgPlace": 4.0, "top4Rate": 0.5 })).collect();
+        let unit = json!({ "grid": cells, "teammates": [{ "id": "M", "name": "M", "cost": 1, "games": 300, "placeChange": -0.4 }],
+            "recent": { "games": 5, "avgPlace": 4.0, "frequency": 0.1 } });
+        let played = |b: &Value| b["grid"].as_array().unwrap().iter().filter(|c| c["games"] != json!(0)).count();
+        let mut empty = unit.clone();
+        stress("empty", "/api/units/X", &mut empty);
+        assert_eq!((empty["grid"].as_array().unwrap().len(), played(&empty)), (12, 0));
+        assert_eq!(empty["teammates"], json!([]));
+        let mut one = unit.clone();
+        stress("one", "/api/units/X", &mut one);
+        assert_eq!(played(&one), 1);
+        let mut worst = unit.clone();
+        stress("worst", "/api/units/X", &mut worst);
+        assert_eq!((played(&worst), worst["grid"][0]["games"].clone()), (8, json!(12_345_678)));
+        let mut many = unit.clone();
+        stress("many", "/api/units/X", &mut many);
+        assert_eq!(many["teammates"].as_array().unwrap().len(), 10);
+
+        let tr = json!({ "levels": [{ "id": "T|1", "level": 1, "units": 2, "games": 9, "avgPlace": 4.0,
+            "set": { "units": [{ "id": "U", "name": "U", "cost": 1 }], "games": 5 } }] });
+        let mut worst = tr.clone();
+        stress("worst", "/api/traits/T", &mut worst);
+        let levels = worst["levels"].as_array().unwrap();
+        assert_eq!((levels.len(), levels[0]["set"]["units"].as_array().unwrap().len()), (8, 10));
+        assert_eq!((levels[1]["set"].clone(), levels[0]["games"].clone()), (Value::Null, json!(12_345_678)));
+        let mut empty = tr;
+        stress("empty", "/api/traits/T", &mut empty);
+        assert_eq!(empty["levels"], json!([]));
     }
 }

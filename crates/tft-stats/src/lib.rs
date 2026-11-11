@@ -15,6 +15,7 @@ pub mod cluster;
 pub mod lineage;
 pub mod overrides;
 pub mod report;
+pub mod unit_depth;
 pub mod variants;
 #[cfg(test)]
 mod cluster_tests;
@@ -198,6 +199,7 @@ pub fn build_stats_incremental_with(
     conn.execute_batch(INC_DROP)?;
     comp_detail::inc_drop(conn)?;
     items_depth::inc_drop(conn)?;
+    unit_depth::inc_drop(conn)?;
     if !touched.is_empty() && comp_method(conn)? == Method::Clusters {
         lineage::update(conn)?; // PRD 2 C13; before the trends, which follow it to last patch's comp
     }
@@ -436,6 +438,7 @@ fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), t
     comp_detail::inc_sums(&tx)?;
     items_depth::prepare(&tx)?;
     items_depth::inc_sums(&tx)?;
+    unit_depth::inc_sums(&tx)?;
     for (job, ..) in &mut planned {
         job.comps =
             tx.query_row("SELECT COUNT(*) FROM inc_b WHERE band >= ? AND w >= ?", params![job.band, job.w], |r| r.get(0))?;
@@ -478,6 +481,7 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         }
         comp_detail::clear(db, patch, &job.scope)?;
         flex::clear(db, patch, &job.scope)?;
+        unit_depth::clear(db, patch, &job.scope)?;
     } else {
         for table in STAT_TABLES {
             db.execute(&format!("DELETE FROM {table} WHERE patch = ? AND bucket = ?"), k)?;
@@ -485,6 +489,7 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         comp_detail::clear(db, patch, &job.scope)?;
         flex::clear(db, patch, &job.scope)?;
         items_depth::clear(db, patch, &job.scope)?;
+        unit_depth::clear(db, patch, &job.scope)?;
         db.execute("INSERT INTO stat_meta VALUES (?,?,?,?,?)", params![patch, job.scope, job.matches, job.comps, now_ms()])?;
         if job.comps == 0 {
             return Ok(());
@@ -512,6 +517,7 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
     }
     items_depth::write_inc(db, patch, &job.scope, job.band, job.w, job.seg)?;
     build_derived(db, patch, &job.scope)?;
+    unit_depth::write_inc(db, patch, &job.scope, job.band, job.w)?;
     if job.comps > 0 && comp_method(db)? == Method::Clusters {
         cluster::comps_from_inc(db, patch, &job.scope, job.band, job.w, job.comps)?;
     } else if job.comps > 0 {
@@ -664,6 +670,7 @@ fn build_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: 
     comp_detail::clear(db, patch, scope)?;
     flex::clear(db, patch, scope)?;
     items_depth::clear(db, patch, scope)?;
+    unit_depth::clear(db, patch, scope)?;
 
     let comps: i64 = db.query_row("SELECT COUNT(*) n FROM p", [], |r| r.get(0))?;
     let matches: i64 = db.query_row(
@@ -682,6 +689,7 @@ fn build_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: 
     build_rates(db, patch, scope)?;
     items_depth::build_full(db, patch, scope)?;
     build_derived(db, patch, scope)?;
+    unit_depth::build_full(db, patch, scope)?; // before build_comps, which relabels the boards in p
     build_comps(db, patch, scope, comps)
 }
 
@@ -1204,12 +1212,28 @@ mod incremental_tests {
         }
     }
 
+    /// Set data giving the synthetic units traits (by name, as Community Dragon lists them), so the trait unit sets
+    /// (PRD 3 U8) have rows.
+    pub(crate) fn depth_static(conn: &Connection) {
+        for t in 0..20 {
+            conn.execute("INSERT INTO static_data VALUES ('trait', ?, ?, NULL, '{}')", params![format!("T{t:02}"), format!("Trait {t:02}")])
+                .unwrap();
+        }
+        for u in 0..60 {
+            let traits = serde_json::json!({ "traits": [format!("Trait {:02}", u % 20), format!("Trait {:02}", (u * 3) % 20)] });
+            conn.execute("INSERT INTO static_data VALUES ('unit', ?, 'U', NULL, ?)", params![format!("U{u:02}"), traits.to_string()])
+                .unwrap();
+        }
+    }
+
     /// Every stat table in `a` equals the one in the database at `b`, row for row and value for value
     /// (stat_meta.built_at aside). Returns the number of rows compared.
     pub(crate) fn assert_same_stats(a: &Connection, b: &std::path::Path) -> i64 {
         a.execute("ATTACH DATABASE ? AS fresh", [b.to_str().unwrap()]).unwrap();
         let mut rows = 0;
-        for table in STAT_TABLES.into_iter().chain(comp_detail::TABLES).chain(flex::TABLES).chain(items_depth::TABLES) {
+        for table in
+            STAT_TABLES.into_iter().chain(comp_detail::TABLES).chain(flex::TABLES).chain(items_depth::TABLES).chain(unit_depth::TABLES)
+        {
             let cols = if table == "stat_meta" { "patch, bucket, matches, comps".to_string() } else { "*".to_string() };
             let count = |sql: &str| -> i64 { a.query_row(sql, [], |r| r.get(0)).unwrap() };
             let n = count(&format!("SELECT COUNT(*) FROM main.{table}"));
@@ -1255,6 +1279,7 @@ mod incremental_tests {
         tft_store::save_calendar(&conn, &cal).unwrap();
         special_items(&conn);
         item_depth_data(&conn);
+        depth_static(&conn);
         store(&mut conn, &cal, 1, &first);
         build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
         let before = built_at(&conn);
@@ -1285,6 +1310,7 @@ mod incremental_tests {
         let (fresh_dir, mut fresh) = fresh_db("fresh");
         special_items(&fresh);
         item_depth_data(&fresh);
+        depth_static(&fresh);
         store(&mut fresh, &cal, 1, &first);
         store_with(&mut fresh, &cal, 2, &more, 2);
         build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
@@ -1306,6 +1332,10 @@ mod incremental_tests {
         }
         // PRD 3 U5: the S and A comps decide the weights in every scope that has them.
         assert!(q("SELECT COUNT(DISTINCT patch || bucket) FROM stat_components") >= 12);
+        for (table, least) in [("stat_unit_pairs", 1000), ("stat_teammates", 20), ("stat_trait_sets", 50)] {
+            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            assert!(n > least, "{table} has only {n} rows, so the comparison proves little");
+        }
 
         // Nothing new: nothing touched.
         assert!(build_stats_incremental_with(&mut conn, 2, &mut |_| {}).unwrap().is_empty());

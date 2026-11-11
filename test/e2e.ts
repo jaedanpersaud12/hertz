@@ -476,6 +476,68 @@ try {
     assert.ok(unitDetail.items.length > 0 && unitDetail.builds.length > 0 && unitDetail.comps.length > 0 && unitDetail.trend.length === 1)
     ok('unit detail: ability, star and item-count breakdowns, items, builds, comps, trend')
 
+    // PRD 3 U1 to U4 and U8: the unit page's grid, teammates, builds by comp and item completer, and the trait page.
+    {
+      const timed = async (p: string) => { const t = performance.now(); const body = await get(p); return { body, ms: performance.now() - t } }
+      const carry = UNITS[17]
+      const on = (b: any) => b.units.find((x: any) => x.character_id === carry.id)
+      const withCarry = boards.filter(on)
+      const d = (await timed(`/api/units/${carry.id}?min=1`)).body
+      assert.equal(d.grid.length, 12)
+      assert.equal(d.grid.reduce((n: number, c: any) => n + c.games, 0), withCarry.length)
+      const cell = d.grid.find((c: any) => c.star === 2 && c.items === 3)
+      const inCell = withCarry.filter((b: any) => on(b).tier === 2 && on(b).itemNames.length === 3)
+      assert.equal(cell.games, inCell.length); near(cell.avgPlace, avg(inCell), 'grid cell avg place')
+      assert.ok(d.teammates.length > 0 && d.teammates.length <= 10)
+      for (const m of d.teammates) {
+        const both = withCarry.filter((b: any) => b.units.some((x: any) => x.character_id === m.id))
+        assert.ok(both.length >= 200, `${m.id}: ${both.length} shared boards`)
+        assert.equal(m.games, both.length); near(m.placeChange, avg(both) - avg(withCarry), 'teammate place change')
+      }
+      assert.ok(d.teammates.every((m: any, n: number, xs: any[]) => n === 0 || xs[n - 1].placeChange <= m.placeChange))
+      assert.equal(d.recent.window, '3d'); assert.equal(d.recent.games, withCarry.length)
+      assert.equal(d.holdsItems, true)
+
+      const all = (await timed(`/api/units/${carry.id}/builds?min=1`)).body
+      assert.equal(all.fallback, false); assert.ok(all.rows.length > 0)
+      const inVanguard = (await timed(`/api/units/${carry.id}/builds?min=1&comp=${encodeURIComponent(vanguard.id)}`)).body
+      assert.equal(inVanguard.fallback, false); assert.ok(inVanguard.compGames >= 50 && inVanguard.rows.length > 0)
+      const brawler = comps.rows.find((r: any) => r.id.startsWith('TFT99_Brawler|'))
+      const elsewhere = (await timed(`/api/units/${carry.id}/builds?min=1&comp=${encodeURIComponent(brawler.id)}`)).body
+      assert.equal(elsewhere.fallback, true, 'too few three-item boards in another comp: all boards instead')
+      assert.deepEqual(elsewhere.rows.map((r: any) => r.id), all.rows.map((r: any) => r.id))
+
+      const [a, b] = [...on(withCarry.find((x: any) => on(x).itemNames.length === 3)).itemNames].sort()
+      const one = (await timed(`/api/units/${carry.id}/pairs?min=1&have=${a}`)).body
+      assert.ok(one.rows.length > 0 && one.rows.every((r: any) => r.games >= 1))
+      const two = (await timed(`/api/units/${carry.id}/pairs?min=1&have=${a},${b}`)).body
+      assert.ok(two.rows.length > 0)
+      const third = two.rows[0]
+      const key = (xs: string[]) => [...xs].sort().join('|')
+      const recount = withCarry.filter((x: any) => on(x).itemNames.length === 3 && key(on(x).itemNames) === key([a, b, third.id]))
+      assert.equal(third.games, recount.length); near(third.avgPlace, avg(recount), 'third item avg place')
+      assert.ok(two.rows.every((r: any, n: number, xs: any[]) => n === 0 || xs[n - 1].placeChange <= r.placeChange))
+
+      const vanguardTrait = (await timed('/api/traits/TFT99_Vanguard')).body
+      assert.equal(vanguardTrait.trait.name, 'Vanguard'); assert.equal(vanguardTrait.setData, true)
+      assert.equal(vanguardTrait.levels.length, 1); assert.equal(vanguardTrait.levels[0].units, 6)
+      assert.ok(vanguardTrait.levels[0].set.units.length >= 4, 'the usual Vanguard units')
+      const shared = (await timed('/api/traits/TFT99_Shared')).body
+      assert.equal(shared.levels.length, 1); near(shared.levels[0].frequency, shared.levels[0].games / shared.comps, 'pick rate')
+      assert.deepEqual((await get('/api/traits/nope')).levels, [])
+
+      // Under 100 ms each on the fixture, once warm.
+      for (const p of [`/api/units/${carry.id}`, `/api/units/${carry.id}/builds?comp=${encodeURIComponent(vanguard.id)}`,
+        `/api/units/${carry.id}/pairs?have=${a},${b}`, '/api/traits/TFT99_Vanguard']) {
+        const { ms } = await timed(p)
+        assert.ok(ms < 100, `${p} took ${ms.toFixed(0)} ms`)
+      }
+      assert.equal((await get(`/api/units/${carry.id}?data=empty`)).grid.length, 12)
+      assert.equal((await get(`/api/units/${carry.id}?data=many`)).teammates.length, 10)
+      assert.equal((await get('/api/traits/TFT99_Vanguard?data=worst')).levels.length, 8)
+      ok('unit page depth: star by items grid, teammates, builds by comp, item completer; trait breakpoints; under 100 ms')
+    }
+
     const traits = await get('/api/traits?bucket=MASTER%2B&window=3d')
     assert.equal(traits.bucket, 'MASTER+'); assert.equal(traits.window, '3d'); assert.equal(traits.rows.length, 7)
     const items = await get('/api/items')
