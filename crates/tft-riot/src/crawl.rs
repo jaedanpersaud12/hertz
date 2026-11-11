@@ -19,16 +19,16 @@ use crate::cdragon::fetch_calendar;
 use crate::client::{RiotClient, RiotError, http_client};
 use anyhow::{Result, bail};
 use futures::future::join_all;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tft_core::config::{Config, TIERS, platform_route, tier_name, tier_rank};
+use tft_core::config::{Config, ROUTES, TIERS, platform_route, tier_name, tier_rank};
 use tft_core::patches::Calendar;
 use tft_core::riot::LeagueEntry;
 use tft_store::{
-    Connection, Ingest, complete_sample, is_sampled, kv_get, kv_set, load_calendar, params, pending_samples,
-    queue_sample, save_calendar, save_rank,
+    Connection, CrawlSettings, Ingest, complete_sample, get_crawl_settings, is_sampled, kv_get, kv_set, load_calendar,
+    params, pending_samples, queue_sample, save_calendar, save_rank,
 };
 
 /// Look at the same player again after this long.
@@ -44,6 +44,13 @@ const SEED_PENDING: &str = "seed_pending";
 
 /// A match whose answer is cut off this many times in one run is left queued for the next run.
 const CUT_OFF_LIMIT: u32 = 3;
+
+/// A routing group with no server chosen checks the settings again this often (seconds).
+const IDLE_ROUTE_SECS: u64 = 10;
+
+/// Which tiers of each server's ladders this run has read (or found already read), per server. Each routing group's
+/// loop owns the entries for its own servers.
+type Seeded = HashMap<String, HashSet<String>>;
 
 /// Sampled matches looked up together (8 lookups each).
 const SAMPLE_BATCH: i64 = 2;
@@ -184,30 +191,23 @@ impl Crawler {
                 me.refresh_calendar().await;
             }
         });
+        let crawled = self.crawl_all().await;
+        calendar_task.abort();
+        crawled
+    }
 
-        for platform in &self.config.platforms {
-            let have: i64 = self.db.lock().unwrap().query_row(
-                "SELECT COUNT(*) FROM players WHERE platform = ?1",
-                [platform],
-                |r| r.get(0),
-            )?;
-            // A kill while reading the ladders leaves the platform in SEED_PENDING, so the next run reads them again.
-            let pending: Vec<String> = kv_get(&self.db.lock().unwrap(), SEED_PENDING)?.unwrap_or_default();
-            if have == 0 || self.opts.reseed || pending.contains(platform) {
-                self.set_seed_pending(platform, true)?;
-                println!("[{platform}] reading ladders...");
-                let seeded = self.seed(platform).await;
-                self.remember_key()?;
-                seeded?;
-                if !self.stopping() {
-                    die_at("after_seed", platform);
-                    self.set_seed_pending(platform, false)?;
-                }
-            }
+    /// Reads the ladders still needed, then runs every routing group's loop until the crawl stops.
+    async fn crawl_all(self: &Arc<Self>) -> Result<()> {
+        // Servers and tiers come from the app's settings (E9), `.env` until they are set. They are read again at
+        // the top of every round, so a change applies without a restart.
+        let settings = self.settings()?;
+        let mut seeded = Seeded::new();
+        for platform in &settings.platforms {
+            self.ensure_seeded(platform, &settings.tiers, self.opts.reseed, &mut seeded).await?;
         }
 
         let mut routes: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-        for p in &self.config.platforms {
+        for p in &settings.platforms {
             routes.entry(platform_route(p).unwrap()).or_default().push(p.clone());
         }
 
@@ -225,13 +225,16 @@ impl Crawler {
         let summary: Vec<String> = routes.iter().map(|(r, ps)| format!("{r} ({})", ps.join(", "))).collect();
         println!("Crawling {}. Press Ctrl+C to stop.", summary.join(" | "));
 
-        let results = join_all(routes.into_iter().map(|(route, platforms)| {
+        // Every routing group gets a loop, so a server on a group that had none can be added while running. A loop
+        // with no server chosen only checks the settings now and then.
+        let results = join_all(ROUTES.into_iter().map(|route| {
             let me = Arc::clone(self);
-            async move { me.crawl_and_sample(route, platforms).await }
+            let mine: Seeded =
+                seeded.iter().filter(|(p, _)| platform_route(p) == Some(route)).map(|(p, t)| (p.clone(), t.clone())).collect();
+            async move { me.crawl_and_sample_with(route, None, mine).await }
         }))
         .await;
         report_task.abort();
-        calendar_task.abort();
         for r in results {
             r?;
         }
@@ -288,8 +291,52 @@ impl Crawler {
         Ok(())
     }
 
-    /// Fills the player list for one server from its ranked ladders.
-    async fn seed(&self, platform: &str) -> Result<()> {
+    /// The servers and tiers to crawl now: the app's settings, or `.env` while none are saved.
+    fn settings(&self) -> Result<CrawlSettings> {
+        get_crawl_settings(&self.db.lock().unwrap(), &self.config)
+    }
+
+    /// Reads the ladders a server still needs, as `run` always has: all of them when the server has no players, when
+    /// `reseed` is set, or when an earlier run was stopped mid-read (`SEED_PENDING`). Otherwise, only tiers added to
+    /// the settings since this run last looked. `seeded` remembers what this run has covered, so each tier of a
+    /// server is read at most once per run.
+    async fn ensure_seeded(&self, platform: &str, tiers: &[String], reseed: bool, seeded: &mut Seeded) -> Result<()> {
+        let todo: Vec<String> = match seeded.get(platform) {
+            Some(done) => tiers.iter().filter(|t| !done.contains(*t)).cloned().collect(),
+            None => {
+                let have: i64 = self.db.lock().unwrap().query_row(
+                    "SELECT COUNT(*) FROM players WHERE platform = ?1",
+                    [platform],
+                    |r| r.get(0),
+                )?;
+                // A kill while reading the ladders leaves the platform in SEED_PENDING, so the next run reads them again.
+                let pending: Vec<String> = kv_get(&self.db.lock().unwrap(), SEED_PENDING)?.unwrap_or_default();
+                if have == 0 || reseed || pending.iter().any(|p| p == platform) {
+                    tiers.to_vec()
+                } else {
+                    seeded.insert(platform.to_string(), tiers.iter().cloned().collect());
+                    Vec::new()
+                }
+            }
+        };
+        if todo.is_empty() {
+            return Ok(());
+        }
+        self.set_seed_pending(platform, true)?;
+        println!("[{platform}] reading ladders...");
+        let read = self.seed(platform, &todo).await;
+        self.remember_key()?;
+        read?;
+        if !self.stopping() {
+            die_at("after_seed", platform);
+            self.set_seed_pending(platform, false)?;
+            seeded.entry(platform.to_string()).or_default().extend(todo);
+        }
+        Ok(())
+    }
+
+    /// Fills the player list for one server from the given tiers of its ranked ladders.
+    async fn seed(&self, platform: &str, tiers: &[String]) -> Result<()> {
         let save = |entries: &[LeagueEntry], tier: &str| -> Result<usize> {
             let mut db = self.db.lock().unwrap();
             let tx = db.transaction()?;
@@ -311,7 +358,7 @@ impl Crawler {
             Ok(n)
         };
 
-        for tier in &self.config.tiers {
+        for tier in tiers {
             if self.stopping() {
                 return Ok(());
             }
@@ -343,12 +390,20 @@ impl Crawler {
         Ok(())
     }
 
-    /// One loop per routing group. Each group has its own rate limit, so they run side by side.
+    /// One loop per routing group, for a fixed list of servers. Each group has its own rate limit, so they run
+    /// side by side.
+    #[cfg(test)]
     async fn crawl_route(&self, route: &str, platforms: Vec<String>) -> Result<()> {
-        let platforms_json = serde_json::to_string(&platforms)?;
+        self.crawl_loop(route, Some(&platforms), &mut Seeded::new()).await
+    }
+
+    /// One loop per routing group. With `fixed` it crawls those servers; without, it reads the settings at the top
+    /// of every round, reads the ladders of servers and tiers that were just added, and crawls only the servers
+    /// chosen now.
+    async fn crawl_loop(&self, route: &str, fixed: Option<&[String]>, seeded: &mut Seeded) -> Result<()> {
         let mut finished = false;
         while !self.stopping() && !finished && self.below_max() {
-            let stepped = self.step(route, &platforms_json).await;
+            let stepped = self.round(route, fixed, seeded).await;
             self.remember_key()?;
             match stepped {
                 Ok(done) => finished = done,
@@ -370,16 +425,53 @@ impl Crawler {
         Ok(())
     }
 
+    /// The servers of this routing group to crawl now, and the tiers whose players to pick.
+    fn route_platforms(&self, route: &str, fixed: Option<&[String]>) -> Result<(Vec<String>, Vec<String>)> {
+        let settings = self.settings()?;
+        let platforms = match fixed {
+            Some(p) => p.to_vec(),
+            None => settings.platforms.into_iter().filter(|p| platform_route(p) == Some(route)).collect(),
+        };
+        Ok((platforms, settings.tiers))
+    }
+
+    /// One round of a group's loop. Returns true when `--once` is satisfied.
+    async fn round(&self, route: &str, fixed: Option<&[String]>, seeded: &mut Seeded) -> Result<bool> {
+        let (platforms, tiers) = self.route_platforms(route, fixed)?;
+        if fixed.is_none() {
+            for p in &platforms {
+                self.ensure_seeded(p, &tiers, false, seeded).await?;
+                if self.stopping() {
+                    return Ok(false);
+                }
+            }
+        }
+        if platforms.is_empty() {
+            if self.opts.once {
+                return Ok(true);
+            }
+            self.pause(IDLE_ROUTE_SECS).await;
+            return Ok(false);
+        }
+        self.step(route, &serde_json::to_string(&platforms)?, &serde_json::to_string(&tiers)?).await
+    }
+
     /// Crawls one routing group and, beside it, looks up real ranks for its sampled matches. With `--once` the
     /// lookups still waiting when the crawl ends are finished before this returns.
+    #[cfg(test)]
     async fn crawl_and_sample(&self, route: &str, platforms: Vec<String>) -> Result<()> {
+        self.crawl_and_sample_with(route, Some(platforms), Seeded::new()).await
+    }
+
+    /// [`Self::crawl_and_sample`] for a fixed list of servers, or (`None`) for the ones the settings choose.
+    async fn crawl_and_sample_with(&self, route: &str, fixed: Option<Vec<String>>, mut seeded: Seeded) -> Result<()> {
         let crawled = AtomicBool::new(false);
         let crawl = async {
-            let r = self.crawl_route(route, platforms.clone()).await;
+            let r = self.crawl_loop(route, fixed.as_deref(), &mut seeded).await;
             crawled.store(true, Ordering::Relaxed);
             r
         };
-        let (c, s) = tokio::join!(crawl, self.sample_ranks(route, &platforms, &crawled));
+        let (c, s) = tokio::join!(crawl, self.sample_loop(route, fixed.as_deref(), &crawled));
         c.and(s)
     }
 
@@ -392,7 +484,13 @@ impl Crawler {
     ///   kill loses at most the lookups in flight; the next run looks up only the players still missing.
     /// - A lookup Riot does not answer leaves its match waiting: it is tried again after [`SAMPLE_RETRY`], or
     ///   on the next run, never dropped.
+    #[cfg(test)]
     async fn sample_ranks(&self, route: &str, platforms: &[String], crawled: &AtomicBool) -> Result<()> {
+        self.sample_loop(route, Some(platforms), crawled).await
+    }
+
+    /// [`Self::sample_ranks`] for a fixed list of servers, or (`None`) for the ones the settings choose now.
+    async fn sample_loop(&self, route: &str, fixed: Option<&[String]>, crawled: &AtomicBool) -> Result<()> {
         let mut failed: HashMap<String, tokio::time::Instant> = HashMap::new();
         loop {
             if self.stopping() {
@@ -400,7 +498,8 @@ impl Crawler {
             }
             failed.retain(|_, at| at.elapsed() < SAMPLE_RETRY);
             let skip: Vec<String> = failed.keys().cloned().collect();
-            let batch = pending_samples(&self.db.lock().unwrap(), platforms, &skip, SAMPLE_BATCH)?;
+            let platforms = self.route_platforms(route, fixed)?.0;
+            let batch = pending_samples(&self.db.lock().unwrap(), &platforms, &skip, SAMPLE_BATCH)?;
             if batch.is_empty() {
                 if crawled.load(Ordering::Relaxed) {
                     return Ok(());
@@ -449,12 +548,13 @@ impl Crawler {
         }
     }
 
-    /// Queued matches this run still has to fetch (the ones held back after repeated cut-offs are left out).
-    fn pending(&self, route: &str) -> Result<i64> {
+    /// Queued matches of the chosen servers this run still has to fetch (the ones held back after repeated cut-offs
+    /// are left out). A server taken out of the settings keeps its queue for when it is chosen again.
+    fn pending(&self, route: &str, platforms_json: &str) -> Result<i64> {
         Ok(self.db.lock().unwrap().query_row(
             "SELECT COUNT(*) FROM match_queue WHERE route = ?1 AND status = 0
-             AND match_id NOT IN (SELECT value FROM json_each(?2))",
-            params![route, self.held_back()?],
+             AND match_id NOT IN (SELECT value FROM json_each(?2)) AND platform IN (SELECT value FROM json_each(?3))",
+            params![route, self.held_back()?, platforms_json],
             |r| r.get(0),
         )?)
     }
@@ -466,22 +566,24 @@ impl Crawler {
         Ok(serde_json::to_string(&ids)?)
     }
 
-    /// One round: top up the queue, then fetch a batch of matches. Returns true when `--once` is satisfied.
-    async fn step(&self, route: &str, platforms_json: &str) -> Result<bool> {
-        if self.pending(route)? < 40 {
+    /// Top up the queue from players of the given servers and tiers, then fetch a batch of those servers' matches.
+    /// Returns true when `--once` is satisfied.
+    async fn step(&self, route: &str, platforms_json: &str, tiers_json: &str) -> Result<bool> {
+        if self.pending(route, platforms_json)? < 40 {
             let players: Vec<(String, String, i64, i64)> = {
                 let db = self.db.lock().unwrap();
                 let mut q = db.prepare_cached(
                     "SELECT puuid, platform, rank, last_crawled FROM players
                      WHERE platform IN (SELECT value FROM json_each(?1)) AND last_crawled < ?2
+                       AND tier IN (SELECT value FROM json_each(?4))
                      ORDER BY last_crawled ASC, rank DESC LIMIT ?3",
                 )?;
-                q.query_map(params![platforms_json, now_ms() - RECRAWL_MS, 8], |r| {
+                q.query_map(params![platforms_json, now_ms() - RECRAWL_MS, 8, tiers_json], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })?
                 .collect::<rusqlite_result::Result<_>>()?
             };
-            if players.is_empty() && self.pending(route)? == 0 {
+            if players.is_empty() && self.pending(route, platforms_json)? == 0 {
                 if self.opts.once {
                     return Ok(true);
                 }
@@ -530,9 +632,10 @@ impl Crawler {
             let db = self.db.lock().unwrap();
             let mut q = db.prepare_cached(
                 "SELECT match_id, platform, seed_rank FROM match_queue WHERE route = ?1 AND status = 0
-                 AND match_id NOT IN (SELECT value FROM json_each(?2)) LIMIT ?3",
+                 AND match_id NOT IN (SELECT value FROM json_each(?2)) AND platform IN (SELECT value FROM json_each(?4))
+                 LIMIT ?3",
             )?;
-            q.query_map(params![route, self.held_back()?, 20], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            q.query_map(params![route, self.held_back()?, 20, platforms_json], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite_result::Result<_>>()?
         };
 
@@ -960,6 +1063,131 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_answer_is_skipped() {
         assert!(riot_sent_garbage(&answer_once("not json", 8).await));
+    }
+
+    // ---- Servers and tiers from the settings (E9) ----------------------------------------------
+
+    /// Players on each ladder of the fake Riot below.
+    const LADDER: usize = 48;
+
+    /// Challenger and Grandmaster ladders of `LADDER` players each (`{server}-c3`, `{server}-g3`), one match per
+    /// player (`{puuid}_M`). Every host answers one request per second, so a round takes long enough to land a
+    /// settings change in the middle of the crawl.
+    fn ladders(path: &str, _: usize) -> (u16, &'static str, String) {
+        const SLOW: &str = "x-app-rate-limit: 1:1,1000:1000\r\n";
+        let path = path.split('?').next().unwrap_or_default();
+        let host = path.split('/').nth(1).unwrap_or_default();
+        if let Some(tier) = path.strip_prefix(&format!("/{host}/tft/league/v1/")) {
+            let letter = match tier {
+                "challenger" => "c",
+                "grandmaster" => "g",
+                _ => return (200, SLOW, r#"{"entries":[]}"#.into()),
+            };
+            let entries: Vec<_> =
+                (0..LADDER).map(|i| serde_json::json!({ "puuid": format!("{host}-{letter}{i}") })).collect();
+            return (200, SLOW, serde_json::json!({ "entries": entries }).to_string());
+        }
+        if let Some(rest) = path.strip_prefix(&format!("/{host}/tft/match/v1/matches/by-puuid/")) {
+            let puuid = rest.split('/').next().unwrap_or_default();
+            return (200, SLOW, serde_json::json!([format!("{puuid}_M")]).to_string());
+        }
+        (200, SLOW, match_body(path.rsplit('/').next().unwrap_or_default()))
+    }
+
+    /// Waits (in paused time) until `done` holds, checking once a second.
+    async fn until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
+        for _ in 0..secs {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        panic!("waited {secs} s for {what}");
+    }
+
+    /// E9: the settings are changed twice while one crawler keeps running (never restarted or re-created).
+    /// 1. na1 is swapped for br1 (same routing group), euw1 (europe) and kr (asia, a routing group that had no
+    ///    server at the start): the next rounds read the new servers' ladders and crawl them, and na1 is not picked
+    ///    again; a na1 match still queued stays queued.
+    /// 2. The tiers change from Challenger to Grandmaster: the Grandmaster ladders are read (Challenger is not read
+    ///    again), and from then on only Grandmaster players are picked.
+    #[tokio::test(start_paused = true)]
+    async fn settings_changed_mid_crawl_apply_on_the_next_round_without_a_restart() {
+        let (base, hits) = serve(ladders).await;
+        let mut config = test_config(&base, KEY);
+        config.platforms = vec!["na1".into()];
+        config.tiers = vec!["CHALLENGER".into()];
+        config.rank_sample_rate = 0.0;
+        let stop: Arc<AtomicBool> = Arc::default();
+        let mut crawler = Crawler::new(config, CrawlOptions::default(), sample_db(), Arc::clone(&stop)).unwrap();
+        crate::client::init_tls();
+        let http = reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap();
+        let me = Arc::get_mut(&mut crawler).unwrap();
+        let riot = std::mem::replace(&mut me.riot, RiotClient::new(KEY, &base, 1.0));
+        me.riot = riot.with_http(http);
+        me.riot.set_key_worked();
+
+        let me = Arc::clone(&crawler);
+        let task = tokio::spawn(async move { me.crawl_all().await });
+        let n = |sql: &str| count(&crawler, sql);
+        let requests = |prefix: &str| hits.lock().unwrap().iter().filter(|(_, p)| p.starts_with(prefix)).count();
+        let crawled = |platform: &str, letter: &str| {
+            n(&format!("SELECT COUNT(*) FROM players WHERE platform = '{platform}' AND puuid LIKE '%-{letter}%' AND last_crawled > 0"))
+        };
+
+        until("na1's first matches", 120, || n("SELECT COUNT(*) FROM matches WHERE platform = 'na1'") >= 3).await;
+        assert_eq!(n("SELECT COUNT(*) FROM matches WHERE platform != 'na1'"), 0);
+        let wanted = CrawlSettings {
+            platforms: vec!["br1".into(), "euw1".into(), "kr".into()],
+            tiers: vec!["CHALLENGER".into()],
+        };
+        tft_store::set_crawl_settings(&crawler.db.lock().unwrap(), &wanted).unwrap();
+        until("br1, euw1 and kr matches", 120, || {
+            ["br1", "euw1", "kr"].iter().all(|p| n(&format!("SELECT COUNT(*) FROM matches WHERE platform = '{p}'")) > 0)
+        })
+        .await;
+        assert!(!task.is_finished(), "the same crawl is still running");
+        // Queued for na1 after the change took hold; americas now crawls br1 and must leave it alone.
+        queue(&crawler.db.lock().unwrap(), "NA1_LATER", "americas", "na1");
+        assert_eq!(requests("/euw1/tft/league/v1/challenger"), 1, "euw1's ladder is read once");
+        assert_eq!(requests("/kr/tft/league/v1/challenger"), 1, "kr's ladder is read once");
+        assert_eq!(requests("/br1/tft/league/v1/challenger"), 1, "br1's ladder is read once");
+        assert!(requests("/asia/tft/match/v1/matches/") > 0, "kr is crawled on its own routing group");
+        assert_eq!(kv_get::<Vec<String>>(&crawler.db.lock().unwrap(), SEED_PENDING).unwrap(), None);
+
+        // 2. Grandmaster instead of Challenger, before every Challenger player has been looked at.
+        let wanted = CrawlSettings { tiers: vec!["GRANDMASTER".into()], ..wanted };
+        tft_store::set_crawl_settings(&crawler.db.lock().unwrap(), &wanted).unwrap();
+        until("Grandmaster matches on both servers", 120, || {
+            n("SELECT COUNT(*) FROM matches WHERE platform = 'euw1' AND match_id LIKE '%-g%'") > 0
+                && n("SELECT COUNT(*) FROM matches WHERE platform = 'kr' AND match_id LIKE '%-g%'") > 0
+        })
+        .await;
+        // Let the rounds in flight at the change finish, then nothing more may happen for na1 or Challenger players.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let na1_requests = || {
+            hits.lock().unwrap().iter().filter(|(_, p)| p.starts_with("/na1/") || p.contains("na1-") || p.contains("NA1_")).count()
+        };
+        let before = (na1_requests(), crawled("na1", "c"), crawled("euw1", "c"), crawled("kr", "c"));
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let after = (na1_requests(), crawled("na1", "c"), crawled("euw1", "c"), crawled("kr", "c"));
+        assert_eq!(after, before, "(na1 requests, Challenger players crawled on na1, euw1, kr) changed");
+        assert_eq!(requests("/americas/tft/match/v1/matches/NA1_LATER"), 0, "na1's queue is not fetched");
+        assert_eq!(n("SELECT status FROM match_queue WHERE match_id = 'NA1_LATER'"), 0, "and stays queued");
+        assert!(n("SELECT COUNT(*) FROM matches WHERE platform = 'br1'") > 0, "americas keeps crawling br1");
+        assert_eq!((crawled("euw1", "g"), crawled("kr", "g")), (LADDER as i64, LADDER as i64), "every Grandmaster player is picked");
+        for p in ["na1", "euw1", "kr"] {
+            assert!(crawled(p, "c") < LADDER as i64, "{p}: every Challenger player was picked, so the change came too late");
+        }
+        assert_eq!(requests("/euw1/tft/league/v1/grandmaster"), 1);
+        assert_eq!(requests("/kr/tft/league/v1/grandmaster"), 1);
+        assert_eq!(requests("/na1/tft/league/v1/grandmaster"), 0, "na1 is no longer chosen");
+        assert_eq!((requests("/euw1/tft/league/v1/challenger"), requests("/kr/tft/league/v1/challenger")), (1, 1));
+        assert_eq!(requests("/na1/tft/league/v1/challenger"), 1);
+
+        assert!(!task.is_finished(), "the same crawl is still running");
+        stop.store(true, Ordering::Relaxed);
+        task.await.unwrap().unwrap();
     }
 
     // ---- Rank samples (E7) ----------------------------------------------------------------------

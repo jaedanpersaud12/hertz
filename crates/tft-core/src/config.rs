@@ -16,6 +16,13 @@ pub fn tier_name(rank: i64) -> &'static str {
     TIERS.get(rank.max(0) as usize).copied().unwrap_or("IRON")
 }
 
+/// Every server [`platform_route`] knows, for the app's settings.
+pub const PLATFORMS: [&str; 15] =
+    ["na1", "br1", "la1", "la2", "euw1", "eun1", "tr1", "ru", "me1", "kr", "jp1", "oc1", "sg2", "tw2", "vn2"];
+
+/// The routing groups, each with its own rate limit and crawl loop.
+pub const ROUTES: [&str; 4] = ["americas", "europe", "asia", "sea"];
+
 /// Which regional host serves match data for each platform.
 pub fn platform_route(platform: &str) -> Option<&'static str> {
     Some(match platform {
@@ -118,6 +125,14 @@ mod tests {
         }
         assert_eq!(scope_key("PLATINUM+", "3d"), "PLATINUM+@3d");
         assert_eq!(scope_key("ALL", ""), "ALL");
+    }
+
+    #[test]
+    fn every_known_platform_has_a_route() {
+        for p in PLATFORMS {
+            assert!(ROUTES.contains(&platform_route(p).unwrap()), "{p}");
+        }
+        assert_eq!(platform_route("pbe1"), None);
     }
 
     #[test]

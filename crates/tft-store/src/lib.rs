@@ -4,6 +4,7 @@ mod ingest;
 mod prune;
 mod rank_sample;
 pub mod schema;
+mod settings;
 
 pub use ingest::{Ingest, relabel_unknown};
 pub use prune::{Compacted, Pruned, compact, prune_old_patches};
@@ -12,6 +13,9 @@ pub use rank_sample::{
     rank_sample_accuracy, sample_done, save_rank,
 };
 pub use rusqlite::{Connection, Error, params};
+pub use settings::{
+    CRAWL_SETTINGS, CrawlSettings, SettingsError, get_crawl_settings, reset_crawl_settings, set_crawl_settings,
+};
 
 use anyhow::{Context, Result};
 use rusqlite::{OpenFlags, OptionalExtension};
