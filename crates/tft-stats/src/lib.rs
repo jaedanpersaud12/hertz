@@ -13,6 +13,7 @@ pub mod flex;
 pub mod items_depth;
 pub mod cluster;
 pub mod lineage;
+mod onepass;
 pub mod overrides;
 pub mod report;
 pub mod unit_depth;
@@ -80,7 +81,54 @@ pub fn build_stats(conn: &mut Connection, patch_count: i64) -> Result<()> {
 }
 
 /// [`build_stats`] with the progress lines sent to `log`.
+///
+/// Every scope is rebuilt from the raw rows, read once per patch: the same steps as an incremental build
+/// ([`build_stats_incremental_with`]) takes for a scope it cannot add to. The tables equal
+/// [`build_stats_reference_with`]'s row for row.
 pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn FnMut(&str)) -> Result<()> {
+    tune_for_build(conn)?;
+    let patches = recent_patches(conn, patch_count)?;
+
+    if patches.is_empty() {
+        log("No matches stored yet. Run \"npm run crawl\" first.");
+        return Ok(());
+    }
+
+    let unlabelled: i64 = conn.query_row("SELECT COUNT(*) n FROM participants WHERE comp_key IS NULL", [], |r| r.get(0))?;
+    let all: i64 = conn.query_row("SELECT COUNT(*) n FROM participants", [], |r| r.get(0))?;
+    if all != 0 && (unlabelled as f64) > (all as f64) * 0.5 {
+        log("Most boards have no comp label yet. Run \"npm run recluster\" once, then \"npm run stats\" again.");
+    }
+
+    conn.execute_batch(INC_TEMP)?;
+    let mut rebuilt = Vec::new();
+    for patch in &patches {
+        update_patch(conn, patch, log, &mut rebuilt, true)?;
+    }
+    drop_scratch(conn)?;
+    if comp_method(conn)? == Method::Clusters {
+        lineage::update(conn)?; // PRD 2 C13; before the trends, which follow it to last patch's comp
+    }
+    finish_trends(conn, &rebuilt)?;
+    conn.execute_batch("PRAGMA optimize")?;
+    Ok(())
+}
+
+/// Drops the scratch tables of [`update_patch`].
+fn drop_scratch(conn: &Connection) -> Result<()> {
+    conn.execute_batch(INC_DROP)?;
+    conn.execute_batch("DROP TABLE IF EXISTS p; DROP TABLE IF EXISTS topc")?;
+    comp_detail::inc_drop(conn)?;
+    items_depth::inc_drop(conn)?;
+    unit_depth::inc_drop(conn)?;
+    Ok(())
+}
+
+/// The full rebuild as it was first written, a port of `src/stats/build.ts`: each scope on its own, straight from
+/// the raw rows, in SQL. It is the definition of every number, and what the tests compare [`build_stats_with`]
+/// and the incremental build against. It reads the raw rows once per scope and step, so it is slow on a large
+/// database (about ten minutes per scope at a million boards); nothing but tests should call it.
+pub fn build_stats_reference_with(conn: &mut Connection, patch_count: i64, log: &mut dyn FnMut(&str)) -> Result<()> {
     tune_for_build(conn)?;
     let patches = recent_patches(conn, patch_count)?;
 
@@ -204,12 +252,9 @@ pub fn build_stats_incremental_with(
     conn.execute_batch(INC_TEMP)?;
     let mut touched = Vec::new();
     for patch in &patches {
-        update_patch(conn, patch, log, &mut touched)?;
+        update_patch(conn, patch, log, &mut touched, false)?;
     }
-    conn.execute_batch(INC_DROP)?;
-    comp_detail::inc_drop(conn)?;
-    items_depth::inc_drop(conn)?;
-    unit_depth::inc_drop(conn)?;
+    drop_scratch(conn)?;
     if !touched.is_empty() && comp_method(conn)? == Method::Clusters {
         lineage::update(conn)?; // PRD 2 C13; before the trends, which follow it to last patch's comp
     }
@@ -373,8 +418,15 @@ struct Job {
 
 /// Brings one patch's scopes up to date. The raw rows are read in one snapshot (a read transaction, so the
 /// crawler keeps writing meanwhile); then each scope is written in its own short write transaction, from the
-/// sums, with the watermark of that snapshot.
-fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), touched: &mut Vec<String>) -> Result<()> {
+/// sums, with the watermark of that snapshot. With `force`, every scope is rebuilt whatever it holds (a full
+/// rebuild); otherwise only the scopes with new matches are touched.
+fn update_patch(
+    conn: &mut Connection,
+    patch: &str,
+    log: &mut dyn FnMut(&str),
+    touched: &mut Vec<String>,
+    force: bool,
+) -> Result<()> {
     let t0 = Instant::now();
     let now = now_ms();
     let since: Vec<i64> = WINDOWS.iter().map(|w| w.days.map_or(0, |d| now - d * 86_400_000)).collect();
@@ -387,7 +439,8 @@ fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), t
     for (bi, bucket) in BUCKETS.iter().enumerate() {
         for (wi, window) in WINDOWS.iter().enumerate() {
             let scope = scope_key(bucket.key, window.key);
-            let mark = match plan_scope(&tx, patch, &scope, bucket.min, since[wi])? {
+            let plan = if force { Plan::Full } else { plan_scope(&tx, patch, &scope, bucket.min, since[wi])? };
+            let mark = match plan {
                 Plan::Skip => continue,
                 Plan::Full => None,
                 Plan::Add(after) => Some(after),
@@ -448,7 +501,7 @@ fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), t
     comp_detail::inc_sums(&tx)?;
     items_depth::prepare(&tx)?;
     items_depth::inc_sums(&tx)?;
-    unit_depth::inc_sums(&tx)?;
+    let boards = unit_depth::inc_sums(&tx)?;
     for (job, ..) in &mut planned {
         job.comps =
             tx.query_row("SELECT COUNT(*) FROM inc_b WHERE band >= ? AND w >= ?", params![job.band, job.w], |r| r.get(0))?;
@@ -458,26 +511,36 @@ fn update_patch(conn: &mut Connection, patch: &str, log: &mut dyn FnMut(&str), t
     for (i, (job, ..)) in planned.iter().enumerate() {
         let t = if i == 0 { t0 } else { Instant::now() };
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        write_scope(&tx, patch, job)?;
+        write_scope(&tx, patch, job, &boards)?;
         tx.execute(
             "INSERT OR REPLACE INTO stat_watermark (scope, last_rowid, built_at) VALUES (?, ?, ?)",
             params![watermark_key(patch, &job.scope), top, now_ms()],
         )?;
         tx.commit()?;
-        log(&format!(
-            "patch {patch}  {:<13} {:>8} matches  {:<5}  {:.1} s",
-            job.scope,
-            job.matches,
-            if job.add { "added" } else { "full" },
-            t.elapsed().as_secs_f64()
-        ));
+        if force {
+            log(&format!(
+                "patch {patch}  {:<13} {:>8} matches {:>9} comps  {:.1} s",
+                job.scope,
+                job.matches,
+                job.comps,
+                t.elapsed().as_secs_f64()
+            ));
+        } else {
+            log(&format!(
+                "patch {patch}  {:<13} {:>8} matches  {:<5}  {:.1} s",
+                job.scope,
+                job.matches,
+                if job.add { "added" } else { "full" },
+                t.elapsed().as_secs_f64()
+            ));
+        }
         touched.push(watermark_key(patch, &job.scope));
     }
     Ok(())
 }
 
 /// Writes one scope from the sums per tag, inside the caller's transaction.
-fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
+fn write_scope(db: &Connection, patch: &str, job: &Job, boards: &onepass::PatchBoards) -> Result<()> {
     let k = params![patch, job.scope];
     if job.add {
         db.execute(
@@ -529,9 +592,9 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
     build_derived(db, patch, &job.scope)?;
     unit_depth::write_inc(db, patch, &job.scope, job.band, job.w)?;
     if job.comps > 0 && comp_method(db)? == Method::Clusters {
-        cluster::comps_from_inc(db, patch, &job.scope, job.band, job.w, job.comps)?;
+        cluster::comps_from_inc(db, patch, &job.scope, job.band, job.w, job.comps, boards)?;
     } else if job.comps > 0 {
-        write_comps(db, patch, job)?;
+        write_comps(db, patch, job, boards)?;
     }
     Ok(())
 }
@@ -539,7 +602,7 @@ fn write_scope(db: &Connection, patch: &str, job: &Job) -> Result<()> {
 /// [`build_comps`] for one scope, from the comp sums per stored label instead of from the boards. The queries
 /// keep the same shape (group by label, then order by games, then limit), so labels with the same number of
 /// games come out in the same order as in a full rebuild.
-fn write_comps(db: &Connection, patch: &str, job: &Job) -> Result<()> {
+fn write_comps(db: &Connection, patch: &str, job: &Job, boards: &onepass::PatchBoards) -> Result<()> {
     let min_games = COMP_MIN_GAMES.max(((job.comps as f64) * COMP_MIN_SHARE).ceil() as i64);
     db.execute_batch("DELETE FROM inc_cand; DELETE FROM inc_map; DELETE FROM inc_top")?;
     merge_lookalike_sums(db, job, min_games)?;
@@ -600,7 +663,7 @@ fn write_comps(db: &Connection, patch: &str, job: &Job) -> Result<()> {
         k4,
     )?;
     comp_detail::write_inc(db, patch, &job.scope, job.band, job.w)?;
-    flex::write_inc(db, patch, &job.scope, job.band, job.w)?;
+    flex::write_fast(db, patch, &job.scope, boards, &flex::Members::from_tags(db, boards, job.band, job.w)?)?;
     tier::finish_scope(db, patch, &job.scope)
 }
 
@@ -700,7 +763,7 @@ fn build_scope(db: &Connection, patch: &str, scope: &str, min_rank: i64, since: 
     items_depth::build_full(db, patch, scope)?;
     build_derived(db, patch, scope)?;
     unit_depth::build_full(db, patch, scope)?; // before build_comps, which relabels the boards in p
-    build_comps(db, patch, scope, comps)
+    build_comps(db, patch, scope, comps, None)
 }
 
 /// The per-board counts for units, traits and items: plain sums over the boards in p, so they can be added up.
@@ -796,7 +859,10 @@ fn build_derived(db: &Connection, patch: &str, scope: &str) -> Result<()> {
 
 /// The comp tables for every board in p. These depend on the whole scope (look-alike merging, the share a comp
 /// needs, the top 120), so they are never added up: an incremental build recomputes them for each scope it touches.
-fn build_comps(db: &Connection, patch: &str, scope: &str, comps: i64) -> Result<()> {
+///
+/// `boards` is the patch's boards in memory when the caller has them (an incremental build that put its scope
+/// in p); the flex tables are then counted from them instead of in SQL.
+fn build_comps(db: &Connection, patch: &str, scope: &str, comps: i64, boards: Option<&onepass::PatchBoards>) -> Result<()> {
     let k = params![patch, scope];
     // ---- Comps ----
     let min_games = COMP_MIN_GAMES.max(((comps as f64) * COMP_MIN_SHARE).ceil() as i64);
@@ -851,7 +917,10 @@ fn build_comps(db: &Connection, patch: &str, scope: &str, comps: i64) -> Result<
     if let Some(labels) = labels {
         cluster::write_shape(db, patch, scope, &labels)?; // core, flex and variants (C1, C2)
     }
-    flex::build_full(db, patch, scope)?;
+    match boards {
+        Some(pb) => flex::write_fast(db, patch, scope, pb, &flex::Members::from_p(db, pb)?)?,
+        None => flex::build_full(db, patch, scope)?,
+    }
     tier::finish_scope(db, patch, scope)
 }
 
@@ -1323,7 +1392,7 @@ mod incremental_tests {
         depth_static(&fresh);
         store(&mut fresh, &cal, 1, &first);
         store_with(&mut fresh, &cal, 2, &more, 2);
-        build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
+        build_stats_reference_with(&mut fresh, 2, &mut |_| {}).unwrap();
         drop(fresh);
         let compared = assert_same_stats(&conn, &fresh_dir.join("t.db"));
         assert!(compared > 1000, "only {compared} rows compared");
@@ -1350,6 +1419,10 @@ mod incremental_tests {
         // Nothing new: nothing touched.
         assert!(build_stats_incremental_with(&mut conn, 2, &mut |_| {}).unwrap().is_empty());
         assert_eq!(built_at(&conn), after);
+
+        // A full rebuild (every scope, raw rows read once per patch) gives the reference build's tables too.
+        build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
+        assert_eq!(assert_same_stats(&conn, &fresh_dir.join("t.db")), compared);
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&fresh_dir).unwrap();
@@ -1377,7 +1450,7 @@ mod incremental_tests {
         let (fresh_dir, mut fresh) = fresh_db("untrusted-fresh");
         store(&mut fresh, &cal, 7, &games);
         fresh.execute("UPDATE matches SET patch = 'unknown' WHERE match_id = 'A0'", []).unwrap();
-        build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
+        build_stats_reference_with(&mut fresh, 2, &mut |_| {}).unwrap();
         drop(fresh);
         assert_same_stats(&conn, &fresh_dir.join("t.db"));
         drop(conn);
@@ -1465,7 +1538,7 @@ mod incremental_tests {
         store(&mut fresh, &cal, 3, &first[..100]);
         store_with(&mut fresh, &cal, 4, &first[100..], 5);
         store_with(&mut fresh, &cal, 5, &more, 3);
-        build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
+        build_stats_reference_with(&mut fresh, 2, &mut |_| {}).unwrap();
         drop(fresh);
         let compared = assert_same_stats(&conn, &fresh_dir.join("t.db"));
         assert!(compared > 1000, "only {compared} rows compared");
@@ -1536,7 +1609,7 @@ mod incremental_tests {
         let (fresh_dir, mut fresh) = fresh_db("ties-fresh");
         add_boards(&fresh, 0, &first);
         add_boards(&fresh, next, &more);
-        build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
+        build_stats_reference_with(&mut fresh, 2, &mut |_| {}).unwrap();
         drop(fresh);
         assert_same_stats(&conn, &fresh_dir.join("t.db"));
 

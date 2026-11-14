@@ -121,6 +121,9 @@ enum Command {
         /// Time every SQL statement of the build and print the slowest at the end.
         #[arg(long)]
         profile: bool,
+        /// Rebuild with the slow reference build (each scope on its own, in SQL), to check the fast one against.
+        #[arg(long, hide = true, conflicts_with = "incremental")]
+        reference: bool,
     },
     /// Serve the built app and its API on 127.0.0.1, like `npm start`.
     Serve {
@@ -306,7 +309,7 @@ async fn run(command: Command, config: Config) -> Result<()> {
             println!("Stored {added} matches ({repeats} were already stored).");
         }
 
-        Command::Stats { patches, incremental, profile } => {
+        Command::Stats { patches, incremental, profile, reference } => {
             let mut conn = tft_store::open(&config.db_path)?;
             // Matches stored without a patch (Riot stopped sending one) get dated from the patch calendar first.
             let unknown: i64 =
@@ -332,6 +335,8 @@ async fn run(command: Command, config: Config) -> Result<()> {
                 if !touched.is_empty() {
                     println!("Rebuilt {} scopes: {}", touched.len(), touched.join(", "));
                 }
+            } else if reference {
+                tft_stats::build_stats_reference_with(&mut conn, patches, &mut |line| println!("{line}"))?;
             } else {
                 tft_stats::build_stats(&mut conn, patches)?;
             }

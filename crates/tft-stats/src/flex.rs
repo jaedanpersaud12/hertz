@@ -15,12 +15,15 @@
 //!   `stat_comp_units` row.
 //!
 //! Every row is kept, however few games it has; the API applies the minimums (see `routes/flex.rs` in
-//! `tft-api`). The core depends on the whole scope, so these are not added up per tag: both builds run the same
-//! SQL on the scope's boards, a full rebuild from `p` and an incremental one from `inc_b` under its merged
-//! labels, after `stat_comp_units` and `stat_comp_levels` are written.
+//! `tft-api`). The core depends on the whole scope, so these are not added up per tag: they are counted over the
+//! scope's boards after `stat_comp_units` and `stat_comp_levels` are written. The SQL below is the definition
+//! (the reference build runs it on `p`); [`write_fast`] counts the same rows in memory from the patch's boards,
+//! because the SQL's self-joins took a quarter of a build at a million boards.
 
+use crate::onepass::{NO_COMP, Names, PatchBoards};
 use anyhow::Result;
 use rusqlite::{Connection, params};
+use std::collections::{HashMap, HashSet};
 
 /// The tables this module writes, per patch and scope.
 pub const TABLES: [&str; 2] = ["stat_comp_flex_adds", "stat_comp_swaps"];
@@ -78,16 +81,142 @@ pub fn build_full(db: &Connection, patch: &str, scope: &str) -> Result<()> {
     write(db, "SELECT p.id, p.placement, p.level, p.comp_key FROM p JOIN topc USING (comp_key)", params![patch, scope])
 }
 
-/// An incremental build, per scope: the scope's boards in `inc_b` (band and window tags), under their merged
-/// label (`inc_map`), listed comps only (`inc_top`).
-pub fn write_inc(db: &Connection, patch: &str, scope: &str, band: i64, w: i64) -> Result<()> {
-    write(
-        db,
-        "SELECT b.id, b.placement, b.level, t.comp_key FROM inc_b b LEFT JOIN inc_map m ON m.src = b.comp_key
-         JOIN inc_top t ON t.comp_key = COALESCE(m.dst, b.comp_key)
-         WHERE b.comp_key IS NOT NULL AND b.band >= ?3 AND b.w >= ?4",
-        params![patch, scope, band, w],
-    )
+/// Which boards a scope's flex rows count: (position in the patch's boards, comp) pairs and the comps' labels.
+pub(crate) struct Members {
+    pub labels: Vec<String>,
+    pub boards: Vec<(usize, u32)>,
+}
+
+impl Members {
+    /// An incremental build with the baseline comp method: the scope's boards (band and window tags), under
+    /// their merged label (`inc_map`), listed comps only (`inc_top`).
+    pub fn from_tags(db: &Connection, pb: &PatchBoards, band: i64, w: i64) -> Result<Members> {
+        let top: Vec<String> = db.prepare("SELECT comp_key FROM inc_top")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let slot: HashMap<&str, u32> = top.iter().enumerate().map(|(i, k)| (k.as_str(), i as u32)).collect();
+        let map: HashMap<String, String> = db
+            .prepare("SELECT src, dst FROM inc_map")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Stored label to listed comp, once per label.
+        let of: Vec<Option<u32>> =
+            pb.comps.names.iter().map(|k| slot.get(map.get(k).unwrap_or(k).as_str()).copied()).collect();
+        let boards = (0..pb.len())
+            .filter(|i| pb.comp[*i] != NO_COMP && pb.band[*i] as i64 >= band && pb.w[*i] as i64 >= w)
+            .filter_map(|i| of[pb.comp[i] as usize].map(|s| (i, s)))
+            .collect();
+        drop(slot);
+        Ok(Members { labels: top, boards })
+    }
+
+    /// The listed comps' boards in `p` (labels already merged) and `topc`, as [`build_full`] reads them.
+    pub fn from_p(db: &Connection, pb: &PatchBoards) -> Result<Members> {
+        let mut labels = Names::default();
+        let mut boards = Vec::new();
+        let mut st = db.prepare("SELECT p.id, p.comp_key FROM p JOIN topc USING (comp_key)")?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let id: i64 = r.get(0)?;
+            let Some(i) = pb.find(id) else { anyhow::bail!("board {id} in p is not one of the patch's boards") };
+            boards.push((i, labels.id(r.get_ref(1)?.as_str()?)));
+        }
+        Ok(Members { labels: labels.names, boards })
+    }
+}
+
+/// [`build_full`] counted in memory: the same rows as [`ADDS`] and [`SWAPS`] give for the boards in `members`,
+/// after `stat_comp_units` and `stat_comps` are written for the scope.
+pub(crate) fn write_fast(db: &Connection, patch: &str, scope: &str, pb: &PatchBoards, members: &Members) -> Result<()> {
+    let slots = members.labels.len();
+    let slot: HashMap<&str, usize> = members.labels.iter().enumerate().map(|(i, k)| (k.as_str(), i)).collect();
+    // Unit ids: the patch's, plus any core unit that is on none of its boards (numbered after them).
+    let mut extra: Vec<String> = Vec::new();
+    let mut core: Vec<HashSet<u32>> = vec![HashSet::new(); slots];
+    {
+        let mut st = db.prepare(
+            "SELECT cu.comp_key, cu.character_id FROM stat_comp_units cu
+             JOIN stat_comps c ON c.patch = cu.patch AND c.bucket = cu.bucket AND c.comp_key = cu.comp_key
+             WHERE cu.patch = ?1 AND cu.bucket = ?2 AND cu.games * 2 >= c.games",
+        )?;
+        let mut rows = st.query(params![patch, scope])?;
+        while let Some(r) = rows.next()? {
+            let Some(s) = slot.get(r.get_ref(0)?.as_str()?) else { continue };
+            let name = r.get_ref(1)?.as_str()?;
+            let unit = pb.units.get(name).unwrap_or_else(|| {
+                let at = extra.iter().position(|x| x == name).unwrap_or_else(|| {
+                    extra.push(name.to_string());
+                    extra.len() - 1
+                });
+                (pb.units.names.len() + at) as u32
+            });
+            core[*s].insert(unit);
+        }
+    }
+    let unit_name = |u: u32| -> &str {
+        let known = pb.units.names.len();
+        if (u as usize) < known { pb.units.name(u) } else { &extra[u as usize - known] }
+    };
+
+    // The level 8 core: units on at least half of a comp's level 8 boards, when it has enough of them.
+    let mut n8 = vec![0i64; slots];
+    let mut on8: Vec<HashMap<u32, i64>> = vec![HashMap::new(); slots];
+    for (i, s) in &members.boards {
+        if pb.level[*i] == Some(8) {
+            n8[*s as usize] += 1;
+            for u in pb.units_on(*i) {
+                *on8[*s as usize].entry(*u).or_insert(0) += 1;
+            }
+        }
+    }
+    let core8: Vec<HashSet<u32>> = (0..slots)
+        .map(|s| {
+            if n8[s] >= LEVEL8_MIN_GAMES {
+                on8[s].iter().filter(|(_, n)| **n * 2 >= n8[s]).map(|(u, _)| *u).collect()
+            } else {
+                core[s].clone()
+            }
+        })
+        .collect();
+
+    let mut adds: HashMap<(u32, u32), (i64, i64)> = HashMap::new();
+    let mut swaps: HashMap<(u32, u32, u32), (i64, i64)> = HashMap::new();
+    let mut out: Vec<u32> = Vec::new();
+    for (i, s) in &members.boards {
+        let (on, place) = (pb.units_on(*i), pb.place[*i]);
+        let (core, core8) = (&core[*s as usize], &core8[*s as usize]);
+        if pb.level[*i].is_some_and(|l| l >= 9) {
+            for u in on.iter().filter(|u| !core8.contains(u)) {
+                let e = adds.entry((*s, *u)).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += place;
+            }
+        }
+        out.clear();
+        out.extend(core.iter().filter(|c| !on.contains(c)));
+        if out.is_empty() {
+            continue;
+        }
+        for u in on.iter().filter(|u| !core.contains(u)) {
+            for o in &out {
+                let e = swaps.entry((*s, *o, *u)).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += place;
+            }
+        }
+    }
+
+    let mut put = db.prepare(
+        "INSERT INTO stat_comp_flex_adds (patch, bucket, comp_key, character_id, games, sum_place) VALUES (?, ?, ?, ?, ?, ?)",
+    )?;
+    for ((s, u), (games, sum)) in &adds {
+        put.execute(params![patch, scope, members.labels[*s as usize], unit_name(*u), games, sum])?;
+    }
+    let mut put = db.prepare(
+        "INSERT INTO stat_comp_swaps (patch, bucket, comp_key, out_unit, in_unit, games, sum_place) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    for ((s, o, u), (games, sum)) in &swaps {
+        put.execute(params![patch, scope, members.labels[*s as usize], unit_name(*o), unit_name(*u), games, sum])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

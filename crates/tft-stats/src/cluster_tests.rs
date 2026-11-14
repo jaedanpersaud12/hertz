@@ -380,10 +380,13 @@ fn incremental_clusters_build_equals_a_full_rebuild() {
     let (fresh_dir, mut fresh, ..) = lobbies("inc-fresh", Method::Clusters);
     store(&mut fresh, &cal, 1, &first);
     store(&mut fresh, &cal, 2, &more);
-    build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
+    build_stats_reference_with(&mut fresh, 2, &mut |_| {}).unwrap();
     drop(fresh);
     let compared = assert_same_stats(&conn, &fresh_dir.join("t.db"));
     assert!(compared > 1000, "only {compared} rows compared");
+    // A full rebuild (every scope, raw rows read once per patch) gives the reference build's tables too.
+    build_stats_with(&mut conn, 2, &mut |_| {}).unwrap();
+    assert_eq!(assert_same_stats(&conn, &fresh_dir.join("t.db")), compared);
     let variants = q(&conn, "SELECT COUNT(*) FROM stat_comp_variants");
     assert!(variants > 0, "the lobbies should make variants");
     drop(conn);
@@ -609,7 +612,7 @@ fn renames_and_merges_are_applied_after_every_rebuild() {
         put(&fresh, "91.1", now_ms() - 3_600_000, 0, &boards);
         put(&fresh, "91.1", now_ms() - 3_500_000, 500, &more);
         overrides::merge(&fresh, &b, Some(&a)).unwrap();
-        build_stats_with(&mut fresh, 2, &mut |_| {}).unwrap();
+        build_stats_reference_with(&mut fresh, 2, &mut |_| {}).unwrap();
         drop(fresh);
         assert_same_stats(&conn, &fresh_dir.join("t.db"));
 

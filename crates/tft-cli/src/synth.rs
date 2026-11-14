@@ -53,7 +53,7 @@ fn trait_id(t: usize) -> String {
 }
 
 fn world() -> World {
-    let mut rng = Rng(0x5eed_0f_7f7);
+    let mut rng = Rng(0x0005_eed0_f7f7);
     let craftable: Vec<String> = (0..45).map(|i| format!("TFT_Item_Craft{i:02}")).collect();
     let radiant: Vec<String> = (0..45).map(|i| format!("TFT5_Item_Craft{i:02}Radiant")).collect();
     let artifact: Vec<String> = (0..25).map(|i| format!("TFT_Item_Artifact_{i:02}")).collect();

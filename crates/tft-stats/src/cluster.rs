@@ -663,7 +663,15 @@ pub(crate) fn write_shape(db: &Connection, patch: &str, scope: &str, labels: &La
 
 /// The comp tables of one scope in an incremental build, from the tagged boards in inc_b: the boards are put
 /// in p and go through the same steps as in a full rebuild, so the result is the same.
-pub(crate) fn comps_from_inc(db: &Connection, patch: &str, scope: &str, band: i64, w: i64, comps: i64) -> Result<()> {
+pub(crate) fn comps_from_inc(
+    db: &Connection,
+    patch: &str,
+    scope: &str,
+    band: i64,
+    w: i64,
+    comps: i64,
+    boards: &crate::onepass::PatchBoards,
+) -> Result<()> {
     db.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS p (id INTEGER PRIMARY KEY, placement INTEGER NOT NULL, level INTEGER, comp_key TEXT);
          CREATE TEMP TABLE IF NOT EXISTS topc (comp_key TEXT PRIMARY KEY) WITHOUT ROWID;
@@ -673,5 +681,5 @@ pub(crate) fn comps_from_inc(db: &Connection, patch: &str, scope: &str, band: i6
         "INSERT INTO p SELECT id, placement, level, comp_key FROM inc_b WHERE band >= ? AND w >= ? ORDER BY id",
         params![band, w],
     )?;
-    super::build_comps(db, patch, scope, comps)
+    super::build_comps(db, patch, scope, comps, Some(boards))
 }

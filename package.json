@@ -17,8 +17,9 @@
     "golden": "tsx scripts/golden.ts",
     "resume": "tsx scripts/resume.ts",
     "cli": "tsx scripts/cli.ts",
+    "perf": "tsx scripts/perf.ts",
     "test:rust": "cargo test -q && cargo clippy -q --all-targets -- -D warnings",
-    "gate": "npm run test:rust && npm run golden && npm run resume && npm run cli && npm test && npm run build"
+    "gate": "npm run test:rust && npm run golden && npm run resume && npm run cli && npm run perf && npm test && npm run build"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",

@@ -50,7 +50,7 @@ impl Profile {
         let wall = self.started.elapsed();
         let rows = self.rows.lock().unwrap();
         let mut list: Vec<(&String, &Row)> = rows.iter().collect();
-        list.sort_by(|a, b| b.1.total.cmp(&a.1.total));
+        list.sort_by_key(|b| std::cmp::Reverse(b.1.total));
         let sql: Duration = list.iter().map(|(_, r)| r.total).sum();
         println!();
         println!(

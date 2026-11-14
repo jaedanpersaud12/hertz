@@ -16,9 +16,9 @@
 //!
 //! Units the data file `no_item_units.json` names (summons, units that cannot hold items) get no pair rows.
 //!
-//! Every value is a count or sum over a scope's boards, so a full rebuild takes them from the boards in `p` and an
-//! incremental build adds up its sums per rank band and time window from `inc_b`: the same SQL, run on either
-//! source. Rows under the scope minimum are not stored (the minimum is applied to the scope's total, so a full and
+//! Every value is a count or sum over a scope's boards. The SQL below is the definition (the reference build runs
+//! it on the boards in `p`); the builds the app uses add up sums per rank band and time window, counted in memory
+//! from `inc_b`. Rows under the scope minimum are not stored (the minimum is applied to the scope's total, so a full and
 //! an incremental build keep the same rows).
 
 use anyhow::Result;
@@ -41,8 +41,8 @@ pub fn no_item_patterns() -> String {
     v["patterns"].to_string()
 }
 
-/// One summed table: `sql` makes rows from boards `{src} b` (columns id, placement); `{ti}` / `{to}` are where an
-/// incremental build adds its tag columns (inside the board-level query and outside it).
+/// One summed table: `sql` makes rows from boards `{src} b` (columns id, placement). `{ti}`, `{to}` and `{xto}`
+/// are where tag columns would go; they are left empty.
 struct Sum {
     table: &'static str,
     inc: &'static str,
@@ -105,8 +105,8 @@ const SUMS: [Sum; 3] = [
     },
 ];
 
-fn fill(sql: &str, src: &str, tagged: bool) -> String {
-    let (ti, to, xto) = if tagged { ("b.band, b.w,", "band, w,", "x.band, x.w,") } else { ("", "", "") };
+fn fill(sql: &str, src: &str) -> String {
+    let (ti, to, xto) = ("", "", "");
     sql.replace("{holds_x}", &HOLDS_ITEMS.replace("{u}", "x"))
         .replace("{holds_u}", &HOLDS_ITEMS.replace("{u}", "u"))
         .replace("{src}", src)
@@ -151,7 +151,7 @@ pub fn build_full(db: &Connection, patch: &str, scope: &str) -> Result<()> {
                  SELECT ?1, ?2, {k}, games, sum_place FROM ({sql}) WHERE games >= ?3",
                 t = s.table,
                 k = s.keys,
-                sql = fill(s.sql, "(SELECT id, placement FROM p)", false)
+                sql = fill(s.sql, "(SELECT id, placement FROM p)")
             ),
             params![patch, scope, s.min],
         )?;
@@ -159,18 +159,12 @@ pub fn build_full(db: &Connection, patch: &str, scope: &str) -> Result<()> {
     Ok(())
 }
 
-/// An incremental build, once per patch: the sums per rank band and time window, from `inc_b`.
-pub fn inc_sums(db: &Connection) -> Result<()> {
+/// An incremental build, once per patch: the sums per rank band and time window, from `inc_b`. The rows are
+/// those [`SUMS`] gives grouped by band and window as well; they are counted in memory in one pass over the
+/// boards ([`crate::onepass::load`]), which also returns the boards for the flex tables.
+pub(crate) fn inc_sums(db: &Connection) -> Result<crate::onepass::PatchBoards> {
     prepare(db)?;
-    for s in &SUMS {
-        db.execute_batch(&format!(
-            "CREATE TEMP TABLE IF NOT EXISTS {inc} (band, w, {k}, games, sum_place); DELETE FROM {inc};",
-            inc = s.inc,
-            k = s.keys
-        ))?;
-        db.execute(&format!("INSERT INTO {} SELECT * FROM ({})", s.inc, fill(s.sql, "(SELECT id, placement, band, w FROM inc_b)", true)), [])?;
-    }
-    Ok(())
+    crate::onepass::load(db)
 }
 
 /// Drops the scratch tables [`inc_sums`] made.
