@@ -82,6 +82,8 @@ const got: Record<string, Record<string, unknown>> = {}
  * but the engine's 3-day window is measured from the real clock. So each run moves them by OFFSET, keeping them
  * where they sat against the clock when the golden files were recorded, and writes them back as the dates below.
  * Any RECORDED_AT from 6 Nov 12:00 to 11 Nov 12:00 UTC gives the recorded answers; 07:00 leaves room either side.
+ * The same goes for the saved team that must stay ahead of the clock. Shifted values are far from the
+ * run's own times, so settle() never takes them for "now" before clock() writes them back.
  */
 const RECORDED_AT = Date.parse('2026-11-11T07:00:00Z')
 const OFFSET = WORLD_NOW - RECORDED_AT
@@ -1237,7 +1239,8 @@ async function apiSection(stats: string) {
   db.prepare("INSERT INTO kv (key, value) VALUES ('pinned', ?)").run(JSON.stringify(comps[0]))
   const team = db.prepare('INSERT INTO saved_teams (id, name, board, created) VALUES (?, ?, ?, ?)')
   team.run(1, 'First', JSON.stringify([{ unit: 'TFT99_Unit1', hex: 3, items: ['TFT_Item_Thing1'] }]), 1_700_000_000_000)
-  team.run(2, 'Newest — team', JSON.stringify([]), 1_800_000_000_000)
+  // Ahead of the clock, so it stays the newest team: moved with the run like the other fixture dates.
+  team.run(2, 'Newest — team', JSON.stringify([]), at('2027-01-15T08:00:00Z')) // 1_800_000_000_000
   team.run(3, 'Middle', JSON.stringify({ odd: true, n: 1.5 }), 1_750_000_000_000)
   seedEdges(db, WORLD_NOW)
   db.close()
