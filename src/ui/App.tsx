@@ -223,7 +223,7 @@ export function App() {
   }
 
   const current = TITLES[page] ? page : page === 'identity' ? '' : 'comps'
-  const heading = page === 'compare' ? 'Compare comps' : page === 'identity' ? null : id && page === 'units' ? null : id && page === 'items' ? null : TITLES[current]
+  const heading = page === 'compare' ? 'Compare comps' : page === 'identity' ? null : id && page === 'units' ? null : id && page === 'items' ? null : id && page === 'traits' ? null : TITLES[current]
   const hasStats = m && m.patches.length > 0
   const isMac = /Mac/i.test(navigator.platform)
 
