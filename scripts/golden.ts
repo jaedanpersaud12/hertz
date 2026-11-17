@@ -77,11 +77,28 @@ const fail = (label: string, detail: string) => {
 
 const got: Record<string, Record<string, unknown>> = {}
 
+/**
+ * The fixtures' calendar dates (the patch calendar, matches dated by it) were written for a run on 11 Nov 2026,
+ * but the engine's 3-day window is measured from the real clock. So each run moves them by OFFSET, keeping them
+ * where they sat against the clock when the golden files were recorded, and writes them back as the dates below.
+ * Any RECORDED_AT from 6 Nov 12:00 to 11 Nov 12:00 UTC gives the recorded answers; 07:00 leaves room either side.
+ */
+const RECORDED_AT = Date.parse('2026-11-11T07:00:00Z')
+const OFFSET = WORLD_NOW - RECORDED_AT
+/** Shifted time -> the date as written in the fixtures (and so in the golden files). */
+const fixtureTimes = new Map<number, number>()
+/** A fixture date (ISO, plus `plus` ms), moved to this run's clock. */
+const at = (iso: string, plus = 0) => {
+  const t = Date.parse(iso) + plus
+  fixtureTimes.set(t + OFFSET, t)
+  return t + OFFSET
+}
+
 /** The fake world's match times, by what they are relative to WORLD_NOW. Exact values only. */
 const worldTimes = new Map<number, number>()
 for (let d = 0; d <= 10; d++) worldTimes.set(WORLD_NOW - 3_600_000 - d * DAY, -3_600_000 - d * DAY)
 worldTimes.set(WORLD_NOW - 10 * 60_000, -10 * 60_000) // the stale account card in section 4
-const clock = (text: string) => text.replace(/(?<![\d.])\d{13}(?![\d.])/g, (m) => String(worldTimes.get(Number(m)) ?? m))
+const clock = (text: string) => text.replace(/(?<![\d.])\d{13}(?![\d.])/g, (m) => String(worldTimes.get(Number(m)) ?? fixtureTimes.get(Number(m)) ?? m))
 
 /** Keys sorted at every level, so files are the same however an object was built. */
 const sortKeys = (v: unknown): unknown =>
@@ -101,8 +118,8 @@ function put(section: string, key: string, value: unknown) {
 
 // Calendar "?.?.?.?" matches are dated against.
 const CALENDAR = [
-  { patch: '16.21', since: Date.parse('2026-10-21T07:15:23Z') },
-  { patch: '16.22', since: Date.parse('2026-11-04T07:47:21Z') },
+  { patch: '16.21', since: at('2026-10-21T07:15:23Z') },
+  { patch: '16.22', since: at('2026-11-04T07:47:21Z') },
 ]
 
 /** Matches the fake world never produces but Riot can. */
@@ -116,9 +133,9 @@ function awkwardMatches() {
   }
   return [
     // Live Riot data: no version, dated by calendar, either side of a patch boundary.
-    mk('EDGE_UNREAL_1', (m) => { m.info.game_version = 'TFT Unreal Version ?.?.?.?'; m.info.game_datetime = Date.parse('2026-11-03T12:00:00Z') }),
-    mk('EDGE_UNREAL_2', (m) => { m.info.game_version = 'TFT Unreal Version ?.?.?.?'; m.info.game_datetime = Date.parse('2026-11-08T12:00:00Z') }),
-    mk('EDGE_NOVERSION', (m) => { delete m.info.game_version; m.info.game_datetime = Date.parse('2026-01-01T00:00:00Z') }),
+    mk('EDGE_UNREAL_1', (m) => { m.info.game_version = 'TFT Unreal Version ?.?.?.?'; m.info.game_datetime = at('2026-11-03T12:00:00Z') }),
+    mk('EDGE_UNREAL_2', (m) => { m.info.game_version = 'TFT Unreal Version ?.?.?.?'; m.info.game_datetime = at('2026-11-08T12:00:00Z') }),
+    mk('EDGE_NOVERSION', (m) => { delete m.info.game_version; m.info.game_datetime = at('2026-01-01T00:00:00Z') }),
     // Blank item names, missing rarity, missing items, a board of three units.
     mk('EDGE_UNITS', (m) => {
       const p = m.info.participants
@@ -805,9 +822,9 @@ function awkwardMyMatches(puuid: string) {
     edit(m)
     return m
   }
-  const t = Date.parse('2026-11-08T12:00:00Z')
+  const t = (plus: number) => at('2026-11-08T12:00:00Z', plus)
   return [
-    mk('MY_EDGE_1', t + 5000, (m) => {
+    mk('MY_EDGE_1', t(5000), (m) => {
       const p = m.info.participants
       delete p[0].riotIdGameName
       p[1].riotIdGameName = ''
@@ -822,12 +839,12 @@ function awkwardMyMatches(puuid: string) {
       m.info.queue_id = 1130
       delete m.info.game_version
     }),
-    mk('MY_EDGE_2', t + 4000, (m) => { delete m.info.queue_id; m.info.queueId = 1160; m.info.game_version = 'TFT Unreal Version ?.?.?.?'; m.info.game_length = 1999.75 }),
-    mk('MY_EDGE_3', t + 3000, (m) => { delete m.info.queue_id; delete m.info.game_version }), // dated by the calendar
-    mk('MY_EDGE_6', Date.parse('2026-01-01T00:00:00Z'), (m) => { m.info.game_version = 'no version here' }), // before the calendar
-    mk('MY_EDGE_4', t + 2000, (m) => { m.info.queue_id = 1090; m.info.participants.reverse() }),
+    mk('MY_EDGE_2', t(4000), (m) => { delete m.info.queue_id; m.info.queueId = 1160; m.info.game_version = 'TFT Unreal Version ?.?.?.?'; m.info.game_length = 1999.75 }),
+    mk('MY_EDGE_3', t(3000), (m) => { delete m.info.queue_id; delete m.info.game_version }), // dated by the calendar
+    mk('MY_EDGE_6', at('2026-01-01T00:00:00Z'), (m) => { m.info.game_version = 'no version here' }), // before the calendar
+    mk('MY_EDGE_4', t(2000), (m) => { m.info.queue_id = 1090; m.info.participants.reverse() }),
     // Not yours: stored, but never shown.
-    mk('MY_EDGE_5', t + 1000, (m) => { m.info.participants[0].puuid = 'someone-else' }),
+    mk('MY_EDGE_5', t(1000), (m) => { m.info.participants[0].puuid = 'someone-else' }),
   ]
 }
 
@@ -1250,12 +1267,12 @@ const fileText = (entries: Record<string, unknown>) => {
 
 /** Times made from this run's clock that were not written relative to it. A golden file must not hold any. */
 function clockLeaks(section: string, entries: Record<string, unknown>) {
-  const fixed = new Set([...CALENDAR.map((c) => c.since), Date.parse('2026-11-03T12:00:00Z'), Date.parse('2026-11-08T12:00:00Z')])
+  const fixed = new Set(fixtureTimes.values()) // the fixtures' dates, as written back by clock()
   const from = WORLD_NOW - 11 * DAY - 3_600_000 - 60_000
   const text = fileText(entries)
   const leaks = [...text.matchAll(/(?<![\d.])\d{13}(?![\d.])/g)].filter((m) => {
     const n = Number(m[0])
-    return n >= from && n <= Date.now() + 60_000 && !fixed.has(n) && !(n > Date.parse('2026-11-08T12:00:00Z') && n <= Date.parse('2026-11-08T12:00:05Z'))
+    return n >= from && n <= Date.now() + 60_000 && !fixed.has(n)
   })
   if (leaks.length) fail(`${section}: run clock`, `    ${leaks.length} times from this run are not written relative to it, e.g. ...${text.slice(Math.max(0, leaks[0].index! - 120), leaks[0].index! + 20)}`)
 }
