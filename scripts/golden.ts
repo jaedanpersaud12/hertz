@@ -492,7 +492,7 @@ async function toolsSection(ingested: string) {
  */
 function seedEdges(db: Database.Database, now: number) {
   const [P, B] = ['98.1', 'ALL']
-  db.prepare('INSERT INTO stat_meta (patch, bucket, matches, comps, built_at) VALUES (?, ?, ?, ?, ?)').run(P, B, 250, 2000, 1_750_000_000_000)
+  db.prepare('INSERT INTO stat_meta (patch, bucket, matches, comps, built_at) VALUES (?, ?, ?, ?, ?)').run(P, B, 250, 2000, at('2025-06-15T15:06:40Z')) // 1_750_000_000_000
   const comp = db.prepare('INSERT INTO stat_comps (patch, bucket, comp_key, games, sum_place, wins, top4, sum_level) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
   const unit = db.prepare('INSERT INTO stat_comp_units (patch, bucket, comp_key, character_id, games, sum_star, sum_items, full_items, sum_place) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
   const item = db.prepare('INSERT INTO stat_comp_items (patch, bucket, comp_key, character_id, item, games, sum_place) VALUES (?, ?, ?, ?, ?, ?, ?)')
@@ -1134,7 +1134,7 @@ async function apiSection(stats: string) {
   {
     // built_at is when the stats were rebuilt: one fixed time, so builtAt in the answers is the same every run.
     const db = new Database(dbPath)
-    db.prepare('UPDATE stat_meta SET built_at = ?').run(1_760_000_000_000)
+    db.prepare('UPDATE stat_meta SET built_at = ?').run(at('2025-10-09T08:53:20Z')) // 1_760_000_000_000
     db.close()
   }
 
@@ -1238,10 +1238,10 @@ async function apiSection(stats: string) {
   mark.run('Gone|TFT99_Unit1', 0, 0)
   db.prepare("INSERT INTO kv (key, value) VALUES ('pinned', ?)").run(JSON.stringify(comps[0]))
   const team = db.prepare('INSERT INTO saved_teams (id, name, board, created) VALUES (?, ?, ?, ?)')
-  team.run(1, 'First', JSON.stringify([{ unit: 'TFT99_Unit1', hex: 3, items: ['TFT_Item_Thing1'] }]), 1_700_000_000_000)
+  team.run(1, 'First', JSON.stringify([{ unit: 'TFT99_Unit1', hex: 3, items: ['TFT_Item_Thing1'] }]), at('2023-11-14T22:13:20Z')) // 1_700_000_000_000
   // Ahead of the clock, so it stays the newest team: moved with the run like the other fixture dates.
   team.run(2, 'Newest — team', JSON.stringify([]), at('2027-01-15T08:00:00Z')) // 1_800_000_000_000
-  team.run(3, 'Middle', JSON.stringify({ odd: true, n: 1.5 }), 1_750_000_000_000)
+  team.run(3, 'Middle', JSON.stringify({ odd: true, n: 1.5 }), at('2025-06-15T15:06:40Z')) // 1_750_000_000_000
   seedEdges(db, WORLD_NOW)
   db.close()
 
