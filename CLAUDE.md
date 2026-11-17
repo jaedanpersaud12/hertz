@@ -11,11 +11,10 @@ player (Jaedan, plays on Windows). Built by an agent team (see "How work gets do
 | `docs/plan/01-weekly-plan.md` | Which stories belong to which week |
 | `docs/plan/02-architecture.md` | Crates, data model groups, API surface, recorded decisions |
 | `docs/plan/prd-*.md` | One PRD per area: requirements, data model, edge cases, test plan, build order |
-| `crates/` | The Rust engine (replacing the TypeScript engine piece by piece) |
-| `src/crawler`, `src/stats`, `src/server` | The TypeScript engine. It is the specification until the Rust port passes parity, then it is deleted |
-| `src/ui` | The React app. Stays. Design rules in "UI rules" below |
+| `crates/` | The Rust engine: crawler, stats, API and the `tft` command line. The TypeScript engine it replaced was deleted in d7405d2 |
+| `src/ui` | The React app. Design rules in "UI rules" below |
 | `test/world.ts` | The deterministic fake TFT world and fake Riot API every test uses |
-| `scripts/parity.ts` | Runs both engines on the same input and diffs the results |
+| `test/golden/`, `scripts/golden.ts` | Answers recorded from the TypeScript engine before it was deleted, and the script that checks the Rust engine against them |
 
 The live plan doc (editable, commented) is https://claude.ai/artifact/CWtsQ5zLe8sgPkoHRBuQcQ.
 `docs/plan/` is a snapshot of it; if they disagree, ask Jaedan which wins.
@@ -24,7 +23,7 @@ Tracking: Linear project "Hertz" (team Jaedan), one milestone per PRD, story id 
 ## The gate
 
 ```
-npm run gate        # cargo test + clippy -D warnings, parity, TypeScript e2e, app build
+npm run gate        # cargo test + clippy -D warnings, golden, resume, cli, e2e, app build
 ```
 
 Nothing reaches `main` unless the gate passes. Run it before you say anything is done. Paste the tail of its output
@@ -36,8 +35,9 @@ as proof. No Riot API key exists in the cloud: every test runs against the fake 
    including the loading screen. No recommendations that react to what is happening in the current game. No win
    rates for Legends or Legend-based augments. No reading game memory, ever. Details in the policy check section
    of `docs/plan/00-overview.md`. If a story seems to need any of these, stop and escalate.
-2. **Parity first.** Until a TypeScript engine piece is retired, the Rust replacement must match it exactly,
-   proven by `npm run parity`. Changing what a number means is a separate, explicit story.
+2. **Golden answers hold.** The Rust engine must keep giving exactly the answers in `test/golden/`, proven by
+   `npm run golden`. Changing what a number means is a separate, explicit story, and only that story may run
+   `npm run golden -- --update`, saying in its review which entries changed and why.
 3. **Tests are the contract.** Never weaken, skip or delete a test to make something pass. If a test is wrong,
    say so in the review and let the reviewer agree before changing it.
 4. **Stay in scope.** Touch only what the story needs. No drive-by refactors, renames or formatting sweeps.
@@ -76,8 +76,10 @@ Procedures: `.claude/playbooks/lead.md` and `auditor.md` for the scheduled sessi
 ```
 npm run gate                  everything below, in order
 npm run test:rust             cargo test, clippy
-npm run parity                Rust engine against the TypeScript engine
-npm test                      TypeScript end-to-end test against the fake Riot API
+npm run golden                Rust engine against the answers recorded from the TypeScript engine
+npm run resume                a killed crawl picks up exactly where it stopped
+npm run cli                   the tft binary against the fake Riot API
+npm test                      end-to-end test of the tft binary against the fake Riot API
 npm run build                 the React app
 cargo run -p tft-cli -- --help   the Rust engine's command line
 ```
