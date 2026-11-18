@@ -129,6 +129,12 @@ export type SortableTableProps<T> = {
   onMarkChange?: (id: string | null) => void;
   getRowLabel?: (row: T) => string;
   className?: string;
+  /** Keep the header row in view while the page scrolls, this far from the top (a CSS length). */
+  stickyTop?: string;
+  /** Narrowest the table may get; below it the rows scroll sideways and the header follows. */
+  minWidth?: number;
+  /** A control at the right end of the header row, such as a column chooser. Stays put when the rows scroll sideways. */
+  headerEnd?: ReactNode;
 };
 
 export function SortableTable<T>({
@@ -145,8 +151,15 @@ export function SortableTable<T>({
   onMarkChange,
   getRowLabel,
   className = "",
+  stickyTop,
+  minWidth,
+  headerEnd,
 }: SortableTableProps<T>) {
   const reduced = useReducedMotion();
+  const headRef = useRef<HTMLDivElement | null>(null);
+  const sticky = stickyTop !== undefined;
+  // Room at the end of every row for the header control, so the columns still line up.
+  const pad = headerEnd ? "pl-2 pr-9" : "px-2";
   const [marked, setMarked] = useState<string | null>(null);
   const [touched, setTouched] = useState(false);
   const [moving, setMoving] = useState(false);
@@ -213,7 +226,8 @@ export function SortableTable<T>({
 
   return (
     <div
-      className={`overflow-hidden rounded-[14px] border border-stone-200 bg-white shadow-[0_1px_2px_rgba(28,25,23,0.06),0_4px_10px_-8px_rgba(28,25,23,0.45)] dark:border-white/[0.16] dark:bg-[#18181B] dark:shadow-[0_1px_6px_rgba(0,0,0,0.45)] ${className}`}
+      // overflow: clip still rounds the corners but, unlike hidden, does not stop the header sticking.
+      className={`${sticky ? "overflow-clip" : "overflow-hidden"} rounded-[14px] border border-stone-200 bg-white shadow-[0_1px_2px_rgba(28,25,23,0.06),0_4px_10px_-8px_rgba(28,25,23,0.45)] dark:border-white/[0.16] dark:bg-[#18181B] dark:shadow-[0_1px_6px_rgba(0,0,0,0.45)] ${className}`}
     >
       <div
         role="table"
@@ -221,12 +235,16 @@ export function SortableTable<T>({
         aria-rowcount={rows.length + 1}
         aria-colcount={columns.length + (markable ? 1 : 0)}
       >
-        <div role="rowgroup">
+        <div
+          className={`tbl-head ${sticky ? "sticky z-10 bg-white dark:bg-[#18181B]" : "relative"}`}
+          style={{ top: stickyTop }}
+        >
+        <div role="rowgroup" ref={headRef} className={minWidth ? "overflow-hidden" : ""}>
           <div
             role="row"
             aria-rowindex={1}
-            className="grid h-9 items-center gap-x-2 border-b border-stone-200 px-2 dark:border-white/[0.16]"
-            style={{ gridTemplateColumns: template }}
+            className={`grid h-9 items-center gap-x-2 border-b border-stone-200 ${pad} dark:border-white/[0.16]`}
+            style={{ gridTemplateColumns: template, minWidth }}
           >
             {markable && (
               <div role="columnheader" className="min-w-0">
@@ -299,6 +317,20 @@ export function SortableTable<T>({
             })}
           </div>
         </div>
+        {headerEnd ? (
+          <div className="absolute inset-y-0 right-1.5 flex items-center">{headerEnd}</div>
+        ) : null}
+        </div>
+        <div
+          className={minWidth ? "overflow-x-auto overflow-y-hidden" : ""}
+          onScroll={
+            minWidth
+              ? (e) => {
+                  if (headRef.current) headRef.current.scrollLeft = e.currentTarget.scrollLeft;
+                }
+              : undefined
+          }
+        >
         <div
           role="rowgroup"
           className={`relative overflow-y-auto overscroll-contain ${
@@ -307,6 +339,7 @@ export function SortableTable<T>({
           style={{
             height: (rows.length || 1) * rowHeight,
             maxHeight,
+            minWidth,
           }}
         >
           {rows.length === 0 && (
@@ -340,7 +373,7 @@ export function SortableTable<T>({
                     ? { duration: 0 }
                     : { ...CELL, delay: Math.min(index, STEP_CAP) * STEP }
                 }
-                className={`absolute inset-x-0 top-0 grid items-center gap-x-2 px-2 transition-colors duration-150 ${
+                className={`absolute inset-x-0 top-0 grid items-center gap-x-2 ${pad} transition-colors duration-150 ${
                   isMarked ? "bg-stone-100 dark:bg-white/[0.06]" : ""
                 }`}
                 style={{ height: rowHeight, gridTemplateColumns: template }}
@@ -423,6 +456,7 @@ export function SortableTable<T>({
               />
             ))}
           </motion.div>
+        </div>
         </div>
       </div>
       <div role="status" aria-live="polite" className="sr-only">

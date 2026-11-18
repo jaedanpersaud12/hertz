@@ -105,7 +105,7 @@ export function PipelineHealth({ reloadKey }: { reloadKey: number }) {
       ) : <p className="muted small mb-3">No problems logged. Warnings and errors from the crawler show up here.</p>}
 
       {rows.length ? (
-        <Table rows={rows} cols={regionCols} initial="hour" desc label="Matches per server" rowHeight={52} minWidth={560} />
+        <Table id="pipeline-servers" rows={rows} cols={regionCols} initial="hour" desc label="Matches per server" rowHeight={52} minWidth={560} />
       ) : (
         <div className="empty-note">
           <p>Nothing collected yet.</p>

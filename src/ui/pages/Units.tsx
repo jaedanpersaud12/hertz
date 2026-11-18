@@ -29,7 +29,7 @@ export function Units() {
         <span className="toolbar-note">{count(rows.length, 'unit')}</span>
       </div>
       {rows.length ? (
-        <Table label="Units" rows={rows} initial="place" cols={[
+        <Table id="units" label="Units" rows={rows} initial="place" cols={[
           { key: 'name', label: 'Unit', sort: (r) => r.name, render: (r) => <a className="name" href={unitLink(r)}><Icon e={r} /><span>{r.name}</span></a> },
           { key: 'cost', label: 'Cost', sort: (r) => r.cost ?? 0, render: (r) => r.cost ? <span className={`cost-text-${r.cost}`}>{r.cost}</span> : <span className="muted">–</span>, align: 'right', width: '70px' },
           { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByPlace(r.avgPlace)} />, width: '60px' },
@@ -93,7 +93,7 @@ export function Unit({ id }: { id: string }) {
   const panels: Record<string, React.ReactNode> = {
     builds: <BuildsPanel id={id} comps={data.comps} holds={data.holdsItems} />,
     items: (
-      <Table flush label="Items" rows={data.items} initial="change" empty={emptyHint} cols={[
+      <Table id="unit-items" flush label="Items" rows={data.items} initial="change" empty={emptyHint} cols={[
         { key: 'name', label: 'Item', sort: (r) => r.name, render: (r) => <a className="name" href={itemLink(r)}><Icon e={r} size={28} plain /><span>{r.name}</span></a> },
         { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByChange(r.placeChange ?? 0)} />, width: '60px' },
         { key: 'change', label: 'Place change', sort: (r) => r.placeChange ?? 0, render: (r) => <Change value={r.placeChange} />, align: 'right' },
@@ -103,7 +103,7 @@ export function Unit({ id }: { id: string }) {
       ]} />
     ),
     comps: (
-      <Table flush label="Comps with this unit" rows={data.comps} initial="games" desc rowHeight={60} empty="This unit is not a regular in any comp at these filters." cols={[
+      <Table id="unit-comps" flush label="Comps with this unit" rows={data.comps} initial="games" desc rowHeight={60} empty="This unit is not a regular in any comp at these filters." cols={[
         { key: 'name', label: 'Comp', sort: (r) => r.name, render: (r) => <span className="name"><span>{r.name}</span> <Tag kind={r.play.kind}>{r.play.label}</Tag></span>, width: 'minmax(220px, 1.4fr)' },
         { key: 'units', label: 'Board', render: (r) => <span className="mini-board flex-nowrap gap-2">{r.units.map((x) => <Icon key={x.id} e={x} size={26} />)}</span>, width: 'minmax(300px, 2fr)' },
         { key: 'place', label: 'Avg place', sort: (r) => r.avgPlace, render: (r) => <PlaceRail value={r.avgPlace} />, width: '150px' },
@@ -112,7 +112,7 @@ export function Unit({ id }: { id: string }) {
       ]} />
     ),
     teammates: (
-      <Table flush label="Teammates" rows={data.teammates} initial="change" cols={[
+      <Table id="unit-teammates" flush label="Teammates" rows={data.teammates} initial="change" cols={[
         { key: 'name', label: 'Unit', sort: (r) => r.name, render: (r) => <a className="name" href={unitLink(r)}><Icon e={r} size={28} /><span>{r.name}</span></a> },
         { key: 'change', label: 'Place change', sort: (r) => r.placeChange, render: (r) => <Change value={r.placeChange} />, align: 'right' },
         { key: 'place', label: 'Avg place together', sort: (r) => r.avgPlace, render: (r) => <PlaceRail value={r.avgPlace} />, width: '170px' },
@@ -120,7 +120,7 @@ export function Unit({ id }: { id: string }) {
       ]} empty="No unit shares 200 boards with this one at these filters. Pick a wider rank filter or the whole patch." />
     ),
     trend: (
-      <Table flush label="By patch" rows={[
+      <Table id="unit-trend" flush label="By patch" rows={[
         ...(data.recent ? [{ ...data.recent, patch: `${data.patch}, last 3 days`, id: 'recent' }] : []),
         ...data.trend.map((t) => ({ ...t, id: t.patch })),
       ]} initial="patch" desc cols={[
@@ -259,7 +259,7 @@ function BuildsPanel({ id, comps, holds }: { id: string; comps: Detail['comps'];
   return (
     <>
       {picker}
-      <Table flush label="Three-item builds" rows={data.rows} initial="change" empty={`No build has ${num(f.min)} games yet. Lower the minimum games${comp ? ', or pick all boards' : ''}.`} cols={[
+      <Table id="unit-builds" flush label="Three-item builds" rows={data.rows} initial="change" empty={`No build has ${num(f.min)} games yet. Lower the minimum games${comp ? ', or pick all boards' : ''}.`} cols={[
         { key: 'build', label: 'Build', render: (r) => <span className="holders">{r.items.map((i, n) => <Icon key={n} e={i} size={30} plain />)}</span> },
         { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByChange(r.placeChange ?? 0)} />, width: '60px' },
         { key: 'change', label: 'Place change', sort: (r) => r.placeChange ?? 0, render: (r) => <Change value={r.placeChange} />, align: 'right' },
@@ -292,7 +292,7 @@ function NextItem({ id, holds }: { id: string; holds: boolean }) {
         <span className="muted small next-step">{step}{data?.base ? <>: holding these, avg place {data.base.avgPlace.toFixed(2)} (<Change value={data.base.placeChange} />) in {num(data.base.games)} games</> : null}</span>
       </div>
       {error || !data ? <Status error={error} loading={loading} /> : (
-        <Table flush label={step} rows={data.rows} initial="change" rowHeight={44} minWidth={480}
+        <Table id="unit-item-completer" flush label={step} rows={data.rows} initial="change" rowHeight={44} minWidth={480}
           empty={have.length ? `Nothing to add with ${num(f.min)} games yet. Remove an item, or lower the minimum games.` : `No item has ${num(f.min)} games on this unit yet. Lower the minimum games.`} cols={[
           { key: 'name', label: full ? 'Add as third item' : 'Item', sort: (r) => r.name, render: (r) => full
             ? <span className="name"><Icon e={r} size={26} plain /><span>{r.name}{r.copies > 1 ? <b className="copies"> x{r.copies}</b> : null}</span></span>

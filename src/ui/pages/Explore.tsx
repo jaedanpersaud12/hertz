@@ -91,7 +91,7 @@ export function Explore() {
             <section>
               <h3>Also on these boards</h3>
               <p className="muted small">Place change compares boards that add the unit with all {num(s.games)} boards found.</p>
-              <Table label="Units also on these boards" rows={data.partners} initial="games" desc rowHeight={44} minWidth={420} cols={[
+              <Table id="explore-partners" label="Units also on these boards" rows={data.partners} initial="games" desc rowHeight={44} minWidth={420} cols={[
                 { key: 'name', label: 'Unit', sort: (r) => r.name, render: (r) => <a className="name" href={`#/units/${encodeURIComponent(r.id)}`}><Icon e={r} size={26} /><span>{r.name}</span></a> },
                 { key: 'freq', label: 'On', sort: (r) => r.frequency, render: (r) => pct(r.frequency, 0), align: 'right', width: '64px' },
                 { key: 'change', label: 'Change', sort: (r) => r.placeChange, render: (r) => <Change value={r.games >= 5 ? r.placeChange : null} />, align: 'right', width: '84px' },
@@ -101,7 +101,7 @@ export function Explore() {
             <section>
               <h3>Items on {data.itemsOn?.name ?? 'the first unit'}</h3>
               <p className="muted small">Within the boards found.</p>
-              <Table label="Items on the first unit" rows={data.items} initial="games" desc rowHeight={44} minWidth={420} empty="No items recorded on this unit in these boards." cols={[
+              <Table id="explore-items" label="Items on the first unit" rows={data.items} initial="games" desc rowHeight={44} minWidth={420} empty="No items recorded on this unit in these boards." cols={[
                 { key: 'name', label: 'Item', sort: (r) => r.name, render: (r) => <a className="name" href={`#/items/${encodeURIComponent(r.id)}`}><Icon e={r} size={26} plain /><span>{r.name}</span></a> },
                 { key: 'freq', label: 'On', sort: (r) => r.frequency, render: (r) => pct(r.frequency, 0), align: 'right', width: '64px' },
                 { key: 'change', label: 'Change', sort: (r) => r.placeChange, render: (r) => <Change value={r.games >= 5 ? r.placeChange : null} />, align: 'right', width: '84px' },

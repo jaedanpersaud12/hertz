@@ -37,7 +37,7 @@ export function Items() {
         <span className="toolbar-note">{count(rows.length, 'item')}</span>
       </div>
       {rows.length ? (
-        <Table label="Items" rows={rows} initial="change" cols={[
+        <Table id="items" label="Items" rows={rows} initial="change" cols={[
           { key: 'name', label: 'Item', sort: (r) => r.name, render: (r) => <a className="name" href={`#/items/${encodeURIComponent(r.id)}`}><Icon e={r} plain /><span>{r.name}</span></a> },
           { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByChange(r.placeChange ?? 0)} />, width: '60px' },
           { key: 'change', label: 'Place change', sort: (r) => r.placeChange ?? 0, render: (r) => <Change value={r.placeChange} />, align: 'right' },
@@ -157,7 +157,7 @@ export function Item({ id }: { id: string }) {
         <>
           <h3>Best holders</h3>
           <p className="muted small mb-3">Place change compares each unit holding this item with that unit overall. Negative is better.</p>
-          <Table label="Best holders" rows={data.holders} initial="change"
+          <Table id="item-holders" label="Best holders" rows={data.holders} initial="change"
             empty={`No unit has ${num(f.min)} games with this item yet. Lower the minimum games.`} cols={[
               { key: 'name', label: 'Unit', sort: (r) => r.name, render: (r) => <a className="name" href={`#/units/${encodeURIComponent(r.id)}`}><Icon e={r} size={28} /><span>{r.name}</span></a> },
               { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByChange(r.placeChange ?? 0)} />, width: '60px' },
@@ -193,7 +193,7 @@ function EmblemBreakpoints({ e, min }: { e: Emblem; min: number }) {
         </>
       )}
       {e.levels.length ? (
-        <Table label="Emblem breakpoints" rows={e.levels.map((l) => ({ ...l, id: String(l.level) }))} initial="level" cols={[
+        <Table id="item-emblem-breakpoints" label="Emblem breakpoints" rows={e.levels.map((l) => ({ ...l, id: String(l.level) }))} initial="level" cols={[
           { key: 'level', label: e.trait ? e.trait.name : 'Trait', sort: (r) => r.level, render: (r) => levelName(r) },
           { key: 'place', label: 'Avg place', sort: (r) => r.avgPlace, render: (r) => r.avgPlace.toFixed(2), align: 'right' },
           { key: 'win', label: 'Win rate', sort: (r) => r.winRate, render: (r) => pct(r.winRate), align: 'right' },

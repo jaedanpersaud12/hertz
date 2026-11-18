@@ -2,16 +2,19 @@
  * The app's own building blocks. Interactive ones sit on interior.dev components (see ./interior):
  * press feedback, tooltips, sortable tables, dropdowns, segmented controls and the like button.
  */
+import { Columns } from '@phosphor-icons/react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import { useMemo, useState, type ComponentPropsWithRef, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ComponentPropsWithRef, type ReactNode } from 'react'
 import { num, pct, type BoardUnit, type Entity, type Rates, type Scope, type TraitChipData } from './api'
 import { Dropdown } from './interior/dropdown'
 import { useOptimisticLike } from './interior/like-burst'
+import { Popover } from './interior/popover'
 import { usePressDepth } from './interior/press-depth'
 import { SegmentedControl } from './interior/segmented-control'
 import { SortableTable, type SortableColumn } from './interior/sortable-table'
 import { Tooltip } from './interior/tooltip-group'
 import { BoardArt, TierBadge } from './art'
+import { fitTablePrefs, NO_PREFS, readTablePrefs, tableSort, writeTablePrefs, type PrefColumn, type TablePrefs } from './tablePrefs'
 import { TRAIT_STYLE, type Grade } from './tiers'
 
 // ---- Buttons ---------------------------------------------------------------------
@@ -222,14 +225,66 @@ export type Col<T> = {
   width?: string
 }
 
-/** interior.dev's sortable table: rows glide to their new position when the sort changes. */
-export function Table<T extends { id: string }>({ rows, cols, initial, desc = false, empty, label, rowHeight = 48, flush, minWidth = 640 }: {
+/** Keeps --topbar-h equal to the sticky top bar's height, so table headers stick just under it (it wraps when narrow). */
+let watchingTopbar = false
+function watchTopbar() {
+  const bar = document.querySelector<HTMLElement>('.topbar')
+  if (watchingTopbar || !bar) return
+  watchingTopbar = true
+  const set = () => document.documentElement.style.setProperty('--topbar-h', `${bar.offsetHeight}px`)
+  set()
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(set).observe(bar)
+}
+
+/** This table's saved columns and sort, read once per table id. Changes are written straight back. */
+function useTablePrefs(id: string) {
+  const [state, setState] = useState(() => ({ id, prefs: readTablePrefs(id) }))
+  const prefs = state.id === id ? state.prefs : readTablePrefs(id)
+  const save = useCallback((next: TablePrefs) => { setState({ id, prefs: next }); writeTablePrefs(id, next) }, [id])
+  return [prefs, save] as const
+}
+
+/** The column chooser at the end of a table's header. The first (name) column always shows. */
+function ColumnMenu({ cols, hidden, onChange, onReset, changed }: {
+  cols: { key: string; label: string }[]; hidden: string[]; onChange: (key: string, show: boolean) => void; onReset: () => void; changed: boolean
+}) {
+  return (
+    <Popover label="Columns" side="bottom" align="end" offset={8} triggerClassName="tbl-cols" className="tbl-cols-panel"
+      trigger={<><Columns size={15} aria-hidden /><span className="sr-only">Choose columns</span></>}>
+      <p className="tbl-cols-title">Show columns</p>
+      <ul className="tbl-cols-list">
+        {cols.map((c, i) => (
+          <li key={c.key}>
+            <label className="check">
+              <input type="checkbox" checked={i === 0 || !hidden.includes(c.key)} disabled={i === 0} onChange={(e) => onChange(c.key, e.target.checked)} />
+              {c.label}{i === 0 ? <span className="muted small">always shown</span> : null}
+            </label>
+          </li>
+        ))}
+      </ul>
+      <Button size="sm" variant="ghost" className="tbl-cols-reset" disabled={!changed} onClick={onReset}>Reset columns and sort</Button>
+    </Popover>
+  )
+}
+
+/**
+ * interior.dev's sortable table: rows glide to their new position when the sort changes. The header sticks under
+ * the top bar, and the player's column choice and sort are kept per table `id` (PRD 3 U9, src/ui/tablePrefs.ts).
+ */
+export function Table<T extends { id: string }>({ id, rows, cols, initial, desc = false, empty, label, rowHeight = 48, flush, minWidth = 640 }: {
+  /** Stable name the table's settings are saved under. Unique per table, never a unit or trait name. */
+  id: string
   rows: T[]; cols: Col<T>[]; initial: string; desc?: boolean; empty?: string; label: string; rowHeight?: number
   /** Narrowest the table may get before it scrolls sideways. Lower it for tables that sit in a half-width column. */
   minWidth?: number
   /** Drop the table's own frame, for when it already sits inside one (a tab panel). */
   flush?: boolean
 }) {
+  useEffect(watchTopbar, [])
+  const [saved, save] = useTablePrefs(id)
+  const known = useMemo<PrefColumn[]>(() => cols.map((c) => ({ id: c.key, sortable: !!c.sort })), [cols])
+  const prefs = fitTablePrefs(saved, known)
+  const sort = tableSort(prefs, known, { columnId: initial, direction: desc ? 'desc' : 'asc' })
   const columns = useMemo<SortableColumn<T>[]>(() => cols.map((c, i) => ({
     id: c.key,
     header: c.label,
@@ -240,14 +295,19 @@ export function Table<T extends { id: string }>({ rows, cols, initial, desc = fa
     value: c.sort,
     cell: c.render,
   })), [cols])
+  const hidden = prefs.hidden.join('\n') // a stable dependency: prefs is rebuilt every render
+  const shown = useMemo(() => columns.filter((c, i) => i === 0 || !hidden.split('\n').includes(c.id)), [columns, hidden])
   if (!rows.length && empty) return <p className="muted px-4 py-6">{empty}</p>
+  const menu = cols.length > 1 ? (
+    <ColumnMenu cols={cols} hidden={prefs.hidden} changed={prefs.hidden.length > 0 || prefs.sort !== undefined}
+      onChange={(key, show) => save({ ...prefs, hidden: show ? prefs.hidden.filter((h) => h !== key) : [...prefs.hidden, key] })}
+      onReset={() => save(NO_PREFS)} />
+  ) : undefined
   return (
-    <div className="overflow-x-auto">
-      <div style={{ minWidth }}>
-      <SortableTable rows={rows} columns={columns} getRowId={(r) => r.id} label={label} rowHeight={rowHeight}
-        defaultSort={{ columnId: initial, direction: desc ? 'desc' : 'asc' }} className={`${flush ? '!rounded-none !border-0 !bg-transparent !shadow-none' : ''}`} />
-      </div>
-    </div>
+    <SortableTable rows={rows} columns={shown} getRowId={(r) => r.id} label={label} rowHeight={rowHeight}
+      sort={sort} onSortChange={(next) => save({ ...prefs, sort: next })}
+      stickyTop="var(--topbar-h, 0px)" minWidth={minWidth} headerEnd={menu}
+      className={`${flush ? '!rounded-none !border-0 !bg-transparent !shadow-none' : ''}`} />
   )
 }
 

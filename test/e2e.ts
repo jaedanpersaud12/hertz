@@ -13,6 +13,7 @@ import Database from 'better-sqlite3'
 
 import { compareHash, pickForCompare, readCompare } from '../src/ui/compare'
 import { filterQuery, NO_FILTERS, readFilters, writeFilters } from '../src/ui/tierFilters'
+import { fitTablePrefs, NO_PREFS, readTablePrefs, tableKey, tableSort, writeTablePrefs } from '../src/ui/tablePrefs'
 import { ARCHETYPES, idsByPlayer, ITEMS, matches, otherModeMatches, rankedMatches, startFakeCdragon, startFakeRiot, UNITS, archetypeOf } from './world'
 
 const root = join(import.meta.dirname, '..')
@@ -410,6 +411,39 @@ try {
     assert.equal(filterQuery({ ...NO_FILTERS, item: 'A|B', playstyle: 'fast' }), 'item=A%7CB&playstyle=fast')
     assert.deepEqual(readFilters('?unit=a&rising=yes'), { ...NO_FILTERS, unit: 'a' })
     ok('filter state round-trips through the page URL')
+
+    // Each table's columns and sort (PRD 3 U9) are kept per table id in local storage (src/ui/tablePrefs.ts).
+    const mem = new Map<string, string>()
+    const store = { getItem: (k: string) => mem.get(k) ?? null, setItem: (k: string, v: string) => void mem.set(k, v), removeItem: (k: string) => void mem.delete(k) }
+    const unitCols = ['name', 'cost', 'place', 'win', 'games'].map((id) => ({ id, sortable: id !== 'cost' }))
+    const unitDefault = { columnId: 'place', direction: 'asc' as const }
+    assert.deepEqual(readTablePrefs('units', store), NO_PREFS, 'nothing stored: defaults')
+    writeTablePrefs('units', { hidden: ['win'], sort: { columnId: 'games', direction: 'desc' } }, store)
+    writeTablePrefs('items', { hidden: ['cost'] }, store)
+    assert.deepEqual(readTablePrefs('units', store), { hidden: ['win'], sort: { columnId: 'games', direction: 'desc' } }, 'a write reads back')
+    assert.deepEqual(readTablePrefs('items', store), { hidden: ['cost'] }, 'tables are independent')
+    assert.deepEqual(tableSort(readTablePrefs('units', store), unitCols, unitDefault), { columnId: 'games', direction: 'desc' })
+    assert.deepEqual(tableSort(readTablePrefs('items', store), unitCols, unitDefault), unitDefault, 'no saved sort: the default')
+    assert.deepEqual(tableSort({ hidden: ['games'], sort: { columnId: 'games', direction: 'desc' } }, unitCols, unitDefault), unitDefault, 'sorted column hidden: the default')
+    assert.equal(tableSort({ hidden: ['place'] }, unitCols, unitDefault), null, 'default column hidden too: original order')
+    assert.equal(tableSort({ hidden: [], sort: null }, unitCols, unitDefault), null, 'original order chosen: kept')
+    // A column that no longer exists, the name column, and a sort that cannot apply are dropped.
+    assert.deepEqual(fitTablePrefs({ hidden: ['gone', 'name', 'win', 'win'], sort: { columnId: 'gone', direction: 'asc' } }, unitCols), { hidden: ['win'] })
+    assert.deepEqual(fitTablePrefs({ hidden: [], sort: { columnId: 'cost', direction: 'asc' } }, unitCols), { hidden: [] }, 'unsortable column')
+    assert.deepEqual(fitTablePrefs({ hidden: [], sort: null }, unitCols), { hidden: [], sort: null })
+    // Corrupt or odd entries, and a store that throws, fall back to the defaults.
+    for (const bad of ['{', '"x"', '[1]', 'null', '{"hidden":"win","sort":{"columnId":3}}', '{"hidden":[1,"win"],"sort":{"columnId":"games","direction":"up"}}']) {
+      mem.set(tableKey('bad'), bad)
+      const got = readTablePrefs('bad', store)
+      assert.ok(Array.isArray(got.hidden) && got.hidden.every((h) => typeof h === 'string') && got.sort === undefined, `${bad} -> ${JSON.stringify(got)}`)
+    }
+    const broken = { getItem: () => { throw new Error('blocked') }, setItem: () => { throw new Error('full') }, removeItem: () => { throw new Error('blocked') } }
+    assert.deepEqual(readTablePrefs('units', broken), NO_PREFS)
+    writeTablePrefs('units', { hidden: ['win'] }, broken)
+    assert.deepEqual(readTablePrefs('units', null), NO_PREFS, 'no storage at all')
+    writeTablePrefs('units', { hidden: [] }, store)
+    assert.equal(mem.has(tableKey('units')), false, 'back to defaults clears the entry')
+    ok('table settings: kept per table id, stale columns ignored, corrupt or missing storage falls back to defaults')
 
     // The dev stress switch covers the new fields.
     const worst = await get('/api/comps?data=worst')

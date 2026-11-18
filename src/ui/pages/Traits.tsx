@@ -50,7 +50,7 @@ function TraitList() {
         <span className="toolbar-note">{count(view === 'overall' ? rows.length : byLevel.length, 'row')}</span>
       </div>
       {!rows.length ? <Empty scope={data} what="No trait" /> : view === 'overall' ? (
-        <Table key="overall" label="Traits" rows={rows} initial="place" cols={[
+        <Table key="overall" id="traits" label="Traits" rows={rows} initial="place" cols={[
           { key: 'name', label: 'Trait', sort: (r) => r.name, render: (r) => <a className="name" href={traitLink(r)}><Icon e={r} size={26} plain /><span>{r.name}</span></a> },
           { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByPlace(r.avgPlace)} />, width: '60px' },
           ...rateCols<TraitRow>(),
@@ -64,7 +64,7 @@ function TraitList() {
           ) },
         ]} />
       ) : (
-        <Table key="level" label="Traits by breakpoint" rows={byLevel} initial="place" cols={[
+        <Table key="level" id="traits-breakpoints" label="Traits by breakpoint" rows={byLevel} initial="place" cols={[
           { key: 'name', label: 'Trait', sort: (r) => `${r.name} ${String(r.units).padStart(2, '0')}`, render: (r) => <a className="name" href={traitLink({ ...r, id: r.id.split('|')[0] })}><Icon e={r} size={26} plain /><b className="units-count">{r.units}</b><span>{r.name}</span></a> },
           { key: 'grade', label: 'Tier', render: (r) => <GradeChip grade={gradeByPlace(r.avgPlace)} />, width: '60px' },
           ...rateCols<LevelRow>(),
@@ -126,7 +126,7 @@ function Trait({ id }: { id: string }) {
           <UsualUnits set={one.set} setData={data.setData} />
         </section>
       ) : (
-        <Table label={`${t.name} by breakpoint`} rows={data.levels} initial="level" rowHeight={60} cols={[
+        <Table id="trait-breakpoints" label={`${t.name} by breakpoint`} rows={data.levels} initial="level" rowHeight={60} cols={[
           { key: 'level', label: 'Breakpoint', sort: (r) => r.level, render: (r) => <span className={thin(r) ? 'thin' : undefined}><b className="units-count">{r.units}</b> {t.name}</span>, width: 'minmax(150px, 1fr)' },
           { key: 'place', label: 'Avg place', sort: (r) => r.avgPlace, render: (r) => <span className={thin(r) ? 'thin' : undefined}><PlaceRail value={r.avgPlace} /></span>, width: '150px' },
           { key: 'pick', label: 'Pick rate', sort: (r) => r.frequency, render: (r) => <span className={thin(r) ? 'thin' : undefined}>{pct(r.frequency)}</span>, align: 'right', width: '100px' },
