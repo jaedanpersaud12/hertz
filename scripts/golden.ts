@@ -1061,11 +1061,6 @@ async function writeSection(from: string, bare: string) {
 // ---- Section 5: the dev stress switch ----------------------------------------------------
 
 /**
- * `tft serve --dev` (PORT + 1, no built app) answers main URLs with ?data=worst | empty | one | many, and no mode,
- * an unknown one, an upper-case one and a repeated one. Your account and lists are loaded, so every field the
- * switch reshapes is hit. The times it makes from Date.now() are written as "now-<days>d".
- */
-/**
  * Test hook, off unless GOLDEN_STRESS_ALIGN is set: waits until WORLD_NOW + that many ms (plus whole minutes,
  * if that has passed) before the plain pass, to check the stress answers at a chosen moment of the run.
  */
@@ -1076,6 +1071,11 @@ async function alignToWorld(ms: number) {
   console.log(`  (GOLDEN_STRESS_ALIGN: plain pass starts ${Date.now() - WORLD_NOW} ms after WORLD_NOW)`)
 }
 
+/**
+ * `tft serve --dev` (PORT + 1, no built app) answers main URLs with ?data=worst | empty | one | many, and no mode,
+ * an unknown one, an upper-case one and a repeated one. Your account and lists are loaded, so every field the
+ * switch reshapes is hit. The times it makes from Date.now() are written as "now-<days>d".
+ */
 async function stressSection(from: string, cwd: string) {
   const path = join(dir, 'stress.db')
   copyFileSync(from, path)
