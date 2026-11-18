@@ -125,6 +125,7 @@ pub fn build_stats_with(conn: &mut Connection, patch_count: i64, log: &mut dyn F
     }
     finish_trends(conn, &rebuilt)?;
     conn.execute_batch("PRAGMA optimize")?;
+    explorer_index(conn, &patches, log);
     Ok(())
 }
 
@@ -208,7 +209,31 @@ pub fn build_stats_incremental_with(
     } else {
         finish_trends(conn, &touched)?;
     }
+    explorer_index(conn, &patches, log);
     Ok(touched)
+}
+
+/// Brings the Explorer index (PRD 4 X5) of each patch up to date: boards stored since the last file are added to
+/// it, or it is built whole. One file per patch next to the database; nothing for a database in memory. A problem
+/// here never fails the stats build: the Explorer answers from SQL until a file is written.
+fn explorer_index(conn: &Connection, patches: &[String], log: &mut dyn FnMut(&str)) {
+    let Some(path) = conn.path().filter(|p| !p.is_empty()) else { return };
+    let dir = tft_explore::index_dir(std::path::Path::new(path));
+    for patch in patches {
+        let t0 = Instant::now();
+        match tft_explore::refresh(conn, &dir, patch) {
+            Ok(r) => {
+                let what = match r.kind {
+                    tft_explore::RefreshKind::Empty => continue,
+                    tft_explore::RefreshKind::Current => "up to date".to_string(),
+                    tft_explore::RefreshKind::Appended => format!("{} boards added", r.added),
+                    tft_explore::RefreshKind::Full => "built in full".to_string(),
+                };
+                log(&format!("Explorer index for patch {patch}: {} boards, {what}, {:.1} s", r.rows, t0.elapsed().as_secs_f64()));
+            }
+            Err(e) => log(&format!("Explorer index for patch {patch} not written ({e:#}). The Explorer answers from the database instead.")),
+        }
+    }
 }
 
 enum Plan {

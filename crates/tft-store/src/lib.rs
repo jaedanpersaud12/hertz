@@ -8,7 +8,7 @@ pub mod schema;
 mod settings;
 
 pub use health::{
-    ERROR, Health, LOG_CAP, LogEntry, QueueDepth, RegionHealth, WARN, health, health_at, log_event, log_event_at,
+    ERROR, Health, LOG_CAP, LogEntry, QueueDepth, RegionHealth, SLOW, WARN, health, health_at, log_event, log_event_at,
 };
 pub use ingest::{Ingest, relabel_unknown};
 pub use prune::{Compacted, Pruned, compact, prune_old_patches};

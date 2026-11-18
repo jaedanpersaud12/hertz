@@ -7,7 +7,8 @@
  * 1. `tft crawl --once` stores matches and builds the stats before it exits.
  * 2. `tft stats --incremental` rebuilds nothing when nothing is new, and only the touched scopes after one
  *    low-rank match is added.
- * 3. `tft health` prints its numbers.
+ * 3. `tft health` prints its numbers, and `tft explore-bench` times the Explorer index and finds it gives the SQL
+ *    answers (PRD 4 X5).
  * 4. `tft run` serves /api/meta while it crawls, and stops on Ctrl+C (SIGINT) within a few seconds.
  * 5. `tft run` without a Riot API key says so and keeps serving.
  *
@@ -147,6 +148,8 @@ try {
     const kinds = scopes.map((s) => s.split('/')[1]).sort()
     check(inc.code === 0 && line !== null && Number(line[1]) === scopes.length, `reports the scopes it rebuilt: ${line?.[2] ?? '(none)'}`, inc.out)
     check(patches.size === 1 && kinds.join(',') === 'ALL,ALL@3d', 'only the ALL scopes of one patch', `got ${scopes.join(', ')}`)
+    // PRD 4 X5: the Explorer index of that patch gets the new match's 8 boards added, not a full rebuild.
+    check(/^Explorer index for patch \S+: \d+ boards, 8 boards added, /m.test(inc.out), 'the Explorer index gets the 8 new boards added', inc.out)
 
     const full = await run(['stats'], env)
     check(full.code === 0 && !full.out.includes('Rebuilt'), 'without --incremental: the full rebuild, as before', full.out)
@@ -162,6 +165,18 @@ try {
     check(/^Matches waiting to be fetched: \d+/m.test(h.out), 'queue depth', h.out)
     check(/^Last problem/m.test(h.out), 'last problem line', h.out)
     check(/^Stats built .* \(\d+ minutes old\)\.$/m.test(h.out), 'stats age', h.out)
+  }
+
+  // ---- 3b. tft explore-bench (PRD 4 X5) ----------------------------------------------------
+  console.log('\ntft explore-bench: times the Explorer, and checks the index against SQL')
+  {
+    const r = await run(['explore-bench', '--queries', '200', '--sql', '200'], baseEnv(db, { RIOT_API_KEY: '' }))
+    check(r.code === 0, 'exits 0', r.out.slice(-2000))
+    check(/^ {2}index file +[\d.]+ MiB/m.test(r.out) && /^ {2}first question +[\d.]+ ms/m.test(r.out), 'prints the file size and time to first question', r.out)
+    check(/^ {2}200 questions +p50 [\d.]+ ms, p95 [\d.]+ ms, max [\d.]+ ms/m.test(r.out), 'prints p50, p95 and max over 200 questions', r.out)
+    check(/same 200 from SQL .* every answer identical$/m.test(r.out), 'the index gives the SQL answers to all 200', r.out)
+    const none = await run(['explore-bench'], baseEnv(join(dir, 'none.db'), { RIOT_API_KEY: '' }))
+    check(none.code !== 0 && none.out.includes('No database at'), 'says so when there is no database', none.out)
   }
 
   // ---- 4. tft run ------------------------------------------------------------------------

@@ -8,6 +8,8 @@ mod comp_admin;
 mod describe;
 mod difficulty;
 mod engine;
+#[cfg(test)]
+mod explore_http_tests;
 pub mod js;
 mod jsval;
 mod me;
@@ -60,6 +62,10 @@ struct App {
     config: Config,
     /// `--dev`: the `?data=` stress switch is on.
     dev: bool,
+    /// The Explorer index per patch (PRD 4 X5).
+    explorer: Arc<tft_explore::Explorer>,
+    /// Explorer questions that take at least this long are logged for the Data page.
+    slow_ms: u64,
 }
 
 pub struct Options {
@@ -69,6 +75,30 @@ pub struct Options {
     pub config: Config,
     /// `npm run dev`: no built app, and `?data=worst | empty | one | many` reshapes GET `/api/*` answers.
     pub dev: bool,
+}
+
+/// One `GET /api/explore?<query>` answer exactly as the app gives it, from `index` (or from SQL with None), and
+/// which of the two answered. For `tft explore-bench`.
+pub fn explore_answer(
+    conn: &Connection,
+    query: &str,
+    index: Option<Arc<tft_explore::Index>>,
+) -> Result<(serde_json::Value, &'static str)> {
+    let (body, source) = routes::explore_using(conn, Some(query), &|_| index.clone())?;
+    Ok((serde_json::Value::Object(body), source.as_str()))
+}
+
+/// The patch `/api/explore` answers for when no patch is asked for: the newest with stats.
+pub fn default_patch(conn: &Connection) -> Result<String> {
+    Ok(routes::scope(conn, None)?.patch)
+}
+
+/// An index not used for this long is let go of (PRD 4: released after 5 idle minutes).
+const IDLE_RELEASE: Duration = Duration::from_secs(300);
+
+/// `HERTZ_SLOW_QUERY_MS` (default 500): Explorer questions at least this slow are logged.
+fn slow_query_ms() -> u64 {
+    std::env::var("HERTZ_SLOW_QUERY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(routes::SLOW_QUERY_MS)
 }
 
 /// Opens (or creates) the database, then serves the API and the built app on 127.0.0.1 until stopped.
@@ -95,6 +125,21 @@ pub async fn serve(opts: Options) -> Result<()> {
         me,
         config: opts.config.clone(),
         dev: opts.dev,
+        explorer: tft_explore::Explorer::new(&opts.db_path, tft_explore::Mode::from_env()),
+        slow_ms: slow_query_ms(),
+    });
+    // The newest patch's index is opened (or built in the background) before the first question, so the Explorer
+    // starts fast; indexes nobody asked about for five minutes are let go.
+    let newest = routes::scope(&app.write.lock().unwrap(), None)?.patch;
+    let explorer = Arc::clone(&app.explorer);
+    tokio::task::spawn_blocking(move || explorer.get(&newest)).await?;
+    let explorer = Arc::clone(&app.explorer);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            explorer.release_idle(IDLE_RELEASE);
+        }
     });
     let router = axum::Router::new().fallback(handle).with_state(app);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", opts.port))
@@ -141,6 +186,7 @@ enum Route {
     Traits,
     Trait(String),
     Explore,
+    SlowQueries,
     Lists,
     Health,
     CrawlSettings,
@@ -166,6 +212,7 @@ fn route(path: &str) -> Option<Route> {
         ["", "api", "traits"] => Route::Traits,
         ["", "api", "traits", id] if !id.is_empty() => Route::Trait(p(id)),
         ["", "api", "explore"] => Route::Explore,
+        ["", "api", "slow-queries"] => Route::SlowQueries,
         ["", "api", "lists"] => Route::Lists,
         ["", "api", "health"] => Route::Health,
         ["", "api", "settings", "crawl"] => Route::CrawlSettings,
@@ -299,6 +346,9 @@ async fn answer(app: Arc<App>, req: Request<Body>) -> Response {
             if let Route::Icon(kind, id) = r {
                 return icon(&app, &kind, &id).await.unwrap_or_else(server_error);
             }
+            if let Route::Explore = r {
+                return explore(&app, query).await.unwrap_or_else(server_error);
+            }
             let app2 = app.clone();
             let result = tokio::task::spawn_blocking(move || -> Result<Obj> {
                 let conn = app2.pool.take()?;
@@ -317,7 +367,8 @@ async fn answer(app: Arc<App>, req: Request<Body>) -> Response {
                     Route::Item(id) => routes::item(&conn, q, &id),
                     Route::Traits => routes::traits(&conn, q),
                     Route::Trait(id) => routes::trait_detail(&conn, q, &id),
-                    Route::Explore => routes::explore(&conn, q),
+                    Route::Explore => unreachable!(),
+                    Route::SlowQueries => routes::slow_queries(&conn, &app2.explorer, app2.slow_ms),
                     Route::Lists => routes::lists(&conn),
                     Route::Health => engine::health(&conn, &app2.config),
                     Route::CrawlSettings => engine::get_settings(&conn, &app2.config),
@@ -346,6 +397,32 @@ async fn answer(app: Arc<App>, req: Request<Body>) -> Response {
         };
     }
     not_found()
+}
+
+/// `GET /api/explore`: answered from the index when the patch has one, from SQL otherwise. A question that takes
+/// [`App::slow_ms`] or longer is written to the engine log afterwards, off the answer's path.
+async fn explore(app: &Arc<App>, query: Option<String>) -> Result<Response> {
+    let app2 = app.clone();
+    let q = query.clone();
+    let (body, source, took) = tokio::task::spawn_blocking(move || -> Result<(Obj, routes::Source, u64)> {
+        let t0 = std::time::Instant::now();
+        let conn = app2.pool.take()?;
+        let explorer = Arc::clone(&app2.explorer);
+        let out = routes::explore_using(&conn, q.as_deref(), &|p| explorer.get(p));
+        app2.pool.give(conn);
+        let (body, source) = out?;
+        Ok((body, source, t0.elapsed().as_millis() as u64))
+    })
+    .await??;
+    if took >= app.slow_ms && source != routes::Source::None {
+        let (db, entry) = (Arc::clone(&app.write), routes::slow_entry(&body, query.as_deref(), source, took));
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = tft_store::log_event(&db.lock().unwrap(), "explore", tft_store::SLOW, &entry) {
+                eprintln!("Could not log a slow Explorer question: {e:#}");
+            }
+        });
+    }
+    Ok(json(body))
 }
 
 /// Icons are downloaded from Community Dragon once, then served from disk.

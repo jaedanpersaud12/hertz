@@ -9,7 +9,8 @@ in `test/golden/` (see Checks). Plan: `docs/plan/prd-01-rust-engine.md`.
 | `tft-core` | Settings, Riot response shapes, comp labels, patch dating, dictionary string order | Done |
 | `tft-store` | SQLite schema, migrations, storing matches, health, pruning | Done |
 | `tft-riot` | Riot client, per-region rate limiter, Community Dragon, the crawler and its supervisor | Done |
-| `tft-stats` | Aggregation, comp merging, incremental builds (`tft stats`) | Done; Explorer index comes in E5 |
+| `tft-stats` | Aggregation, comp merging, incremental builds (`tft stats`); writes the Explorer index | Done |
+| `tft-explore` | The Explorer index (PRD 4 X5): one memory-mapped file of board rows and Roaring bitmaps per patch | Session 1 of 5 |
 | `tft-api` | The `/api` routes the React app calls, the built app, and the dev-only `?data=` stress switch | Done |
 | `tft-cli` | The `tft` command | Done |
 
@@ -34,6 +35,7 @@ target/release/tft serve --dev            # the API alone on PORT+1, behind Vite
 target/release/tft refresh                # download the patch calendar and the set data (names, icons) now
 target/release/tft recluster              # label every stored board with its comp again, then run tft stats
 target/release/tft health                 # matches per hour per server, matches waiting, the last problem, stats age
+target/release/tft explore-bench --sql 20 # time the Explorer index (p50, p95, max, size, first question), check it against SQL
 target/release/tft patches                # download the patch calendar, date matches stored without one
 target/release/tft ingest saved.json      # store saved match files
 target/release/tft --help                 # every command; `tft <command> --help` for its options

@@ -16,6 +16,9 @@ pub const LOG_CAP: i64 = 10_000;
 
 pub const WARN: &str = "warn";
 pub const ERROR: &str = "error";
+/// An Explorer question that took longer than it should (PRD 4 X5): region `explore`, the message a JSON object.
+/// Not a problem with the crawl, so it never shows as the last problem.
+pub const SLOW: &str = "slow";
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -67,7 +70,7 @@ pub struct Health {
     /// Every server that stored a match in the last 24 hours or has matches queued, by name.
     pub per_region: Vec<RegionHealth>,
     pub queue_depth_per_region: Vec<QueueDepth>,
-    /// The newest warning or error in the engine log.
+    /// The newest warning or error in the engine log (slow Explorer questions are not problems).
     pub last_error: Option<LogEntry>,
     /// When the stat tables were last built (ms), from `stat_meta`.
     pub stats_built_at: Option<i64>,
@@ -118,7 +121,7 @@ pub fn health_at(conn: &Connection, now: i64) -> Result<Health> {
     let last_error = conn
         .query_row(
             "SELECT at, COALESCE(region, ''), COALESCE(level, ''), COALESCE(message, '') FROM engine_log
-             ORDER BY rowid DESC LIMIT 1",
+             WHERE level IS NOT 'slow' ORDER BY rowid DESC LIMIT 1",
             [],
             |r| Ok(LogEntry { at: r.get(0)?, region: r.get(1)?, level: r.get(2)?, message: r.get(3)? }),
         )
@@ -235,6 +238,17 @@ mod tests {
         assert_eq!(h.stats_built_at, Some(NOW - 25 * MIN - 30_000), "the newest build of any scope");
         assert_eq!(h.stats_age_minutes, Some(25));
         assert_eq!(h.newest_match_at, Some(NOW));
+    }
+
+    #[test]
+    fn slow_explorer_questions_are_not_the_last_problem() {
+        let conn = db();
+        log_event_at(&conn, NOW - 5 * MIN, "americas", WARN, "Riot asked us to slow down.").unwrap();
+        log_event_at(&conn, NOW - MIN, "explore", SLOW, "{\"ms\":900}").unwrap();
+        let last = health_at(&conn, NOW).unwrap().last_error.unwrap();
+        assert_eq!((last.level.as_str(), last.message.as_str()), (WARN, "Riot asked us to slow down."));
+        conn.execute("DELETE FROM engine_log WHERE level = 'warn'", []).unwrap();
+        assert_eq!(health_at(&conn, NOW).unwrap().last_error, None, "only slow questions: no problem");
     }
 
     #[test]

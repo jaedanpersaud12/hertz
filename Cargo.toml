@@ -15,6 +15,7 @@ tft-store = { path = "crates/tft-store" }
 tft-riot = { path = "crates/tft-riot" }
 tft-stats = { path = "crates/tft-stats" }
 tft-api = { path = "crates/tft-api" }
+tft-explore = { path = "crates/tft-explore" }
 
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
@@ -22,7 +23,10 @@ clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 futures = "0.3"
 httpdate = "1"
+# The Explorer index (PRD 4 X5): the index file is memory-mapped, its bitmaps are Roaring bitmaps (pure Rust).
+memmap2 = "0.9"
 regex = "1"
+roaring = "0.11"
 # TLS through rustls with the ring backend: builds on Windows, macOS and Linux without CMake, NASM or OpenSSL.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2"] }
 rusqlite = { version = "0.41", features = ["bundled"] }

@@ -83,8 +83,14 @@ npm run crawl            collect matches only; leave it running, Ctrl+C to stop,
 npm run stats            rebuild the numbers the app shows (safe while a crawl is running)
 npm run tft -- refresh   download the patch calendar and the set data now
 npm run tft -- health    matches per hour per server, matches waiting, the last problem, how old the stats are
+npm run tft -- explore-bench   time the Explorer on your database: index size, time to first question, p50/p95/max
 npm run tft -- --help    every engine command
 ```
+
+The stats step also writes the Explorer's index, one file per patch in `data/tft.db.explore/` (PRD 4 X5). The
+app answers Explorer questions from it, and from the database while a patch has none. To measure it on your own
+database, run `npm run tft -- explore-bench --sql 20` (it also answers 20 questions the old way and checks the
+answers are the same); `--patch 16.22` picks a patch, `--queries 500` asks more questions.
 
 `npm run tft -- <command>` builds the engine if needed and runs `target/release/tft <command>`
 (`tft.exe` on Windows). You can also run that file directly.

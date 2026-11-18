@@ -290,6 +290,8 @@ mod tests {
             me,
             config,
             dev: false,
+            explorer: tft_explore::Explorer::new(&db, tft_explore::Mode::Wait),
+            slow_ms: crate::routes::SLOW_QUERY_MS,
         });
         (app, dir)
     }

@@ -267,7 +267,8 @@ try {
   db.close()
 
   // 5. The app's API
-  const api = spawn(bin, ['serve', '--dev'], { env: { ...process.env, ...env } }) // PORT + 1, as behind Vite
+  // PORT + 1, as behind Vite. Every Explorer question counts as slow (threshold 0 ms), so the slow-question log fills.
+  const api = spawn(bin, ['serve', '--dev'], { env: { ...process.env, ...env, HERTZ_SLOW_QUERY_MS: '0' } })
   let apiOut = ''
   api.stdout.on('data', (d) => (apiOut += d)); api.stderr.on('data', (d) => (apiOut += d))
   try {
@@ -648,6 +649,28 @@ try {
     const withTrait = await get(`/api/explore?units=${UNITS[12].id}&traits=TFT99_Sniper`)
     assert.equal(withTrait.summary.games, boards.filter((b: any) => b.arch === 3 && b.units.some((x: any) => x.character_id === UNITS[12].id)).length)
     ok('explorer answers "boards with these units and traits" and matches a recount')
+
+    // PRD 4 X5: the stats step wrote an index for the newest patch, the Explorer answered from it, and both
+    // questions were logged as slow (threshold forced to 0 ms) with what was asked. The log is written just after
+    // each answer, so it is read until both are there.
+    let slow: any = null
+    for (let i = 0; i < 50 && !(slow?.queries.length >= 2); i++) {
+      slow = await get('/api/slow-queries')
+      if (slow.queries.length < 2) await new Promise((r) => setTimeout(r, 100))
+    }
+    assert.equal(slow.thresholdMs, 0)
+    assert.equal(slow.queries.length, 2)
+    assert.deepEqual(slow.queries.map((q: any) => q.source), ['index', 'index'])
+    assert.deepEqual(slow.queries[0].units.map((u: any) => u.id), [UNITS[12].id])
+    assert.deepEqual(slow.queries[0].traits.map((t: any) => t.id), ['TFT99_Sniper'])
+    assert.deepEqual(slow.queries[1].units.map((u: any) => u.id), [UNITS[17].id, UNITS[16].id])
+    assert.equal(slow.queries[1].games, pairQ.summary.games)
+    assert.ok(typeof slow.queries[0].units[0].name === 'string' && slow.queries[0].units[0].name.length > 0)
+    assert.ok(slow.indexes.some((i: any) => i.patch === meta.patch && i.state === 'ready' && i.boards >= meta.comps), JSON.stringify(slow.indexes))
+    assert.notEqual((await get('/api/health')).lastProblem?.level, 'slow')
+    assert.equal((await get('/api/slow-queries?data=worst')).queries.length, 50)
+    assert.deepEqual((await get('/api/slow-queries?data=empty')).queries, [])
+    ok('slow Explorer questions are logged and listed for the Data page; both were answered from the index')
 
     assert.deepEqual((await post('/api/lists/mark', { key: vanguard.id, fav: true })).favs, [vanguard.id])
     assert.equal((await post('/api/lists/pin', { key: vanguard.id })).pinned, vanguard.id)

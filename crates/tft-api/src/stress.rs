@@ -743,6 +743,52 @@ fn stress_settings(mode: Option<&str>, mut body: Obj) -> Obj {
     body
 }
 
+/// Reshapes `/api/slow-queries` (PRD 4 X5): the most rows and the longest of everything under worst, none under empty.
+fn stress_slow(mode: &str, mut body: Obj) -> Obj {
+    let now = now_ms_int();
+    let unit = |i: usize| json!({ "id": format!("TFT16_{i}"), "name": UNITS[i % UNITS.len()] });
+    let trait_ = |i: usize| json!({ "id": format!("TFT16_T{i}"), "name": TRAITS[i % TRAITS.len()] });
+    let entry = |i: usize, worst: bool| {
+        let (nu, nt) = if worst { (4, 3) } else { (1 + i % 3, i % 2) };
+        json!({
+            "at": if worst { now - 400 * 24 * HOUR } else { now - (i as i64 * 7 + 1) * 60_000 },
+            "ms": if worst { 98_765 } else { 500 + ((i * 137) % 1900) },
+            "source": if worst || i % 4 == 3 { "sql" } else { "index" },
+            "patch": "16.22",
+            "bucket": if worst { "MASTER+" } else { BUCKETS[i % BUCKETS.len()].key },
+            "window": if worst || i % 3 == 0 { "3d" } else { "" },
+            "units": (0..nu).map(|k| unit(i + k * 5)).collect::<Vec<_>>(),
+            "traits": (0..nt).map(|k| trait_(i + k * 3)).collect::<Vec<_>>(),
+            "games": if worst { json!(12_345_678) } else { json!((i * 311) % 4000) },
+        })
+    };
+    let index = |patch: &str, state: &str, boards: i64, problem: Option<&str>| {
+        json!({ "patch": patch, "state": state, "boards": (boards >= 0).then_some(boards), "bytes": (boards >= 0).then_some(boards * 101),
+            "builtAt": (boards >= 0).then_some(now - 35 * 60_000), "problem": problem })
+    };
+    let (queries, indexes): (Vec<Value>, Vec<Value>) = match mode {
+        "empty" => (vec![], vec![]),
+        "one" => (vec![entry(0, false)], vec![index("16.22", "ready", 1, None)]),
+        "many" => ((0..50).map(|i| entry(i, false)).collect(), vec![index("16.22", "ready", 8_000_000, None), index("16.21", "idle", 6_400_000, None)]),
+        "worst" => (
+            (0..50).map(|i| entry(i, true)).collect(),
+            vec![
+                index("16.22", "building", -1, None),
+                index("16.21", "failed", -1, Some("Explorer index for patch 16.21 could not be built: database is locked (the stats step held the write lock for longer than ten seconds while a very long rebuild ran)")),
+                index("16.20", "ready", 12_345_678, None),
+                index("16.19", "idle", 0, None),
+            ],
+        ),
+        _ => return body,
+    };
+    if mode == "worst" {
+        body.insert("thresholdMs".into(), json!(1));
+    }
+    body.insert("queries".into(), json!(queries));
+    body.insert("indexes".into(), json!(indexes));
+    body
+}
+
 /// Reshapes one answer for `mode`. Anything that is not a JSON object, or a mode that is not listed, is left alone.
 /// `/api/health` and `/api/settings/crawl` get their own datasets; every other route the ones `worstcase.ts` made.
 pub fn stress(mode: &str, path: &str, body: &mut Value) {
@@ -753,6 +799,11 @@ pub fn stress(mode: &str, path: &str, body: &mut Value) {
     if path == "/api/health" || path == "/api/settings/crawl" {
         let taken = std::mem::take(b);
         *b = if path == "/api/health" { stress_health(Some(mode), taken) } else { stress_settings(Some(mode), taken) };
+        return;
+    }
+    if path == "/api/slow-queries" {
+        let taken = std::mem::take(b);
+        *b = stress_slow(mode, taken);
         return;
     }
     match mode {

@@ -172,6 +172,102 @@ function RankAccuracy({ acc }: { acc: Health['rankAccuracy'] }) {
   )
 }
 
+// ---- Explorer speed (PRD 4 X5): /api/slow-queries in crates/tft-api/src/routes.rs -------------
+type Named = { id: string; name: string }
+type SlowQuery = {
+  at: number; ms: number; source: 'index' | 'sql'; patch: string; bucket: string; window: string
+  units: Named[]; traits: Named[]; games: number | null
+}
+type IndexRow = { patch: string; state: 'ready' | 'idle' | 'building' | 'failed'; boards: number | null; bytes: number | null; builtAt: number | null; problem: string | null }
+export type SlowQueries = { thresholdMs: number; mode: string; queries: SlowQuery[]; indexes: IndexRow[] }
+
+const STATE_LABEL: Record<IndexRow['state'], string> = { ready: 'In use', idle: 'On disk', building: 'Building', failed: 'Failed' }
+const SCOPE_LABEL: Record<string, string> = { ALL: 'All ranks', 'PLATINUM+': 'Platinum+', 'DIAMOND+': 'Diamond+', 'MASTER+': 'Master+' }
+const size = (b: number | null) => (b == null ? '–' : b < 1024 * 1024 ? `${num(Math.max(1, Math.round(b / 1024)))} KB` : b < 1024 ** 3 ? `${num(Math.round(b / 1024 ** 2))} MB` : `${(b / 1024 ** 3).toFixed(1)} GB`)
+const took = (ms: number) => (ms < 10_000 ? `${num(ms)} ms` : `${(ms / 1000).toFixed(1)} s`)
+
+const indexCols: Col<IndexRow & { id: string }>[] = [
+  { key: 'patch', label: 'Patch', sort: (r) => r.patch, width: 'minmax(110px, 1fr)', render: (r) => r.patch },
+  { key: 'state', label: 'Index', width: 'minmax(150px, 1.4fr)', render: (r) => (
+    <span className="server-cell">
+      <span><Tag kind={r.state === 'failed' ? 'error' : 'level'}>{STATE_LABEL[r.state] ?? r.state}</Tag></span>
+      {r.problem ? <span className="muted small problem-text" title={r.problem}>{r.problem}</span> : null}
+    </span>
+  ) },
+  { key: 'boards', label: 'Boards', sort: (r) => r.boards ?? -1, align: 'right', width: 'minmax(110px, 1fr)', render: (r) => (r.boards == null ? '–' : num(r.boards)) },
+  { key: 'size', label: 'File size', sort: (r) => r.bytes ?? -1, align: 'right', width: 'minmax(90px, 0.8fr)', render: (r) => size(r.bytes) },
+  { key: 'built', label: 'Written', sort: (r) => r.builtAt ?? 0, width: 'minmax(120px, 1fr)', render: (r) => (r.builtAt ? ago(r.builtAt) : '–') },
+]
+
+const slowCols: Col<SlowQuery & { id: string }>[] = [
+  { key: 'question', label: 'Question', width: 'minmax(220px, 2.4fr)', render: (r) => (
+    <span className="server-cell">
+      <span className="server-name truncate" title={r.units.map((u) => u.name).join(' + ')}>{r.units.map((u) => u.name).join(' + ') || 'No units'}</span>
+      <span className="muted small truncate">
+        {r.traits.length ? `with ${r.traits.map((t) => t.name).join(', ')}` : 'no traits'}
+      </span>
+    </span>
+  ) },
+  { key: 'scope', label: 'Scope', width: 'minmax(150px, 1.2fr)', render: (r) => (
+    <span className="server-cell">
+      <span>{r.patch || 'No patch'}</span>
+      <span className="muted small">{SCOPE_LABEL[r.bucket] ?? r.bucket}{r.window === '3d' ? ', last 3 days' : ''}</span>
+    </span>
+  ) },
+  { key: 'ms', label: 'Took', sort: (r) => r.ms, align: 'right', width: 'minmax(90px, 0.8fr)', render: (r) => took(r.ms) },
+  { key: 'from', label: 'Answered from', width: 'minmax(120px, 1fr)', render: (r) => <Tag kind="level">{r.source === 'index' ? 'Index' : 'Database'}</Tag> },
+  { key: 'games', label: 'Boards found', sort: (r) => r.games ?? -1, align: 'right', width: 'minmax(110px, 0.9fr)', render: (r) => (r.games == null ? '–' : num(r.games)) },
+  { key: 'at', label: 'When', sort: (r) => r.at, width: 'minmax(110px, 0.9fr)', render: (r) => ago(r.at) },
+]
+
+/** The Explorer's index per patch, and the questions that took longer than they should. */
+export function ExplorerSpeed() {
+  const { data, error, loading, reload } = useApi<SlowQueries>('/api/slow-queries')
+  useEffect(() => { const t = setInterval(reload, REFRESH_MS); return () => clearInterval(t) }, [reload])
+  const indexes = useMemo(() => (data?.indexes ?? []).map((r) => ({ ...r, id: r.patch })), [data])
+  const queries = useMemo(() => (data?.queries ?? []).map((r, i) => ({ ...r, id: `${r.at}-${i}` })), [data])
+
+  if (!data) {
+    return (
+      <>
+        <h3>Explorer speed</h3>
+        {error ? <Retry text="Could not load the Explorer's speed log. Check that the app's server is running, then try again." onRetry={reload} />
+          : <Status error={null} loading={loading} />}
+      </>
+    )
+  }
+  return (
+    <>
+      <h3>Explorer speed</h3>
+      <p className="lede">
+        The Explorer answers from an index file per patch, written with the stats. Any question that takes{' '}
+        {num(data.thresholdMs)} ms or more is listed below, newest first.
+      </p>
+      {indexes.length ? (
+        <Table rows={indexes} cols={indexCols} initial="built" desc label="Explorer index per patch" rowHeight={52} minWidth={560} />
+      ) : (
+        <div className="empty-note">
+          <p>No index yet, so the Explorer counts boards in the database, which is slower.</p>
+          <p className="muted small">Run <code>npm run stats</code> to write one, or open the Explorer and it is built in the background.</p>
+        </div>
+      )}
+      <div className="mt-4">
+        {queries.length ? (
+          <>
+            <Table rows={queries} cols={slowCols} initial="at" desc label="Slow Explorer questions" rowHeight={56} minWidth={760} />
+            <p className="muted small mt-2">The 50 newest. Answered from database means the patch had no index yet.</p>
+          </>
+        ) : (
+          <div className="empty-note">
+            <p>No slow questions.</p>
+            <p className="muted small">Every Explorer question so far took under {num(data.thresholdMs)} ms. Slower ones show up here.</p>
+          </div>
+        )}
+      </div>
+    </>
+  )
+}
+
 const same = (a: string[], b: string[]) => a.length === b.length && a.every((x) => b.includes(x))
 
 /** Which servers to crawl and which tiers to find players in. Saved in the database; the crawler reads it each round. */

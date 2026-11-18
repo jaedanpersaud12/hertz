@@ -150,6 +150,29 @@ enum Command {
         /// baseline or clusters. Leave out to show the current one.
         method: Option<String>,
     },
+    /// Time the Explorer on this database (PRD 4 X5): index size, time to first question, p50, p95 and max.
+    ///
+    /// Builds the patch's index first if it has none. Questions are a mix of one to four units, some with traits,
+    /// across rank buckets and both time windows, each answered exactly as the app answers it. Nothing is changed
+    /// in the database.
+    ExploreBench {
+        /// Patch to measure. Defaults to the newest with stats.
+        #[arg(long)]
+        patch: Option<String>,
+        /// How many questions to time.
+        #[arg(long, default_value_t = 300)]
+        queries: usize,
+        /// Also answer the first N questions from SQL (as before the index), to compare times and check the
+        /// answers are the same. Slow on a large database.
+        #[arg(long, default_value_t = 0)]
+        sql: usize,
+        /// Build the index from scratch first, even when one exists.
+        #[arg(long)]
+        rebuild: bool,
+        /// Seed for the question mix (the same seed asks the same questions).
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
 }
 
 fn main() {
@@ -362,7 +385,16 @@ async fn run(command: Command, config: Config) -> Result<()> {
         Command::Recluster => {
             let mut conn = tft_store::open(&config.db_path)?;
             recluster(&mut conn, &mut |line| println!("{line}"))?;
+            // The Explorer index holds each board's comp, so it is built again at the next stats run.
+            let index = tft_explore::index_dir(&config.db_path);
+            if let Err(e) = tft_explore::remove_all(&index) {
+                println!("Could not remove the Explorer index in {} ({e}). Stop the app, delete that folder, then run the stats.", index.display());
+            }
             println!("Done. Run \"npm run stats\" to rebuild the numbers.");
+        }
+
+        Command::ExploreBench { patch, queries, sql, rebuild, seed } => {
+            explore_bench(&config.db_path, patch, queries, sql, rebuild, seed)?;
         }
 
         Command::Patches => {
@@ -561,6 +593,192 @@ fn health_lines(h: &tft_store::Health, now: i64) -> Vec<String> {
 }
 
 /// 1234567 as "1,234,567", as `toLocaleString('en-US')` prints it.
+/// `tft explore-bench`. Prints what it measures as it goes, then a summary.
+fn explore_bench(db: &std::path::Path, patch: Option<String>, queries: usize, sql: usize, rebuild: bool, seed: u64) -> Result<()> {
+    use std::time::Instant;
+    use tft_explore::{Index, Kind, key};
+    if !db.exists() {
+        bail!("No database at {}. Give one with --db.", db.display());
+    }
+    let conn = tft_store::open(db)?;
+    let patch = match patch {
+        Some(p) => p,
+        None => tft_api::default_patch(&conn)?,
+    };
+    if patch.is_empty() {
+        bail!("No stats built yet, so there is no patch to measure. Run \"tft stats\" first, or give --patch.");
+    }
+    let boards: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM matches m JOIN participants pa ON pa.match_id = m.match_id WHERE m.patch = ?1",
+        [&patch],
+        |r| r.get(0),
+    )?;
+    println!("Patch {patch}: {} boards stored in {}", thousands(boards as usize), db.display());
+    if boards == 0 {
+        bail!("Patch {patch} has no boards.");
+    }
+
+    let dir = tft_explore::index_dir(db);
+    if rebuild {
+        for (_, p) in tft_explore::generations(&dir, &patch) {
+            std::fs::remove_file(&p).with_context(|| format!("removing {}", p.display()))?;
+        }
+    }
+    let t = Instant::now();
+    let r = tft_explore::refresh(&conn, &dir, &patch)?;
+    println!("Index: {:?}, {} boards, {:.1} s", r.kind, thousands(r.rows as usize), t.elapsed().as_secs_f64());
+    let path = r.path.context("no index file was written")?;
+
+    // Time to first question: map the file, then answer one question about the most played unit.
+    let t = Instant::now();
+    let ix = Arc::new(Index::open(&path)?);
+    let opened = t.elapsed();
+    let first_unit = ix.dir.units.first().cloned().unwrap_or_default();
+    let (_, source) = tft_api::explore_answer(&conn, &format!("units={}&patch={}", enc(&first_unit), enc(&patch)), Some(ix.clone()))?;
+    let first = t.elapsed();
+    if source != "index" {
+        bail!("the first question was answered from {source}, not the index");
+    }
+
+    // The question mix. Units are picked by how often they are played; each further unit is one of the ten most
+    // common partners of the units so far, as people explore.
+    let freq: Vec<u64> = (0..ix.dir.units.len()).map(|u| ix.bitmap(key(Kind::Unit, u as u32, 0)).len()).collect();
+    let tfreq: Vec<u64> = (0..ix.dir.traits.len()).map(|t| ix.bitmap(key(Kind::Trait, t as u32, 0)).len()).collect();
+    let mut rng = seed.max(1);
+    let mut next = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n.max(1)
+    };
+    let weighted = |w: &[u64], roll: u64| -> usize {
+        let total: u64 = w.iter().sum();
+        let mut at = roll % total.max(1);
+        for (i, x) in w.iter().enumerate() {
+            if at < *x {
+                return i;
+            }
+            at -= x;
+        }
+        0
+    };
+    let buckets = ["ALL", "PLATINUM%2B", "DIAMOND%2B", "MASTER%2B"];
+    let mut questions = Vec::with_capacity(queries);
+    for _ in 0..queries {
+        let n_units = [1, 1, 1, 1, 2, 2, 2, 3, 3, 4][next(10) as usize];
+        let mut units = vec![ix.dir.units[weighted(&freq, next(u64::MAX))].clone()];
+        while units.len() < n_units {
+            let a = ix.explore(&tft_explore::Query {
+                units: &units,
+                traits: &[],
+                rank_min: 0,
+                since: 0,
+                ranked_queue: 1100,
+                partner_limit: 14,
+                item_limit: 0,
+            });
+            let options: Vec<&String> = a.partners.iter().map(|(n, _)| n).filter(|n| !units.contains(n)).take(10).collect();
+            if options.is_empty() {
+                break;
+            }
+            units.push(options[next(options.len() as u64) as usize].clone());
+        }
+        let mut q = format!("units={}&patch={}", units.iter().map(|u| enc(u)).collect::<Vec<_>>().join(","), enc(&patch));
+        if next(5) == 0 && !tfreq.is_empty() {
+            let traits: Vec<String> = (0..1 + next(3)).map(|_| enc(&ix.dir.traits[weighted(&tfreq, next(u64::MAX))])).collect();
+            q.push_str(&format!("&traits={}", traits.join(",")));
+        }
+        q.push_str(&format!("&bucket={}", buckets[next(4) as usize]));
+        if next(10) < 3 {
+            q.push_str("&window=3d");
+        }
+        questions.push(q);
+    }
+
+    let mut times = Vec::with_capacity(queries);
+    let mut found = 0;
+    let t_all = Instant::now();
+    for q in &questions {
+        let t = Instant::now();
+        let (body, source) = tft_api::explore_answer(&conn, q, Some(ix.clone()))?;
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+        if source != "index" {
+            bail!("{q} was answered from {source}, not the index");
+        }
+        if body["summary"]["games"].as_i64().unwrap_or(0) > 0 {
+            found += 1;
+        }
+    }
+    let wall = t_all.elapsed();
+    let pct = |xs: &[f64], p: f64| -> f64 {
+        let mut v = xs.to_vec();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v.get(((v.len() as f64 * p).ceil() as usize).saturating_sub(1).min(v.len().saturating_sub(1))).copied().unwrap_or(0.0)
+    };
+
+    let mut sql_times = Vec::new();
+    let mut differ = 0;
+    for q in questions.iter().take(sql) {
+        let t = Instant::now();
+        let (mut slow, _) = tft_api::explore_answer(&conn, q, None)?;
+        sql_times.push(t.elapsed().as_secs_f64() * 1000.0);
+        let (mut fast, _) = tft_api::explore_answer(&conn, q, Some(ix.clone()))?;
+        for b in [&mut slow, &mut fast] {
+            if let Some(o) = b.as_object_mut() {
+                o.remove("ms");
+            }
+        }
+        if slow != fast {
+            differ += 1;
+            println!("  different answers for {q}");
+        }
+    }
+
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    println!();
+    println!("Explorer benchmark, patch {patch}, {} boards", thousands(ix.dir.rows as usize));
+    println!("  index file          {:.1} MiB  ({})", mib(ix.bytes()), path.display());
+    println!("  open (map the file) {:.1} ms", opened.as_secs_f64() * 1000.0);
+    println!("  first question      {:.1} ms after opening began", first.as_secs_f64() * 1000.0);
+    println!(
+        "  {} questions       p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms ({} found boards; {:.1} s in all)",
+        times.len(),
+        pct(&times, 0.5),
+        pct(&times, 0.95),
+        pct(&times, 1.0),
+        found,
+        wall.as_secs_f64()
+    );
+    if !sql_times.is_empty() {
+        println!(
+            "  same {} from SQL    p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms; {}",
+            sql_times.len(),
+            pct(&sql_times, 0.5),
+            pct(&sql_times, 0.95),
+            pct(&sql_times, 1.0),
+            if differ == 0 { "every answer identical".to_string() } else { format!("{differ} answers differ") }
+        );
+    }
+    println!("  bitmaps read        {:.1} MiB on the heap", mib(ix.heap_bytes()));
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines().filter(|l| l.starts_with("VmRSS") || l.starts_with("VmHWM")) {
+            println!("  {}", line.split_whitespace().collect::<Vec<_>>().join(" "));
+        }
+    } else {
+        println!("  memory              see Task Manager for this process (not read on this system)");
+    }
+    println!("  cores               {}", std::thread::available_parallelism().map_or(1, |n| n.get()));
+    if differ > 0 {
+        bail!("{differ} answers from the index differ from SQL");
+    }
+    Ok(())
+}
+
+/// A query-string value, percent-encoded.
+fn enc(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"_.-".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
 fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();

@@ -18,6 +18,8 @@ mod comp_page;
 mod flex;
 mod items_page;
 mod unit_depth;
+#[cfg(test)]
+pub(crate) mod explore_tests;
 pub use unit_depth::{builds as unit_builds, pairs as unit_pairs, trait_detail};
 
 /// Time windows inside a patch, as `WINDOWS` in `src/config.ts`. '' is the whole patch.
@@ -691,25 +693,179 @@ pub fn item_components(conn: &Connection, q: Option<&str>) -> Result<Obj> {
 
 // ---- Explorer: live questions against the raw boards -----------------------------
 
-pub fn explore(conn: &Connection, q: Option<&str>) -> Result<Obj> {
-    let sc = scope(conn, q)?;
-    let ids = |key: &str, max: usize| -> Vec<String> {
-        js::query(q, key)
-            .unwrap_or_default()
-            .split(',')
-            .map(|x| x.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}').to_string())
-            .filter(|x| !x.is_empty())
-            .take(max)
-            .collect()
+/// Where an Explorer answer came from: the index (PRD 4 X5), the SQL joins (no index for the patch yet), or
+/// neither (no units asked for, or no boards found before any counting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Index,
+    Sql,
+    None,
+}
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Index => "index",
+            Source::Sql => "sql",
+            Source::None => "none",
+        }
+    }
+}
+
+/// `?units=` and `?traits=`: comma-separated, trimmed as JavaScript's `trim()` trims, empty entries dropped.
+fn explore_ids(q: Option<&str>, key: &str, max: usize) -> Vec<String> {
+    js::query(q, key)
+        .unwrap_or_default()
+        .split(',')
+        .map(|x| x.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}').to_string())
+        .filter(|x| !x.is_empty())
+        .take(max)
+        .collect()
+}
+
+/// Explorer questions at least this slow (ms) are logged for the Data page; `HERTZ_SLOW_QUERY_MS` changes it.
+pub const SLOW_QUERY_MS: u64 = 500;
+
+/// The engine log message for a slow question: what was asked, in which scope, how long it took and how it was
+/// answered.
+pub fn slow_entry(body: &Obj, q: Option<&str>, source: Source, ms: u64) -> String {
+    let games = body.get("summary").and_then(|s| s.get("games")).cloned().unwrap_or(Value::Null);
+    json!({
+        "ms": ms,
+        "source": source.as_str(),
+        "patch": g(body, "patch"),
+        "bucket": g(body, "bucket"),
+        "window": g(body, "window"),
+        "units": explore_ids(q, "units", 4),
+        "traits": explore_ids(q, "traits", 3),
+        "games": games,
+    })
+    .to_string()
+}
+
+/// `GET /api/slow-queries`: the 50 newest slow Explorer questions, the threshold, and each patch's index.
+pub fn slow_queries(conn: &Connection, explorer: &tft_explore::Explorer, threshold: u64) -> Result<Obj> {
+    let mut queries = Vec::new();
+    for r in rows(conn, "SELECT at, message FROM engine_log WHERE level = 'slow' ORDER BY rowid DESC LIMIT 50", &[])? {
+        let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(s(&r, "message")) else { continue };
+        m.insert("at".into(), g(&r, "at"));
+        // Ids with their names, for the Data page.
+        for (key, kind) in [("units", Kind::Unit), ("traits", Kind::Trait)] {
+            let ids: Vec<String> = m.get(key).and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+            let mut named = Vec::new();
+            for id in ids {
+                let d = describe(conn, kind, &id, false)?;
+                named.push(json!({ "id": id, "name": g(&d, "name") }));
+            }
+            m.insert(key.into(), Value::Array(named));
+        }
+        queries.push(Value::Object(m));
+    }
+    let indexes: Vec<Value> = explorer
+        .status()
+        .into_iter()
+        .map(|p| json!({ "patch": p.patch, "state": p.state, "boards": p.boards, "bytes": p.bytes, "builtAt": p.built_at, "problem": p.problem }))
+        .collect();
+    let mode = match explorer.mode() {
+        tft_explore::Mode::Off => "off",
+        tft_explore::Mode::Wait => "wait",
+        tft_explore::Mode::Background => "background",
     };
-    let units = ids("units", 4);
-    let traits = ids("traits", 3);
+    Ok(with(
+        Map::new(),
+        &[("thresholdMs", json!(threshold)), ("mode", json!(mode)), ("queries", Value::Array(queries)), ("indexes", Value::Array(indexes))],
+    ))
+}
+
+/// A counted row as the SQL gives it: `{ <id_key>: id, games, sum_place, wins, top4 }`, all integers.
+fn counted(id_key: &str, id: &str, c: &tft_explore::Counts) -> Obj {
+    let mut o = Map::new();
+    o.insert(id_key.into(), json!(id));
+    o.insert("games".into(), json!(c.games));
+    o.insert("sum_place".into(), json!(c.sum_place));
+    o.insert("wins".into(), json!(c.wins));
+    o.insert("top4".into(), json!(c.top4));
+    o
+}
+
+/// `GET /api/explore`, answered from the index `pick` gives for the patch, or from SQL when it gives none. Both give
+/// the same answer (the equivalence test below); only `ms` differs.
+pub fn explore_using(
+    conn: &Connection,
+    q: Option<&str>,
+    pick: &dyn Fn(&str) -> Option<std::sync::Arc<tft_explore::Index>>,
+) -> Result<(Obj, Source)> {
+    let sc = scope(conn, q)?;
+    let units = explore_ids(q, "units", 4);
+    let traits = explore_ids(q, "traits", 3);
     if units.is_empty() {
-        return Ok(with(public(&sc), &[("summary", Value::Null), ("partners", json!([])), ("items", json!([])), ("ms", json!(0))]));
+        return Ok((
+            with(public(&sc), &[("summary", Value::Null), ("partners", json!([])), ("items", json!([])), ("ms", json!(0))]),
+            Source::None,
+        ));
     }
 
     let t0 = std::time::Instant::now();
     let ms = |t0: std::time::Instant| json!(t0.elapsed().as_millis() as i64);
+    let (sum, partners, items, source) = match pick(&sc.patch) {
+        Some(ix) => {
+            let a = ix.explore(&tft_explore::Query {
+                units: &units,
+                traits: &traits,
+                rank_min: sc.rank_min,
+                since: sc.since,
+                ranked_queue: tft_core::config::Config::from_env().ranked_queue_id,
+                partner_limit: 40,
+                item_limit: 30,
+            });
+            let partners: Vec<Obj> = a.partners.iter().map(|(id, c)| counted("character_id", id, c)).collect();
+            let items: Vec<Obj> = a.items.iter().map(|(id, c)| counted("item", id, c)).collect();
+            (counted("_", "", &a.summary), partners, items, Source::Index)
+        }
+        None => {
+            let (sum, partners, items) = explore_sql(conn, &sc, &units, &traits)?;
+            (sum, partners, items, Source::Sql)
+        }
+    };
+    let games = f(&sum, "games");
+    if games == 0.0 || games.is_nan() {
+        return Ok((
+            with(public(&sc), &[("summary", json!({ "games": 0 })), ("partners", json!([])), ("items", json!([])), ("ms", ms(t0))]),
+            source,
+        ));
+    }
+    let mut sum = sum;
+    sum.remove("_");
+
+    let summary = rate(&sum, sc.comps as f64);
+    let avg = f(&summary, "avgPlace");
+    let mut p_out = Vec::new();
+    for p in partners.iter().filter(|p| !units.iter().any(|u| u == s(p, "character_id"))) {
+        let d = merge(describe(conn, Kind::Unit, s(p, "character_id"), false)?, rate(p, games));
+        p_out.push(with(d, &[("placeChange", num(f(p, "sum_place") / f(p, "games") - avg))]));
+    }
+    let mut i_out = Vec::new();
+    for i in &items {
+        let d = merge(describe(conn, Kind::Item, s(i, "item"), false)?, rate(i, games));
+        i_out.push(with(d, &[("placeChange", num(f(i, "sum_place") / f(i, "games") - avg))]));
+    }
+    Ok((
+        with(
+            public(&sc),
+            &[
+                ("summary", Value::Object(summary)),
+                ("ms", ms(t0)),
+                ("partners", arr(p_out)),
+                ("items", arr(i_out)),
+                ("itemsOn", Value::Object(describe(conn, Kind::Unit, &units[0], false)?)),
+            ],
+        ),
+        source,
+    ))
+}
+
+/// The Explorer's SQL joins, as before the index: the matching boards' totals, the 40 units most often on them and
+/// the 30 items the first unit most often holds.
+fn explore_sql(conn: &Connection, sc: &Scope, units: &[String], traits: &[String]) -> Result<(Obj, Vec<Obj>, Vec<Obj>)> {
     conn.execute_batch("DROP TABLE IF EXISTS temp.hit")?;
     let sql = format!(
         "\n    CREATE TEMP TABLE hit AS\n    SELECT DISTINCT pa.id, pa.placement FROM units u0\n    JOIN participants pa ON pa.id = u0.participant_id\n    JOIN matches m ON m.match_id = pa.match_id\n    WHERE u0.character_id = ? AND m.patch = ? AND m.rank >= ? AND m.game_datetime >= ? AND {}\n    {}\n    {}\n  ",
@@ -726,7 +882,7 @@ pub fn explore(conn: &Connection, q: Option<&str>) -> Result<Obj> {
         .unwrap_or_default();
     let games = f(&sum, "games");
     if games == 0.0 || games.is_nan() {
-        return Ok(with(public(&sc), &[("summary", json!({ "games": 0 })), ("partners", json!([])), ("items", json!([])), ("ms", ms(t0))]));
+        return Ok((sum, Vec::new(), Vec::new()));
     }
     let partners = rows(
         conn,
@@ -739,29 +895,7 @@ pub fn explore(conn: &Connection, q: Option<&str>) -> Result<Obj> {
         &[&units[0]],
     )?;
     conn.execute_batch("DROP TABLE IF EXISTS temp.hit")?;
-
-    let summary = rate(&sum, sc.comps as f64);
-    let avg = f(&summary, "avgPlace");
-    let mut p_out = Vec::new();
-    for p in partners.iter().filter(|p| !units.iter().any(|u| u == s(p, "character_id"))) {
-        let d = merge(describe(conn, Kind::Unit, s(p, "character_id"), false)?, rate(p, games));
-        p_out.push(with(d, &[("placeChange", num(f(p, "sum_place") / f(p, "games") - avg))]));
-    }
-    let mut i_out = Vec::new();
-    for i in &items {
-        let d = merge(describe(conn, Kind::Item, s(i, "item"), false)?, rate(i, games));
-        i_out.push(with(d, &[("placeChange", num(f(i, "sum_place") / f(i, "games") - avg))]));
-    }
-    Ok(with(
-        public(&sc),
-        &[
-            ("summary", Value::Object(summary)),
-            ("ms", ms(t0)),
-            ("partners", arr(p_out)),
-            ("items", arr(i_out)),
-            ("itemsOn", Value::Object(describe(conn, Kind::Unit, &units[0], false)?)),
-        ],
-    ))
+    Ok((sum, partners, items))
 }
 
 // ---- Static data for pickers and the team builder ---------------------------------

@@ -5,7 +5,7 @@ import { CollapsibleBanner } from '../interior/collapsible-banner'
 import { CopyButton } from '../interior/copy-button'
 import { TaskSteps } from '../interior/task-steps'
 import { Fact } from '../parts'
-import { CrawlSettingsForm, PipelineHealth } from './Pipeline'
+import { CrawlSettingsForm, ExplorerSpeed, PipelineHealth } from './Pipeline'
 
 const COMMANDS = [
   { icon: Shapes, title: 'Names and icons', command: 'npm run refresh', text: 'Download unit, item and trait data and the patch calendar now. The engine also does this on its own every 3 hours.' },
@@ -72,6 +72,8 @@ export function Data({ meta }: { meta: Meta }) {
       ) : <p className="muted">No matches yet.</p>}
 
       <PipelineHealth reloadKey={saves} />
+
+      <ExplorerSpeed />
 
       <CrawlSettingsForm onSaved={() => setSaves((n) => n + 1)} />
     </div>
