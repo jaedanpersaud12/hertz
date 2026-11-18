@@ -318,7 +318,15 @@ export function SortableTable<T>({
           </div>
         </div>
         {headerEnd ? (
-          <div className="absolute inset-y-0 right-1.5 flex items-center">{headerEnd}</div>
+          // Solid, with a short fade on its left edge, so header labels scrolled sideways pass under it, not through it.
+          // bottom-px leaves the header's bottom border showing.
+          <div className="absolute bottom-px right-0 top-0 flex items-center bg-white pl-1 pr-1.5 dark:bg-[#18181B]">
+            <span
+              aria-hidden
+              className="pointer-events-none absolute inset-y-0 right-full w-4 bg-linear-to-l from-white to-transparent dark:from-[#18181B]"
+            />
+            {headerEnd}
+          </div>
         ) : null}
         </div>
         <div
