@@ -237,9 +237,13 @@ const stop = (child: ChildProcess) =>
     child.kill()
   })
 
-/** Times the stress switch makes from Date.now(), written relative to now: whole days, else whole minutes. */
+/**
+ * Times the stress switch makes from Date.now(), written relative to now: whole days, else whole minutes.
+ * The fake world's match times and the fixture dates are left for clock() to write back: a run that reaches this
+ * a whole number of minutes after WORLD_NOW would otherwise see the newest match (WORLD_NOW - 1h) as "now-61m".
+ */
 function fromNow(x: unknown) {
-  if (typeof x !== 'number' || x < 1e12) return x
+  if (typeof x !== 'number' || x < 1e12 || worldTimes.has(x) || fixtureTimes.has(x)) return x
   const diff = x - Date.now()
   const days = Math.round(diff / DAY)
   if (Math.abs(diff - days * DAY) < 120_000) return `now${days < 0 ? '' : '+'}${days}d`
@@ -1061,6 +1065,17 @@ async function writeSection(from: string, bare: string) {
  * an unknown one, an upper-case one and a repeated one. Your account and lists are loaded, so every field the
  * switch reshapes is hit. The times it makes from Date.now() are written as "now-<days>d".
  */
+/**
+ * Test hook, off unless GOLDEN_STRESS_ALIGN is set: waits until WORLD_NOW + that many ms (plus whole minutes,
+ * if that has passed) before the plain pass, to check the stress answers at a chosen moment of the run.
+ */
+async function alignToWorld(ms: number) {
+  let target = WORLD_NOW + ms
+  while (target < Date.now()) target += 60_000
+  await new Promise((r) => setTimeout(r, target - Date.now()))
+  console.log(`  (GOLDEN_STRESS_ALIGN: plain pass starts ${Date.now() - WORLD_NOW} ms after WORLD_NOW)`)
+}
+
 async function stressSection(from: string, cwd: string) {
   const path = join(dir, 'stress.db')
   copyFileSync(from, path)
@@ -1086,6 +1101,7 @@ async function stressSection(from: string, cwd: string) {
     const SYNTHETIC = ['worst', 'empty', 'one', 'many', 'worst&data=empty']
     const plain = new Map<string, string>()
     for (const mode of modes) {
+      if (!mode && process.env.GOLDEN_STRESS_ALIGN) await alignToWorld(Number(process.env.GOLDEN_STRESS_ALIGN))
       let reshaped = 0
       for (const base of urls) {
         const url = mode ? `${base}${base.includes('?') ? '&' : '?'}data=${mode}` : base
