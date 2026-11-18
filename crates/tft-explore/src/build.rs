@@ -1,6 +1,6 @@
 //! Building an index from the database, and refreshing one after new boards arrive.
 
-use crate::file::{self, Dir, Index, Kind, Parts, Row, key, trait_entry, trait_parts, unit_entry, unit_parts};
+use crate::file::{self, Base, Dir, Index, Kind, Parts, Row, key, trait_entry, trait_parts, unit_entry, unit_parts};
 use anyhow::{Context, Result, bail, ensure};
 use roaring::RoaringBitmap;
 use rusqlite::{Connection, types::ValueRef};
@@ -51,19 +51,23 @@ fn text<'a>(v: ValueRef<'a>, what: &str) -> Result<&'a [u8]> {
     }
 }
 
-/// An index being put together in memory. Rows are kept in participant id order.
+/// An index being put together. Rows are kept in participant id order. When it extends an existing file
+/// ([`Builder::from_index`]) it holds only the new boards; the file's own rows, arrays and bitmaps are copied across
+/// when it is written, never loaded.
 #[derive(Clone, Default)]
 pub struct Builder {
+    /// The file this one extends.
+    base: Option<Base>,
     patch: String,
     units: Dict,
     traits: Dict,
     items: Dict,
     comps: Dict,
     queues: Vec<Option<i64>>,
-    rows: Vec<Row>,
-    unit_e: Vec<u16>,
-    trait_e: Vec<u16>,
-    item_e: Vec<u32>,
+    pub(crate) rows: Vec<Row>,
+    pub(crate) unit_e: Vec<u16>,
+    pub(crate) trait_e: Vec<u16>,
+    pub(crate) item_e: Vec<u32>,
     max_pid: i64,
 }
 
@@ -73,32 +77,41 @@ impl Builder {
     }
 
     /// Starts from an existing file: its boards are kept as they are, and new ones go after them.
+    /// Only the file's directory and bitmap table are kept (not its mapping), so `ix` can be dropped at once.
     pub fn from_index(ix: &Index) -> Builder {
         let d = &ix.dir;
         Builder {
+            base: Some(Base::of(ix)),
             patch: d.patch.clone(),
             units: Dict::from(&d.units),
             traits: Dict::from(&d.traits),
             items: Dict::from(&d.items),
             comps: Dict::from(&d.comps),
             queues: d.queues.clone(),
-            rows: ix.rows().to_vec(),
-            unit_e: ix.units().to_vec(),
-            trait_e: ix.traits().to_vec(),
-            item_e: ix.items().to_vec(),
             max_pid: d.max_pid,
+            ..Default::default()
         }
     }
 
+    /// Every board: the base file's and the new ones.
     pub fn rows(&self) -> usize {
-        self.rows.len()
+        self.base_rows() as usize + self.rows.len()
+    }
+
+    fn base_rows(&self) -> u64 {
+        self.base.as_ref().map_or(0, |b| b.dir.rows)
+    }
+
+    /// Where the new boards' entries start in the whole file's arrays.
+    fn offsets(&self) -> (u64, u64, u64) {
+        self.base.as_ref().map_or((0, 0, 0), |b| (b.dir.units_n, b.dir.traits_n, b.dir.items_n))
     }
 
     /// Adds every board of the patch with a participant id above `after`, with its units, traits and items.
     /// Fails on a value the index cannot hold exactly (the app then answers from SQL); the builder is then half
     /// filled and must be dropped.
     pub fn add_from_db(&mut self, conn: &Connection, after: i64) -> Result<usize> {
-        ensure!(after >= self.max_pid || self.rows.is_empty(), "boards must be added in id order");
+        ensure!(after >= self.max_pid || self.rows() == 0, "boards must be added in id order");
         let base = self.rows.len();
         let mut pids = Vec::new();
         {
@@ -159,8 +172,10 @@ impl Builder {
                 unit_entry(u, star, n).with_context(|| format!("unit {u} at {star} stars with {n} items does not fit the index"))
             },
         )?;
+        let (ou, ot, oi) = self.offsets();
+        let at = |s: u32, off: u64| u32::try_from(s as u64 + off).map_err(|_| anyhow::anyhow!("too many entries for one index"));
         for (k, s) in starts.into_iter().enumerate() {
-            self.rows[base + k].unit_start = s;
+            self.rows[base + k].unit_start = at(s, ou)?;
         }
         let traits = &mut self.traits;
         let starts = fill(
@@ -177,7 +192,7 @@ impl Builder {
             },
         )?;
         for (k, s) in starts.into_iter().enumerate() {
-            self.rows[base + k].trait_start = s;
+            self.rows[base + k].trait_start = at(s, ot)?;
         }
         let (units, items) = (&mut self.units, &mut self.items);
         let starts = fill(
@@ -194,32 +209,41 @@ impl Builder {
             },
         )?;
         for (k, s) in starts.into_iter().enumerate() {
-            self.rows[base + k].item_start = s;
+            self.rows[base + k].item_start = at(s, oi)?;
         }
-        ensure!(self.rows.len() < u32::MAX as usize, "too many boards for one index");
+        ensure!(self.rows() < u32::MAX as usize, "too many boards for one index");
         Ok(pids.len())
     }
 
-    /// Every bitmap, sorted by key.
+    /// The new boards' bitmaps (row numbers counted after the base file's rows), sorted by key.
     fn bitmaps(&self) -> Vec<(u64, RoaringBitmap)> {
+        let first = self.base_rows() as u32;
+        let (ou, ot, oi) = self.offsets();
+        // Row r's entries in this builder's own arrays (the row offsets count the base file's entries too).
+        fn local<'a, T>(rows: &[Row], r: usize, array: &'a [T], off: u64, start: impl Fn(&Row) -> u32) -> &'a [T] {
+            let at = |x: &Row| ((start(x) as u64).saturating_sub(off) as usize).min(array.len());
+            let lo = at(&rows[r]);
+            let hi = rows.get(r + 1).map_or(array.len(), at).max(lo);
+            &array[lo..hi]
+        }
         let mut m: HashMap<u64, RoaringBitmap> = HashMap::new();
         let mut put = |k: u64, r: u32| {
             // Rows are visited in order, so push (append) is enough; a repeat on the same board is a no-op.
             let _ = m.entry(k).or_default().try_push(r);
         };
         for (r, row) in self.rows.iter().enumerate() {
-            let rn = r as u32;
-            for &e in file::entries(&self.rows, r, &self.unit_e, |x| x.unit_start) {
+            let rn = first + r as u32;
+            for &e in local(&self.rows, r, &self.unit_e, ou, |x| x.unit_start) {
                 let (u, star, _) = unit_parts(e);
                 put(key(Kind::Unit, u as u32, 0), rn);
                 put(key(Kind::UnitStar, u as u32, star as u32), rn);
             }
-            for &e in file::entries(&self.rows, r, &self.trait_e, |x| x.trait_start) {
+            for &e in local(&self.rows, r, &self.trait_e, ot, |x| x.trait_start) {
                 let (t, tier) = trait_parts(e);
                 put(key(Kind::Trait, t as u32, 0), rn);
                 put(key(Kind::TraitTier, t as u32, tier as u32), rn);
             }
-            for &e in file::entries(&self.rows, r, &self.item_e, |x| x.item_start) {
+            for &e in local(&self.rows, r, &self.item_e, oi, |x| x.item_start) {
                 put(key(Kind::UnitItem, e >> 16, e & 0xffff), rn);
                 put(key(Kind::Item, e & 0xffff, 0), rn);
             }
@@ -254,6 +278,7 @@ impl Builder {
                 queues: self.queues.clone(),
                 ..Dir::default()
             },
+            base: self.base.as_ref(),
             rows: &self.rows,
             units: &self.unit_e,
             traits: &self.trait_e,
@@ -267,13 +292,7 @@ impl Builder {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        // Older snapshots: a reader that still has one mapped keeps it (on Windows the delete fails and is retried
-        // at the next write).
-        for (g, old) in crate::generations(dir, &self.patch) {
-            if g < generation {
-                let _ = std::fs::remove_file(old);
-            }
-        }
+        crate::remove_older(dir, &self.patch, generation);
         Ok(path)
     }
 }
@@ -349,15 +368,17 @@ pub fn refresh(conn: &Connection, dir: &Path, patch: &str) -> Result<Refreshed> 
         }
         return Ok(Refreshed { kind: RefreshKind::Empty, rows: 0, added: 0, path: None });
     }
-    if let Some(ix) = &existing
-        && (count - above) as u64 == ix.dir.rows
-        && ix.dir.patch == patch
-    {
+    // Only what is needed from the newest file is kept, and its mapping dropped before anything is written or
+    // deleted (Windows will not delete a file this process has mapped).
+    let base = existing.as_ref().filter(|ix| (count - above) as u64 == ix.dir.rows && ix.dir.patch == patch).map(Builder::from_index);
+    drop(existing);
+    if let Some(mut b) = base {
         if above == 0 {
-            return Ok(Refreshed { kind: RefreshKind::Current, rows: ix.dir.rows, added: 0, path: Some(ix.path.clone()) });
+            let path = b.base.as_ref().map(|x| x.path.clone());
+            return Ok(Refreshed { kind: RefreshKind::Current, rows: b.rows() as u64, added: 0, path });
         }
-        let mut b = Builder::from_index(ix);
-        let added = b.add_from_db(conn, ix.dir.max_pid)?;
+        let after = b.max_pid;
+        let added = b.add_from_db(conn, after)?;
         let path = b.write(dir)?;
         return Ok(Refreshed { kind: RefreshKind::Appended, rows: b.rows() as u64, added: added as u64, path: Some(path) });
     }

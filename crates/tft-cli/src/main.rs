@@ -592,7 +592,6 @@ fn health_lines(h: &tft_store::Health, now: i64) -> Vec<String> {
     out
 }
 
-/// 1234567 as "1,234,567", as `toLocaleString('en-US')` prints it.
 /// `tft explore-bench`. Prints what it measures as it goes, then a summary.
 fn explore_bench(db: &std::path::Path, patch: Option<String>, queries: usize, sql: usize, rebuild: bool, seed: u64) -> Result<()> {
     use std::time::Instant;
@@ -779,6 +778,7 @@ fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"_.-".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
+/// 1234567 as "1,234,567", as `toLocaleString('en-US')` prints it.
 fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::new();

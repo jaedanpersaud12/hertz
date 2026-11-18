@@ -212,7 +212,7 @@ const slowCols: Col<SlowQuery & { id: string }>[] = [
     </span>
   ) },
   { key: 'ms', label: 'Took', sort: (r) => r.ms, align: 'right', width: 'minmax(90px, 0.8fr)', render: (r) => took(r.ms) },
-  { key: 'from', label: 'Answered from', width: 'minmax(120px, 1fr)', render: (r) => <Tag kind="level">{r.source === 'index' ? 'Index' : 'Database'}</Tag> },
+  { key: 'from', label: 'Source', width: 'minmax(110px, 0.9fr)', render: (r) => <Tag kind="level">{r.source === 'index' ? 'Index' : 'Database'}</Tag> },
   { key: 'games', label: 'Found', sort: (r) => r.games ?? -1, align: 'right', width: 'minmax(100px, 0.8fr)', render: (r) => (r.games == null ? '–' : num(r.games)) },
   { key: 'at', label: 'When', sort: (r) => r.at, width: 'minmax(110px, 0.9fr)', render: (r) => ago(r.at) },
 ]
@@ -263,7 +263,7 @@ export function ExplorerSpeed() {
         {queries.length ? (
           <>
             <Table rows={queries} cols={slowCols} initial="at" desc label="Slow Explorer questions" rowHeight={56} minWidth={760} />
-            <p className="muted small mt-2">The 50 newest. Answered from database means the patch had no index yet.</p>
+            <p className="muted small mt-2">The 50 newest. A source of Database means the patch had no index yet, so the boards were counted the slower way.</p>
           </>
         ) : (
           <div className="empty-note">

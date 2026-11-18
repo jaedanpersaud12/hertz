@@ -79,6 +79,17 @@ pub fn newest(dir: &Path, patch: &str) -> Option<(u64, PathBuf)> {
     generations(dir, patch).pop()
 }
 
+/// Deletes the files for `patch` older than `generation`, as far as it can. One still mapped (a question in flight,
+/// or on Windows any mapping at all) stays, and goes at the next call: every write and every switch to a newer file
+/// calls this.
+pub fn remove_older(dir: &Path, patch: &str, generation: u64) {
+    for (g, old) in generations(dir, patch) {
+        if g < generation {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+}
+
 /// Deletes every index file for every patch (after `tft recluster`, which relabels boards the files hold).
 pub fn remove_all(dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(dir) {

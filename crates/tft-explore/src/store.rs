@@ -95,7 +95,14 @@ impl Explorer {
                     && slot.bad.as_ref() != Some(&path)
                 {
                     match Index::open(&path) {
-                        Ok(ix) if ix.dir.patch == patch => slot.index = Some(Arc::new(ix)),
+                        Ok(ix) if ix.dir.patch == patch => {
+                            // The older snapshot is let go of here (questions in flight keep it until they end),
+                            // and its file deleted when nothing maps it any more: now, or at the next switch or
+                            // write. On Windows a mapped file cannot be deleted, so this is where the app's own
+                            // mapping stops holding back the stats step's clean-up.
+                            slot.index = Some(Arc::new(ix));
+                            crate::remove_older(&self.dir, patch, g);
+                        }
                         _ => slot.bad = Some(path),
                     }
                 }
@@ -142,7 +149,9 @@ impl Explorer {
         slot.building = false;
         match result {
             Ok(ix) => {
+                let g = ix.generation;
                 slot.index = Some(Arc::new(ix));
+                crate::remove_older(&self.dir, patch, g);
                 slot.failed = None;
                 slot.scanned = Some(Instant::now());
             }

@@ -21,7 +21,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -175,9 +175,27 @@ impl<W: Write> Out<W> {
     }
 }
 
-/// The parts of an index, in memory, ready to write.
+/// The file a new snapshot extends: its directory and bitmap table, read before its mapping is dropped. Its
+/// sections are copied across with plain reads (never through a mapping, so they do not stay resident), and its
+/// bitmaps are read one at a time.
+#[derive(Clone, Debug)]
+pub struct Base {
+    pub path: PathBuf,
+    pub dir: Dir,
+    pub table: Vec<[u64; 3]>,
+}
+
+impl Base {
+    pub fn of(ix: &Index) -> Base {
+        Base { path: ix.path.clone(), dir: ix.dir.clone(), table: ix.table().to_vec() }
+    }
+}
+
+/// The parts of an index ready to write: the rows after the base file's (or all of them), and the bitmaps of those
+/// rows only (row numbers counted after the base's rows).
 pub struct Parts<'a> {
     pub dir: Dir,
+    pub base: Option<&'a Base>,
     pub rows: &'a [Row],
     pub units: &'a [u16],
     pub traits: &'a [u16],
@@ -186,47 +204,121 @@ pub struct Parts<'a> {
     pub bitmaps: Vec<(u64, RoaringBitmap)>,
 }
 
-/// Writes a complete file at `path` (a temporary name; the caller renames it into place).
+/// Copies `len` bytes at `at` of `from` to the output, 1 MiB at a time.
+fn copy<W: Write>(o: &mut Out<W>, from: &mut File, at: u64, len: u64) -> Result<()> {
+    from.seek(SeekFrom::Start(at))?;
+    let mut left = len;
+    let mut buf = vec![0u8; 1 << 20];
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        from.read_exact(&mut buf[..n])?;
+        o.put(&buf[..n])?;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+fn read_at(from: &mut File, at: u64, len: u64) -> Result<Vec<u8>> {
+    from.seek(SeekFrom::Start(at))?;
+    let mut buf = vec![0u8; len as usize];
+    from.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Writes a complete file at `path` (a temporary name; the caller renames it into place). With a base, the base's
+/// rows and arrays come first, copied as they are, and each bitmap is the base's extended with the new rows'.
 pub fn write(path: &Path, mut p: Parts) -> Result<()> {
     let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut o = Out { w: BufWriter::with_capacity(1 << 20, file), at: 0 };
+    let mut base = match p.base {
+        Some(b) => Some((b, File::open(&b.path).with_context(|| format!("reading {}", b.path.display()))?)),
+        None => None,
+    };
+    let empty = Dir::default();
+    let bd = base.as_ref().map_or(&empty, |(b, _)| &b.dir);
     o.put(&[0; HEADER as usize])?;
 
     p.dir.version = FORMAT_VERSION;
-    p.dir.rows = p.rows.len() as u64;
+    p.dir.rows = bd.rows + p.rows.len() as u64;
     p.dir.rows_at = o.at;
+    if let Some((b, f)) = &mut base {
+        copy(&mut o, f, b.dir.rows_at, 40 * b.dir.rows)?;
+    }
     for r in p.rows {
         r.write(&mut o.w)?;
     }
     o.at += 40 * p.rows.len() as u64;
-    let put_u16s = |o: &mut Out<_>, xs: &[u16]| -> std::io::Result<(u64, u64)> {
-        o.align()?;
-        let at = o.at;
-        for x in xs {
-            o.put(&x.to_le_bytes())?;
-        }
-        Ok((at, xs.len() as u64))
-    };
-    (p.dir.units_at, p.dir.units_n) = put_u16s(&mut o, p.units)?;
-    (p.dir.traits_at, p.dir.traits_n) = put_u16s(&mut o, p.traits)?;
+
+    o.align()?;
+    p.dir.units_at = o.at;
+    p.dir.units_n = bd.units_n + p.units.len() as u64;
+    if let Some((b, f)) = &mut base {
+        copy(&mut o, f, b.dir.units_at, 2 * b.dir.units_n)?;
+    }
+    for x in p.units {
+        o.put(&x.to_le_bytes())?;
+    }
+    o.align()?;
+    p.dir.traits_at = o.at;
+    p.dir.traits_n = bd.traits_n + p.traits.len() as u64;
+    if let Some((b, f)) = &mut base {
+        copy(&mut o, f, b.dir.traits_at, 2 * b.dir.traits_n)?;
+    }
+    for x in p.traits {
+        o.put(&x.to_le_bytes())?;
+    }
     o.align()?;
     p.dir.items_at = o.at;
-    p.dir.items_n = p.items.len() as u64;
+    p.dir.items_n = bd.items_n + p.items.len() as u64;
+    if let Some((b, f)) = &mut base {
+        copy(&mut o, f, b.dir.items_at, 4 * b.dir.items_n)?;
+    }
     for x in p.items {
         o.put(&x.to_le_bytes())?;
     }
 
+    // Bitmaps in key order: the base's and the new rows', merged. A base bitmap with no new rows is copied as it
+    // is; one with new rows is read, extended and written again; only one is in memory at a time.
     o.align()?;
-    let mut table = Vec::with_capacity(p.bitmaps.len());
-    for (k, b) in &mut p.bitmaps {
-        b.optimize();
+    let old: &[[u64; 3]] = base.as_ref().map_or(&[], |(b, _)| &b.table);
+    let mut table = Vec::with_capacity(old.len() + p.bitmaps.len());
+    let (mut i, mut j) = (0, 0);
+    let mut new = std::mem::take(&mut p.bitmaps);
+    while i < old.len() || j < new.len() {
+        let ko = old.get(i).map(|e| e[0]);
+        let kn = new.get(j).map(|e| e.0);
         let at = o.at;
-        let mut buf = Vec::with_capacity(b.serialized_size());
-        b.serialize_into(&mut buf)?;
-        o.put(&buf)?;
-        table.push([*k, at, buf.len() as u64]);
+        let (k, len) = match (ko, kn) {
+            (Some(a), b) if b.is_none_or(|b| a < b) => {
+                let [_, off, len] = old[i];
+                let f = &mut base.as_mut().expect("old keys come from a base").1;
+                copy(&mut o, f, off, len)?;
+                i += 1;
+                (a, len)
+            }
+            (a, Some(b)) => {
+                let mut bm = std::mem::take(&mut new[j].1);
+                j += 1;
+                if a == Some(b) {
+                    let [_, off, len] = old[i];
+                    i += 1;
+                    let f = &mut base.as_mut().expect("old keys come from a base").1;
+                    let mut merged = RoaringBitmap::deserialize_from(&read_at(f, off, len)?[..]).context("reading a bitmap of the base file")?;
+                    merged |= bm;
+                    bm = merged;
+                }
+                bm.optimize();
+                let mut buf = Vec::with_capacity(bm.serialized_size());
+                bm.serialize_into(&mut buf)?;
+                o.put(&buf)?;
+                (b, buf.len() as u64)
+            }
+            _ => unreachable!(),
+        };
+        table.push([k, at, len]);
     }
     ensure!(table.windows(2).all(|w| w[0][0] < w[1][0]), "bitmap keys out of order");
+    drop(base);
     o.align()?;
     p.dir.table_at = o.at;
     p.dir.table_n = table.len() as u64;
@@ -384,7 +476,7 @@ impl Index {
     pub fn items(&self) -> &[u32] {
         self.try_items().expect("checked at open")
     }
-    fn table(&self) -> &[[u64; 3]] {
+    pub(crate) fn table(&self) -> &[[u64; 3]] {
         self.try_table().expect("checked at open")
     }
 
