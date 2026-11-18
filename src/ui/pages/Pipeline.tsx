@@ -189,10 +189,7 @@ const took = (ms: number) => (ms < 10_000 ? `${num(ms)} ms` : `${(ms / 1000).toF
 const indexCols: Col<IndexRow & { id: string }>[] = [
   { key: 'patch', label: 'Patch', sort: (r) => r.patch, width: 'minmax(110px, 1fr)', render: (r) => r.patch },
   { key: 'state', label: 'Index', width: 'minmax(150px, 1.4fr)', render: (r) => (
-    <span className="server-cell">
-      <span><Tag kind={r.state === 'failed' ? 'error' : 'level'}>{STATE_LABEL[r.state] ?? r.state}</Tag></span>
-      {r.problem ? <span className="muted small problem-text" title={r.problem}>{r.problem}</span> : null}
-    </span>
+    <Tag kind={r.state === 'failed' ? 'error' : 'level'}>{STATE_LABEL[r.state] ?? r.state}</Tag>
   ) },
   { key: 'boards', label: 'Boards', sort: (r) => r.boards ?? -1, align: 'right', width: 'minmax(110px, 1fr)', render: (r) => (r.boards == null ? '–' : num(r.boards)) },
   { key: 'size', label: 'File size', sort: (r) => r.bytes ?? -1, align: 'right', width: 'minmax(90px, 0.8fr)', render: (r) => size(r.bytes) },
@@ -216,7 +213,7 @@ const slowCols: Col<SlowQuery & { id: string }>[] = [
   ) },
   { key: 'ms', label: 'Took', sort: (r) => r.ms, align: 'right', width: 'minmax(90px, 0.8fr)', render: (r) => took(r.ms) },
   { key: 'from', label: 'Answered from', width: 'minmax(120px, 1fr)', render: (r) => <Tag kind="level">{r.source === 'index' ? 'Index' : 'Database'}</Tag> },
-  { key: 'games', label: 'Boards found', sort: (r) => r.games ?? -1, align: 'right', width: 'minmax(110px, 0.9fr)', render: (r) => (r.games == null ? '–' : num(r.games)) },
+  { key: 'games', label: 'Found', sort: (r) => r.games ?? -1, align: 'right', width: 'minmax(100px, 0.8fr)', render: (r) => (r.games == null ? '–' : num(r.games)) },
   { key: 'at', label: 'When', sort: (r) => r.at, width: 'minmax(110px, 0.9fr)', render: (r) => ago(r.at) },
 ]
 
@@ -244,7 +241,18 @@ export function ExplorerSpeed() {
         {num(data.thresholdMs)} ms or more is listed below, newest first.
       </p>
       {indexes.length ? (
-        <Table rows={indexes} cols={indexCols} initial="built" desc label="Explorer index per patch" rowHeight={52} minWidth={560} />
+        <>
+          <Table rows={indexes} cols={indexCols} initial="built" desc label="Explorer index per patch" rowHeight={52} minWidth={560} />
+          {indexes.filter((r) => r.problem).map((r) => (
+            <div key={r.patch} className="problem mt-3">
+              <div className="problem-head">
+                <Tag kind="error">Failed</Tag>
+                <span className="small">Patch {r.patch}: answered from the database until the next stats run writes the index</span>
+              </div>
+              <p className="problem-text">{r.problem}</p>
+            </div>
+          ))}
+        </>
       ) : (
         <div className="empty-note">
           <p>No index yet, so the Explorer counts boards in the database, which is slower.</p>
